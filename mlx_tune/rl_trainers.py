@@ -9,7 +9,6 @@ Provides TRL-style trainer interfaces for:
 - SimPO
 """
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable, Tuple
 import json
@@ -27,17 +26,24 @@ except ImportError:
     HAS_NATIVE_TRAINING = False
 
 from mlx_tune.losses import (
-    compute_completion_log_probs,
-    compute_log_probs_with_lengths,
-    compute_reference_logprobs,
     dpo_loss as compute_dpo_loss,
-    grpo_batch_loss,
     grpo_recompute_loss,
     kto_loss as compute_kto_loss,
     orpo_loss as compute_orpo_loss,
-    precompute_kto_reference_logprobs,
-    precompute_preference_reference_logprobs,
     simpo_loss as compute_simpo_loss,
+)
+from mlx_tune._rl_runtime import (
+    PolicyEvalBatch,
+    PreferenceBatch,
+    RolloutBatch,
+    assemble_minibatches,
+    collect_rollouts,
+    compute_advantages,
+    evaluate_rewards,
+    make_policy_eval_batch,
+    make_preference_batch,
+    pad_sequences,
+    score_policy_in_chunks,
 )
 from mlx_tune.model import ReferencePolicy
 
@@ -156,10 +162,7 @@ def _restore_rng_state(flat_state: Dict[str, mx.array]) -> None:
 
 
 def _pad_sequences(sequences: List[List[int]], pad_id: int) -> Tuple[mx.array, mx.array]:
-    max_length = max(len(sequence) for sequence in sequences)
-    padded = [sequence + [pad_id] * (max_length - len(sequence)) for sequence in sequences]
-    lengths = [len(sequence) for sequence in sequences]
-    return mx.array(padded), mx.array(lengths)
+    return pad_sequences(sequences, pad_id)
 
 
 class _RLTrainerBase:
@@ -414,18 +417,6 @@ class GRPOConfig:
         }
 
 
-@dataclass
-class GRPORolloutBatch:
-    prompt_texts: List[str]
-    prompt_ids: List[List[int]]
-    reward_contexts: List[str]
-    completion_ids: List[List[int]]
-    completion_lengths: List[int]
-    rollout_logprobs: mx.array
-    rewards: mx.array
-    advantages: mx.array
-
-
 class DPOTrainer(_RLTrainerBase):
     algorithm = "dpo"
 
@@ -493,23 +484,26 @@ class DPOTrainer(_RLTrainerBase):
 
     def _precompute_reference_cache(self) -> None:
         self._ensure_reference_policy()
-        pad_id = _pad_token_id(self.tokenizer)
-        chosen_ids, chosen_lengths = _pad_sequences(
-            [sample["chosen_ids"] for sample in self.train_samples],
-            pad_id,
+        preference_batch = make_preference_batch(
+            chosen_sequences=[sample["chosen_ids"] for sample in self.train_samples],
+            rejected_sequences=[sample["rejected_ids"] for sample in self.train_samples],
+            pad_id=_pad_token_id(self.tokenizer),
+            sample_indices=[sample["sample_index"] for sample in self.train_samples],
         )
-        rejected_ids, rejected_lengths = _pad_sequences(
-            [sample["rejected_ids"] for sample in self.train_samples],
-            pad_id,
-        )
-        ref_chosen, ref_rejected = precompute_preference_reference_logprobs(
+        ref_chosen = score_policy_in_chunks(
             _actual_model(self.reference_policy.model),
-            chosen_ids,
-            rejected_ids,
-            chosen_lengths,
-            rejected_lengths,
+            preference_batch.chosen,
             batch_size=max(1, self.batch_size),
-        )
+            mode="sequence",
+        ).summed_logprobs
+        ref_rejected = score_policy_in_chunks(
+            _actual_model(self.reference_policy.model),
+            preference_batch.rejected,
+            batch_size=max(1, self.batch_size),
+            mode="sequence",
+        ).summed_logprobs
+        ref_chosen = mx.stop_gradient(ref_chosen)
+        ref_rejected = mx.stop_gradient(ref_rejected)
         for idx, sample in enumerate(self.train_samples):
             sample["reference_chosen_logprobs"] = ref_chosen[idx]
             sample["reference_rejected_logprobs"] = ref_rejected[idx]
@@ -530,13 +524,19 @@ class DPOTrainer(_RLTrainerBase):
             sample["reference_chosen_logprobs"] = ref_chosen[idx]
             sample["reference_rejected_logprobs"] = ref_rejected[idx]
 
-    def _build_batch(self, samples: List[Dict[str, Any]]) -> Tuple[mx.array, ...]:
-        pad_id = _pad_token_id(self.tokenizer)
-        chosen_ids, chosen_lengths = _pad_sequences([sample["chosen_ids"] for sample in samples], pad_id)
-        rejected_ids, rejected_lengths = _pad_sequences([sample["rejected_ids"] for sample in samples], pad_id)
-        ref_chosen = mx.array([sample["reference_chosen_logprobs"] for sample in samples])
-        ref_rejected = mx.array([sample["reference_rejected_logprobs"] for sample in samples])
-        return chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, ref_chosen, ref_rejected
+    def _build_batch(self, samples: List[Dict[str, Any]]) -> PreferenceBatch:
+        return make_preference_batch(
+            chosen_sequences=[sample["chosen_ids"] for sample in samples],
+            rejected_sequences=[sample["rejected_ids"] for sample in samples],
+            pad_id=_pad_token_id(self.tokenizer),
+            sample_indices=[sample["sample_index"] for sample in samples],
+            chosen_reference_logprobs=mx.array(
+                [sample["reference_chosen_logprobs"] for sample in samples]
+            ),
+            rejected_reference_logprobs=mx.array(
+                [sample["reference_rejected_logprobs"] for sample in samples]
+            ),
+        )
 
     def _extra_state_arrays(self) -> Dict[str, mx.array]:
         return {
@@ -568,16 +568,15 @@ class DPOTrainer(_RLTrainerBase):
             self._precompute_reference_cache()
 
         def loss_fn(model, batch):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, ref_chosen, ref_rejected = batch
             loss, _ = compute_dpo_loss(
                 model=model,
-                chosen_ids=chosen_ids,
-                rejected_ids=rejected_ids,
-                chosen_lengths=chosen_lengths,
-                rejected_lengths=rejected_lengths,
+                chosen_ids=batch.chosen.input_ids,
+                rejected_ids=batch.rejected.input_ids,
+                chosen_lengths=batch.chosen.sequence_lengths,
+                rejected_lengths=batch.rejected.sequence_lengths,
                 beta=self.beta,
-                reference_chosen_logprobs=ref_chosen,
-                reference_rejected_logprobs=ref_rejected,
+                reference_chosen_logprobs=batch.chosen.reference_logprobs,
+                reference_rejected_logprobs=batch.rejected.reference_logprobs,
                 label_smoothing=self.label_smoothing,
             )
             return loss
@@ -817,7 +816,7 @@ class GRPOTrainer(_RLTrainerBase):
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.prompt_samples: List[Dict[str, Any]] = []
-        self._last_rollout_batch: Optional[GRPORolloutBatch] = None
+        self._last_rollout_batch: Optional[RolloutBatch] = None
         self._init_native_state()
 
         if self.reward_fn is None:
@@ -839,13 +838,12 @@ class GRPOTrainer(_RLTrainerBase):
 
     def _prepare_prompt_samples(self) -> None:
         self.prompt_samples = []
-        max_prompt_tokens = max(1, self.max_seq_length - self.max_completion_length)
         for sample_index, sample in enumerate(self.train_dataset):
             prompt = sample.get("prompt", sample.get("question", ""))
             if not prompt:
                 continue
             reward_context = sample.get("answer", sample.get("response", prompt))
-            prompt_ids = self.tokenizer.encode(prompt)[:max_prompt_tokens]
+            prompt_ids = self.tokenizer.encode(prompt)
             self.prompt_samples.append(
                 {
                     "sample_index": sample_index,
@@ -857,83 +855,26 @@ class GRPOTrainer(_RLTrainerBase):
         if not self.prompt_samples:
             raise ValueError("GRPOTrainer requires prompt or question fields.")
 
-    def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> GRPORolloutBatch:
-        prompt_texts: List[str] = []
-        prompt_ids: List[List[int]] = []
-        reward_contexts: List[str] = []
-        completion_ids: List[List[int]] = []
-        completion_lengths: List[int] = []
-        rollout_logprobs: List[mx.array] = []
-        rewards: List[float] = []
-        advantages: List[float] = []
-
-        for sample in prompt_samples:
-            prompt_rewards: List[float] = []
-            prompt_start = len(rewards)
-
-            for _ in range(self.num_generations):
-                generated_ids, token_log_probs = self._generate_completion(sample["prompt_ids"])
-                completion = generated_ids[len(sample["prompt_ids"]):].tolist()
-                completion_text = self.tokenizer.decode(completion)
-                reward = float(self.reward_fn(completion_text, sample["reward_context"]))
-
-                prompt_texts.append(sample["prompt"])
-                prompt_ids.append(list(sample["prompt_ids"]))
-                reward_contexts.append(sample["reward_context"])
-                completion_ids.append(completion)
-                completion_lengths.append(len(completion))
-                rollout_logprobs.append(
-                    token_log_probs.sum() if len(token_log_probs) > 0 else mx.array(0.0, dtype=mx.float32)
-                )
-                rewards.append(reward)
-                prompt_rewards.append(reward)
-
-            reward_array = mx.array(prompt_rewards, dtype=mx.float32)
-            reward_std = mx.std(reward_array)
-            if reward_std.item() < 1e-6:
-                prompt_advantages = reward_array - mx.mean(reward_array)
-            else:
-                prompt_advantages = (reward_array - mx.mean(reward_array)) / (reward_std + 1e-8)
-            advantages.extend(prompt_advantages.tolist())
-
-        return GRPORolloutBatch(
-            prompt_texts=prompt_texts,
-            prompt_ids=prompt_ids,
-            reward_contexts=reward_contexts,
-            completion_ids=completion_ids,
-            completion_lengths=completion_lengths,
-            rollout_logprobs=mx.array(rollout_logprobs),
-            rewards=mx.array(rewards),
-            advantages=mx.array(advantages),
-        )
-
-    def _generate_completion(self, prompt_ids: List[int]) -> Tuple[mx.array, mx.array]:
-        from mlx_tune.losses import generate_with_log_probs
-
-        return generate_with_log_probs(
+    def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> RolloutBatch:
+        rollout_batch = collect_rollouts(
             _actual_model(self.model),
             self.tokenizer,
-            mx.array(prompt_ids),
-            max_tokens=self.max_completion_length,
-            temperature=self.temperature,
+            prompt_samples=prompt_samples,
+            sampling_config={
+                "num_generations": self.num_generations,
+                "temperature": self.temperature,
+                "max_completion_length": self.max_completion_length,
+                "max_seq_length": self.max_seq_length,
+            },
+            reward_evaluator=None,
+            collect_sample_stats=False,
         )
-
-    def _build_grpo_tensors(self, rollout_batch: GRPORolloutBatch) -> Tuple[mx.array, ...]:
-        pad_id = _pad_token_id(self.tokenizer)
-        full_sequences = [
-            prompt_ids + completion_ids
-            for prompt_ids, completion_ids in zip(rollout_batch.prompt_ids, rollout_batch.completion_ids)
-        ]
-        input_ids, _ = _pad_sequences(full_sequences, pad_id)
-        prompt_lengths = mx.array([len(ids) for ids in rollout_batch.prompt_ids])
-        completion_lengths = mx.array(rollout_batch.completion_lengths)
-        return (
-            input_ids,
-            prompt_lengths,
-            completion_lengths,
-            rollout_batch.rollout_logprobs,
-            rollout_batch.advantages,
-        )
+        reward_batch = evaluate_rewards(rollout_batch, self.reward_fn)
+        advantages = compute_advantages(reward_batch)
+        rollout_batch.rewards = reward_batch.scalar_rewards
+        rollout_batch.advantages = advantages
+        rollout_batch.policy_eval.advantages = advantages
+        return rollout_batch
 
     def train(self, resume_from_checkpoint: Optional[str] = None):
         if self.use_native:
@@ -956,17 +897,16 @@ class GRPOTrainer(_RLTrainerBase):
         reference_model = _actual_model(self.reference_policy.model)
 
         def loss_fn(model, batch):
-            input_ids, prompt_lengths, completion_lengths, rollout_logprobs, advantages = batch
             if self.phase1_loss_type != "phase1_shared_rollout_recompute":
                 raise ValueError(f"Unhandled GRPO Phase 1 loss routing: {self.phase1_loss_type}")
             loss, _ = grpo_recompute_loss(
                 model=model,
                 reference_model=reference_model,
-                input_ids=input_ids,
-                prompt_lengths=prompt_lengths,
-                completion_lengths=completion_lengths,
-                rollout_logprobs=rollout_logprobs,
-                advantages=advantages,
+                input_ids=batch.input_ids,
+                prompt_lengths=batch.prompt_lengths,
+                completion_lengths=batch.completion_lengths,
+                rollout_logprobs=batch.rollout_logprobs,
+                advantages=batch.advantages,
                 beta=self.beta,
                 temperature=self.temperature,
             )
@@ -980,13 +920,20 @@ class GRPOTrainer(_RLTrainerBase):
             prompt_samples = self._next_samples(self.prompt_samples)
             rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
-            batch = self._build_grpo_tensors(rollout_batch)
+            minibatches = assemble_minibatches(
+                rollout_batch.policy_eval,
+                minibatch_size=max(1, self.batch_size * self.num_generations),
+                shuffle=False,
+            )
 
-            loss, grads = value_and_grad(actual_model, batch)
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
+            step_loss = 0.0
+            for minibatch in minibatches:
+                loss, grads = value_and_grad(actual_model, minibatch)
+                optimizer.update(actual_model, grads)
+                mx.eval(actual_model.parameters(), optimizer.state)
+                step_loss += loss.item()
 
-            last_loss = loss.item()
+            last_loss = step_loss / max(1, len(minibatches))
             running_loss += last_loss
             self.global_step += 1
 
@@ -1103,14 +1050,20 @@ class KTOTrainer(_RLTrainerBase):
 
     def _precompute_reference_cache(self) -> None:
         self._ensure_reference_policy()
-        pad_id = _pad_token_id(self.tokenizer)
-        input_ids, lengths = _pad_sequences([sample["ids"] for sample in self.train_samples], pad_id)
-        reference_logprobs = precompute_kto_reference_logprobs(
-            _actual_model(self.reference_policy.model),
-            input_ids,
-            lengths,
-            batch_size=max(1, self.batch_size),
+        eval_batch = make_policy_eval_batch(
+            [sample["ids"] for sample in self.train_samples],
+            pad_id=_pad_token_id(self.tokenizer),
+            mode="sequence",
+            labels=mx.array([sample["label"] for sample in self.train_samples]),
+            sample_indices=mx.array([sample["sample_index"] for sample in self.train_samples]),
         )
+        reference_logprobs = score_policy_in_chunks(
+            _actual_model(self.reference_policy.model),
+            eval_batch,
+            batch_size=max(1, self.batch_size),
+            mode="sequence",
+        ).summed_logprobs
+        reference_logprobs = mx.stop_gradient(reference_logprobs)
         for idx, sample in enumerate(self.train_samples):
             sample["reference_logprobs"] = reference_logprobs[idx]
         self.cache_metadata = {
@@ -1128,12 +1081,15 @@ class KTOTrainer(_RLTrainerBase):
         for idx, sample in enumerate(self.train_samples):
             sample["reference_logprobs"] = reference_logprobs[idx]
 
-    def _build_batch(self, samples: List[Dict[str, Any]]) -> Tuple[mx.array, ...]:
-        pad_id = _pad_token_id(self.tokenizer)
-        input_ids, lengths = _pad_sequences([sample["ids"] for sample in samples], pad_id)
-        labels = mx.array([sample["label"] for sample in samples])
-        reference_logprobs = mx.array([sample["reference_logprobs"] for sample in samples])
-        return input_ids, lengths, labels, reference_logprobs
+    def _build_batch(self, samples: List[Dict[str, Any]]) -> PolicyEvalBatch:
+        return make_policy_eval_batch(
+            [sample["ids"] for sample in samples],
+            pad_id=_pad_token_id(self.tokenizer),
+            mode="sequence",
+            labels=mx.array([sample["label"] for sample in samples]),
+            reference_logprobs=mx.array([sample["reference_logprobs"] for sample in samples]),
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+        )
 
     def _extra_state_arrays(self) -> Dict[str, mx.array]:
         return {
@@ -1163,14 +1119,13 @@ class KTOTrainer(_RLTrainerBase):
             self._precompute_reference_cache()
 
         def loss_fn(model, batch):
-            input_ids, lengths, labels, reference_logprobs = batch
             loss, _ = compute_kto_loss(
                 model=model,
-                input_ids=input_ids,
-                lengths=lengths,
-                labels=labels,
+                input_ids=batch.input_ids,
+                lengths=batch.sequence_lengths,
+                labels=batch.labels,
                 beta=self.beta,
-                reference_logprobs=reference_logprobs,
+                reference_logprobs=batch.reference_logprobs,
             )
             return loss
 

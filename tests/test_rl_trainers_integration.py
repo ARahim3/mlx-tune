@@ -86,7 +86,7 @@ def rollout_sequence_tensors(rollout_batch, index: int):
     return (
         mx.array([sequence]),
         mx.array([len(rollout_batch.prompt_ids[index])]),
-        mx.array([rollout_batch.completion_lengths[index]]),
+        mx.array([int(rollout_batch.completion_lengths[index].item())]),
     )
 
 
@@ -505,25 +505,25 @@ class TestKTOTrainerIntegration:
         trainer.train()
 
         sample = trainer.train_samples[0]
-        input_ids, lengths, labels, cached_reference = trainer._build_batch([sample])
+        batch = trainer._build_batch([sample])
         cached_loss, _ = kto_loss(
             trainer.model.model,
-            input_ids,
-            lengths,
-            labels,
+            batch.input_ids,
+            batch.sequence_lengths,
+            batch.labels,
             beta=trainer.beta,
-            reference_logprobs=cached_reference,
+            reference_logprobs=batch.reference_logprobs,
         )
         live_policy_reference = compute_log_probs_with_lengths(
             trainer.model.model,
-            input_ids,
-            lengths,
+            batch.input_ids,
+            batch.sequence_lengths,
         )
         live_loss, _ = kto_loss(
             trainer.model.model,
-            input_ids,
-            lengths,
-            labels,
+            batch.input_ids,
+            batch.sequence_lengths,
+            batch.labels,
             beta=trainer.beta,
             reference_logprobs=live_policy_reference,
         )

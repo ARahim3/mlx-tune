@@ -9,10 +9,56 @@ Provides native MLX losses and reference-logprob helpers for:
 - SimPO (Simple Preference Optimization)
 """
 
-from typing import Optional, Tuple, Callable, List, Any
+from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from mlx_tune._rl_runtime import (
+    PolicyEvalBatch,
+    build_token_mask,
+    collect_rollouts,
+    completion_token_mask,
+    compute_advantages,
+    evaluate_rewards,
+    kl_against_reference,
+    length_mask,
+    make_policy_eval_batch,
+    normalize_logprobs,
+    sample_completion,
+    score_policy,
+    score_policy_in_chunks,
+)
+
+
+def _policy_eval_from_padded(
+    input_ids: mx.array,
+    lengths: mx.array,
+    mode: str = "sequence",
+    prompt_lengths: Optional[mx.array] = None,
+    completion_lengths: Optional[mx.array] = None,
+    rollout_logprobs: Optional[mx.array] = None,
+    reference_logprobs: Optional[mx.array] = None,
+    advantages: Optional[mx.array] = None,
+    labels: Optional[mx.array] = None,
+) -> PolicyEvalBatch:
+    return PolicyEvalBatch(
+        input_ids=input_ids,
+        sequence_lengths=lengths,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        token_mask=build_token_mask(
+            input_ids=input_ids,
+            sequence_lengths=lengths,
+            mode=mode,
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+        ),
+        rollout_logprobs=rollout_logprobs,
+        reference_logprobs=reference_logprobs,
+        advantages=advantages,
+        labels=labels,
+    )
 
 
 def _token_log_probs(
@@ -20,39 +66,11 @@ def _token_log_probs(
     input_ids: mx.array,
     temperature: float = 1.0,
 ) -> mx.array:
-    """Return token log probabilities aligned to ``input_ids[:, 1:]``."""
-    inputs = input_ids[:, :-1]
-    targets = input_ids[:, 1:]
-
-    logits = model(inputs)
-    if temperature != 1.0:
-        logits = logits / temperature
-    log_probs = nn.log_softmax(logits, axis=-1)
-    return mx.take_along_axis(
-        log_probs,
-        targets[:, :, None],
-        axis=-1,
-    ).squeeze(-1)
-
-
-def _length_mask(lengths: mx.array, width: int) -> mx.array:
-    positions = mx.arange(width)[None, :]
-    return positions < lengths[:, None]
-
-
-def completion_token_mask(
-    input_ids: mx.array,
-    prompt_lengths: mx.array,
-    completion_lengths: mx.array,
-) -> mx.array:
-    """
-    Build a mask over ``input_ids[:, 1:]`` that keeps completion-token losses only.
-    """
-    width = input_ids.shape[1] - 1
-    positions = mx.arange(width)[None, :]
-    start = mx.maximum(prompt_lengths - 1, 0)[:, None]
-    end = mx.maximum(prompt_lengths + completion_lengths - 1, 0)[:, None]
-    return (positions >= start) & (positions < end)
+    batch = _policy_eval_from_padded(
+        input_ids=input_ids,
+        lengths=mx.array([input_ids.shape[1]] * input_ids.shape[0]),
+    )
+    return score_policy(model, batch, mode="sequence", temperature=temperature).token_logprobs
 
 
 def compute_log_probs(
@@ -77,9 +95,8 @@ def compute_log_probs_with_lengths(
     """
     Compute per-sequence log probabilities with explicit length masking.
     """
-    token_log_probs = _token_log_probs(model, input_ids)
-    mask = _length_mask(lengths, token_log_probs.shape[1]).astype(token_log_probs.dtype)
-    return (token_log_probs * mask).sum(axis=-1)
+    batch = _policy_eval_from_padded(input_ids=input_ids, lengths=lengths, mode="sequence")
+    return score_policy(model, batch, mode="sequence").summed_logprobs
 
 
 def compute_completion_log_probs(
@@ -92,9 +109,15 @@ def compute_completion_log_probs(
     """
     Compute log probabilities over completion tokens only.
     """
-    token_log_probs = _token_log_probs(model, input_ids, temperature=temperature)
-    mask = completion_token_mask(input_ids, prompt_lengths, completion_lengths)
-    return (token_log_probs * mask.astype(token_log_probs.dtype)).sum(axis=-1)
+    sequence_lengths = prompt_lengths + completion_lengths
+    batch = _policy_eval_from_padded(
+        input_ids=input_ids,
+        lengths=sequence_lengths,
+        mode="completion",
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+    )
+    return score_policy(model, batch, mode="completion", temperature=temperature).summed_logprobs
 
 
 def _batched_sequence_log_probs(
@@ -103,20 +126,8 @@ def _batched_sequence_log_probs(
     lengths: mx.array,
     batch_size: int = 8,
 ) -> mx.array:
-    if input_ids.shape[0] <= batch_size:
-        return compute_log_probs_with_lengths(model, input_ids, lengths)
-
-    chunks = []
-    for start in range(0, input_ids.shape[0], batch_size):
-        end = start + batch_size
-        chunks.append(
-            compute_log_probs_with_lengths(
-                model,
-                input_ids[start:end],
-                lengths[start:end],
-            )
-        )
-    return mx.concatenate(chunks, axis=0)
+    batch = _policy_eval_from_padded(input_ids=input_ids, lengths=lengths, mode="sequence")
+    return score_policy_in_chunks(model, batch, batch_size=batch_size, mode="sequence").summed_logprobs
 
 
 def precompute_preference_reference_logprobs(
@@ -162,20 +173,41 @@ def dpo_loss(
     """
     Compute DPO loss.
     """
-    log_pi_chosen = compute_log_probs_with_lengths(model, chosen_ids, chosen_lengths)
-    log_pi_rejected = compute_log_probs_with_lengths(model, rejected_ids, rejected_lengths)
+    chosen_batch = score_policy(
+        model,
+        _policy_eval_from_padded(
+            input_ids=chosen_ids,
+            lengths=chosen_lengths,
+            mode="sequence",
+            reference_logprobs=reference_chosen_logprobs,
+        ),
+        mode="sequence",
+    )
+    rejected_batch = score_policy(
+        model,
+        _policy_eval_from_padded(
+            input_ids=rejected_ids,
+            lengths=rejected_lengths,
+            mode="sequence",
+            reference_logprobs=reference_rejected_logprobs,
+        ),
+        mode="sequence",
+    )
 
-    if reference_chosen_logprobs is None or reference_rejected_logprobs is None:
-        log_ref_chosen = mx.stop_gradient(log_pi_chosen)
-        log_ref_rejected = mx.stop_gradient(log_pi_rejected)
-    else:
-        log_ref_chosen = reference_chosen_logprobs
-        log_ref_rejected = reference_rejected_logprobs
+    log_pi_chosen = chosen_batch.summed_logprobs
+    log_pi_rejected = rejected_batch.summed_logprobs
+    log_ref_chosen = (
+        mx.stop_gradient(log_pi_chosen)
+        if chosen_batch.reference_logprobs is None
+        else chosen_batch.reference_logprobs
+    )
+    log_ref_rejected = (
+        mx.stop_gradient(log_pi_rejected)
+        if rejected_batch.reference_logprobs is None
+        else rejected_batch.reference_logprobs
+    )
 
-    log_ratio_chosen = log_pi_chosen - log_ref_chosen
-    log_ratio_rejected = log_pi_rejected - log_ref_rejected
-    logits = beta * (log_ratio_chosen - log_ratio_rejected)
-
+    logits = beta * ((log_pi_chosen - log_ref_chosen) - (log_pi_rejected - log_ref_rejected))
     if label_smoothing > 0:
         losses = (
             -nn.log_sigmoid(logits) * (1 - label_smoothing)
@@ -183,7 +215,6 @@ def dpo_loss(
         )
     else:
         losses = -nn.log_sigmoid(logits)
-
     return mx.mean(losses), chosen_lengths.sum() + rejected_lengths.sum()
 
 
@@ -200,14 +231,12 @@ def orpo_loss(
     """
     log_pi_chosen = compute_log_probs_with_lengths(model, chosen_ids, chosen_lengths)
     log_pi_rejected = compute_log_probs_with_lengths(model, rejected_ids, rejected_lengths)
+    avg_log_pi_chosen = normalize_logprobs(log_pi_chosen, chosen_lengths, mode="mean")
 
-    avg_log_pi_chosen = log_pi_chosen / chosen_lengths.astype(log_pi_chosen.dtype)
     sft_term = -mx.mean(avg_log_pi_chosen)
     odds_term = -mx.mean(nn.log_sigmoid(log_pi_chosen - log_pi_rejected))
-
     loss = sft_term + beta * odds_term
-    ntoks = chosen_lengths.sum() + rejected_lengths.sum()
-    return loss, ntoks
+    return loss, chosen_lengths.sum() + rejected_lengths.sum()
 
 
 def kto_loss(
@@ -221,17 +250,26 @@ def kto_loss(
     """
     Compute KTO loss.
     """
-    log_pi = compute_log_probs_with_lengths(model, input_ids, lengths)
-    log_ref = mx.stop_gradient(log_pi) if reference_logprobs is None else reference_logprobs
+    batch = score_policy(
+        model,
+        _policy_eval_from_padded(
+            input_ids=input_ids,
+            lengths=lengths,
+            mode="sequence",
+            reference_logprobs=reference_logprobs,
+            labels=labels,
+        ),
+        mode="sequence",
+    )
+    log_pi = batch.summed_logprobs
+    log_ref = mx.stop_gradient(log_pi) if batch.reference_logprobs is None else batch.reference_logprobs
     log_ratio = log_pi - log_ref
 
     positive_mask = labels > 0.5
     negative_mask = ~positive_mask
     weights = mx.where(positive_mask, 1.0, 1.0)
-
     positive_loss = -nn.log_sigmoid(beta * log_ratio) * positive_mask
     negative_loss = -nn.log_sigmoid(-beta * log_ratio) * negative_mask
-
     loss = mx.mean(weights * (positive_loss + negative_loss))
     return loss, lengths.sum()
 
@@ -250,13 +288,11 @@ def simpo_loss(
     """
     log_pi_chosen = compute_log_probs_with_lengths(model, chosen_ids, chosen_lengths)
     log_pi_rejected = compute_log_probs_with_lengths(model, rejected_ids, rejected_lengths)
-
-    r_chosen = log_pi_chosen / chosen_lengths.astype(log_pi_chosen.dtype)
-    r_rejected = log_pi_rejected / rejected_lengths.astype(log_pi_rejected.dtype)
+    r_chosen = normalize_logprobs(log_pi_chosen, chosen_lengths, mode="mean")
+    r_rejected = normalize_logprobs(log_pi_rejected, rejected_lengths, mode="mean")
 
     logits = beta * (r_chosen - r_rejected - gamma)
-    loss = -mx.mean(nn.log_sigmoid(logits))
-    return loss, chosen_lengths.sum() + rejected_lengths.sum()
+    return -mx.mean(nn.log_sigmoid(logits)), chosen_lengths.sum() + rejected_lengths.sum()
 
 
 def sft_loss(
@@ -271,7 +307,7 @@ def sft_loss(
     targets = input_ids[:, 1:]
     logits = model(inputs)
 
-    mask = _length_mask(lengths, targets.shape[1]).astype(logits.dtype)
+    mask = length_mask(lengths, targets.shape[1]).astype(logits.dtype)
     ce = nn.losses.cross_entropy(logits, targets, reduction="none")
     masked_ce = ce * mask
     ntoks = mask.sum()
@@ -288,32 +324,18 @@ def generate_with_log_probs(
     """
     Generate a sampled completion and return sampled-token log probabilities.
     """
-    generated_ids = list(prompt_ids.tolist()) if hasattr(prompt_ids, "tolist") else list(prompt_ids)
-    log_probs = []
-    x = mx.array([generated_ids])
-
-    for _ in range(max_tokens):
-        logits = model(x)[:, -1, :]
-        if temperature > 0:
-            scaled = logits / temperature
-            probs = mx.softmax(scaled, axis=-1)
-            next_token = mx.random.categorical(mx.log(probs + 1e-10))
-            token_log_prob = nn.log_softmax(scaled, axis=-1)[0, next_token.item()]
-        else:
-            next_token = mx.argmax(logits, axis=-1)
-            token_log_prob = nn.log_softmax(logits, axis=-1)[0, next_token.item()]
-
-        next_token_id = next_token.item()
-        generated_ids.append(next_token_id)
-        log_probs.append(token_log_prob)
-        x = mx.array([generated_ids])
-
-        if hasattr(tokenizer, "eos_token_id") and next_token_id == tokenizer.eos_token_id:
-            break
-
-    if log_probs:
-        return mx.array(generated_ids), mx.stack(log_probs)
-    return mx.array(generated_ids), mx.zeros((0,), dtype=mx.float32)
+    generated = sample_completion(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_ids=prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        collect_sample_stats=False,
+    )
+    token_logprobs = generated["sampled_logprobs"]
+    if token_logprobs:
+        return mx.array(generated["generated_ids"]), mx.array(token_logprobs, dtype=mx.float32)
+    return mx.array(generated["generated_ids"]), mx.zeros((0,), dtype=mx.float32)
 
 
 def grpo_recompute_loss(
@@ -331,31 +353,28 @@ def grpo_recompute_loss(
     """
     Recompute GRPO loss on fixed sampled completions.
     """
-    current_logprobs = compute_completion_log_probs(
+    batch = score_policy(
         model,
-        input_ids,
-        prompt_lengths,
-        completion_lengths,
+        _policy_eval_from_padded(
+            input_ids=input_ids,
+            lengths=prompt_lengths + completion_lengths,
+            mode="completion",
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            rollout_logprobs=rollout_logprobs,
+            advantages=advantages,
+        ),
+        mode="completion",
+        reference_model=reference_model,
         temperature=temperature,
     )
-    reference_logprobs = compute_completion_log_probs(
-        reference_model,
-        input_ids,
-        prompt_lengths,
-        completion_lengths,
-        temperature=temperature,
-    )
-    reference_logprobs = mx.stop_gradient(reference_logprobs)
 
-    ratios = mx.exp(current_logprobs - rollout_logprobs)
+    ratios = mx.exp(batch.summed_logprobs - rollout_logprobs)
     clipped_ratios = mx.clip(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
-
     unclipped_objective = ratios * advantages
     clipped_objective = clipped_ratios * advantages
     policy_objective = mx.minimum(unclipped_objective, clipped_objective)
-
-    log_ratio = current_logprobs - reference_logprobs
-    kl_penalty = mx.exp(log_ratio) - log_ratio - 1.0
+    kl_penalty = kl_against_reference(batch.summed_logprobs, batch.reference_logprobs)
 
     loss = -mx.mean(policy_objective - beta * kl_penalty)
     return loss, completion_lengths.sum()
@@ -375,30 +394,27 @@ def grpo_loss(
     """
     Legacy log-only GRPO loss retained for compatibility.
     """
-    completions = []
-    all_log_probs = []
-
-    for _ in range(num_generations):
-        generated_ids, log_probs = generate_with_log_probs(
-            model,
-            tokenizer,
-            prompt_ids,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        completion_ids = generated_ids[len(prompt_ids):]
-        completion_text = tokenizer.decode(completion_ids.tolist())
-        completions.append(completion_text)
-        all_log_probs.append(log_probs.sum() if log_probs.size > 0 else mx.array(0.0))
-
-    rewards = mx.array([reward_fn(completion, prompt_text) for completion in completions])
-    rewards_std = mx.std(rewards)
-    if rewards_std.item() < 1e-6:
-        advantages = rewards - mx.mean(rewards)
-    else:
-        advantages = (rewards - mx.mean(rewards)) / (rewards_std + 1e-8)
-
-    pg_loss = -mx.mean(advantages * mx.stack(all_log_probs))
+    del beta
+    rollout_batch = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": prompt_text,
+                "prompt_ids": prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids),
+                "reward_context": prompt_text,
+            }
+        ],
+        sampling_config={
+            "num_generations": num_generations,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+    )
+    reward_batch = evaluate_rewards(rollout_batch, reward_fn)
+    advantages = compute_advantages(reward_batch)
+    pg_loss = -mx.mean(advantages * rollout_batch.rollout_logprobs)
     return pg_loss, num_generations
 
 
@@ -415,26 +431,30 @@ def grpo_batch_loss(
     """
     Legacy batched GRPO loss retained for compatibility.
     """
-    losses = []
-    total_completions = 0
-
-    for prompt in prompts:
-        prompt_ids = mx.array(tokenizer.encode(prompt))
-        loss, count = grpo_loss(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_ids=prompt_ids,
-            reward_fn=reward_fn,
-            prompt_text=prompt,
-            num_generations=num_generations,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            beta=beta,
-        )
-        losses.append(loss)
-        total_completions += count
-
-    return mx.mean(mx.stack(losses)), total_completions
+    del beta
+    prompt_samples = [
+        {
+            "sample_index": index,
+            "prompt": prompt,
+            "prompt_ids": tokenizer.encode(prompt),
+            "reward_context": prompt,
+        }
+        for index, prompt in enumerate(prompts)
+    ]
+    rollout_batch = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=prompt_samples,
+        sampling_config={
+            "num_generations": num_generations,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+    )
+    reward_batch = evaluate_rewards(rollout_batch, reward_fn)
+    advantages = compute_advantages(reward_batch)
+    pg_loss = -mx.mean(advantages * rollout_batch.rollout_logprobs)
+    return pg_loss, len(prompt_samples) * num_generations
 
 
 def compute_reference_logprobs(
@@ -454,3 +474,4 @@ def compute_reference_logprobs(
         chosen_lengths,
         rejected_lengths,
     )
+
