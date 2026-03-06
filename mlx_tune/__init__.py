@@ -15,7 +15,7 @@ Supported Training Methods:
 
 __version__ = "0.4.0"  # Renamed to mlx-tune (formerly unsloth-mlx)
 
-from mlx_tune.model import FastLanguageModel
+from mlx_tune.model import FastLanguageModel, ReferencePolicy
 from mlx_tune.trainer import (
     prepare_dataset,
     format_chat_template,
@@ -44,6 +44,7 @@ from mlx_tune.rl_trainers import (
 from mlx_tune.losses import (
     compute_log_probs,
     compute_log_probs_with_lengths,
+    compute_completion_log_probs,
     dpo_loss,
     orpo_loss,
     kto_loss,
@@ -52,6 +53,8 @@ from mlx_tune.losses import (
     grpo_loss,
     grpo_batch_loss,
     compute_reference_logprobs,
+    precompute_preference_reference_logprobs,
+    precompute_kto_reference_logprobs,
 )
 
 # Vision Language Models
@@ -96,6 +99,7 @@ from mlx_tune.chat_templates import (
 __all__ = [
     # Core
     "FastLanguageModel",
+    "ReferencePolicy",
     "__version__",
     # SFT Training
     "SFTTrainer",
@@ -116,6 +120,7 @@ __all__ = [
     # Loss Functions
     "compute_log_probs",
     "compute_log_probs_with_lengths",
+    "compute_completion_log_probs",
     "dpo_loss",
     "orpo_loss",
     "kto_loss",
@@ -124,6 +129,8 @@ __all__ = [
     "grpo_loss",
     "grpo_batch_loss",
     "compute_reference_logprobs",
+    "precompute_preference_reference_logprobs",
+    "precompute_kto_reference_logprobs",
     # Utilities
     "prepare_dataset",
     "prepare_preference_dataset",

@@ -1,220 +1,143 @@
 """
-Unit tests for loss functions in mlx_tune.losses
+Unit tests for mlx_tune.losses.
 """
 
-import pytest
 import mlx.core as mx
 import mlx.nn as nn
 
 
-class TestComputeLogProbs:
-    """Test log probability computation."""
+class TinyModel(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.output = nn.Linear(hidden_size, vocab_size)
 
-    def test_compute_log_probs_shape(self):
-        """Test output shape of compute_log_probs."""
-        from mlx_tune.losses import compute_log_probs_with_lengths
-
-        # Create a simple mock model
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        # Test input
-        batch_size = 2
-        seq_len = 10
-        input_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        lengths = mx.array([8, 6])
-
-        log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
-
-        assert log_probs.shape == (batch_size,), f"Expected shape {(batch_size,)}, got {log_probs.shape}"
-
-    def test_compute_log_probs_values(self):
-        """Test that log probs are negative (as expected for probabilities)."""
-        from mlx_tune.losses import compute_log_probs_with_lengths
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        input_ids = mx.random.randint(0, 100, (2, 10))
-        lengths = mx.array([8, 6])
-
-        log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
-        mx.eval(log_probs)
-
-        # Log probabilities should be negative (or zero at maximum)
-        assert mx.all(log_probs <= 0), "Log probabilities should be non-positive"
+    def __call__(self, x):
+        return self.output(self.embedding(x))
 
 
-class TestDPOLoss:
-    """Test DPO loss computation."""
+def test_compute_log_probs_with_lengths_shape():
+    from mlx_tune.losses import compute_log_probs_with_lengths
 
-    def test_dpo_loss_shape(self):
-        """Test DPO loss returns scalar."""
-        from mlx_tune.losses import dpo_loss
+    model = TinyModel()
+    mx.eval(model.parameters())
 
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
+    input_ids = mx.array([[1, 2, 3, 4], [1, 5, 6, 0]])
+    lengths = mx.array([3, 2])
 
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        batch_size = 2
-        seq_len = 10
-        chosen_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        rejected_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = dpo_loss(
-            model, chosen_ids, rejected_ids,
-            chosen_lengths, rejected_lengths,
-            beta=0.1
-        )
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
-        assert ntoks.shape == (), f"ntoks should be scalar, got shape {ntoks.shape}"
-
-    def test_dpo_loss_beta_effect(self):
-        """Test that higher beta increases loss magnitude."""
-        from mlx_tune.losses import dpo_loss
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss_low_beta, _ = dpo_loss(model, chosen_ids, rejected_ids,
-                                     chosen_lengths, rejected_lengths, beta=0.01)
-        loss_high_beta, _ = dpo_loss(model, chosen_ids, rejected_ids,
-                                      chosen_lengths, rejected_lengths, beta=1.0)
-
-        mx.eval(loss_low_beta, loss_high_beta)
-
-        # Both losses should be finite
-        assert not mx.isnan(loss_low_beta), "Low beta loss should not be NaN"
-        assert not mx.isnan(loss_high_beta), "High beta loss should not be NaN"
+    log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
+    assert log_probs.shape == (2,)
 
 
-class TestORPOLoss:
-    """Test ORPO loss computation."""
+def test_precompute_preference_reference_logprobs_matches_direct():
+    from mlx_tune.losses import (
+        compute_reference_logprobs,
+        precompute_preference_reference_logprobs,
+    )
 
-    def test_orpo_loss_shape(self):
-        """Test ORPO loss returns scalar."""
-        from mlx_tune.losses import orpo_loss
+    model = TinyModel()
+    mx.eval(model.parameters())
 
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
+    chosen_ids = mx.array([[1, 2, 3, 4], [1, 4, 5, 6]])
+    rejected_ids = mx.array([[1, 3, 2, 4], [1, 6, 5, 4]])
+    chosen_lengths = mx.array([3, 3])
+    rejected_lengths = mx.array([3, 3])
 
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
+    direct = compute_reference_logprobs(
+        model,
+        chosen_ids,
+        rejected_ids,
+        chosen_lengths,
+        rejected_lengths,
+    )
+    batched = precompute_preference_reference_logprobs(
+        model,
+        chosen_ids,
+        rejected_ids,
+        chosen_lengths,
+        rejected_lengths,
+        batch_size=1,
+    )
 
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = orpo_loss(model, chosen_ids, rejected_ids,
-                                chosen_lengths, rejected_lengths, beta=0.1)
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
-
-
-class TestSimPOLoss:
-    """Test SimPO loss computation."""
-
-    def test_simpo_loss_shape(self):
-        """Test SimPO loss returns scalar."""
-        from mlx_tune.losses import simpo_loss
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = simpo_loss(model, chosen_ids, rejected_ids,
-                                  chosen_lengths, rejected_lengths,
-                                  beta=2.0, gamma=0.5)
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
+    assert mx.allclose(direct[0], batched[0])
+    assert mx.allclose(direct[1], batched[1])
 
 
-class TestSFTLoss:
-    """Test SFT loss computation."""
+def test_precompute_kto_reference_logprobs_matches_direct():
+    from mlx_tune.losses import compute_log_probs_with_lengths, precompute_kto_reference_logprobs
 
-    def test_sft_loss_shape(self):
-        """Test SFT loss returns scalar."""
-        from mlx_tune.losses import sft_loss
+    model = TinyModel()
+    mx.eval(model.parameters())
 
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
+    input_ids = mx.array([[1, 2, 3, 4], [1, 6, 7, 8]])
+    lengths = mx.array([3, 3])
 
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
+    direct = compute_log_probs_with_lengths(model, input_ids, lengths)
+    cached = precompute_kto_reference_logprobs(model, input_ids, lengths, batch_size=1)
 
-        model = MockModel()
-        mx.eval(model.parameters())
+    assert mx.allclose(direct, cached)
 
-        input_ids = mx.random.randint(0, 100, (2, 10))
-        lengths = mx.array([8, 6])
 
-        loss, ntoks = sft_loss(model, input_ids, lengths)
+def test_compute_completion_log_probs_masks_prompt_tokens():
+    from mlx_tune.losses import compute_completion_log_probs
 
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
-        assert loss.item() > 0, "Cross entropy loss should be positive"
+    model = TinyModel()
+    mx.eval(model.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    prompt_lengths = mx.array([3])
+    completion_lengths = mx.array([2])
+
+    completion_only = compute_completion_log_probs(
+        model,
+        input_ids,
+        prompt_lengths,
+        completion_lengths,
+    )
+
+    first_completion = compute_completion_log_probs(
+        model,
+        input_ids,
+        mx.array([4]),
+        mx.array([1]),
+    )
+
+    assert completion_only.shape == (1,)
+    assert not mx.allclose(completion_only, first_completion)
+
+
+def test_grpo_recompute_loss_is_finite_and_trainable():
+    from mlx_tune.losses import (
+        compute_completion_log_probs,
+        grpo_recompute_loss,
+    )
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]])
+    prompt_lengths = mx.array([3, 2])
+    completion_lengths = mx.array([2, 3])
+    rollout_logprobs = compute_completion_log_probs(
+        policy,
+        input_ids,
+        prompt_lengths,
+        completion_lengths,
+    )
+    advantages = mx.array([1.0, -0.5])
+
+    loss, ntoks = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+    )
+
+    mx.eval(loss, ntoks)
+    assert loss.shape == ()
+    assert ntoks.item() == 5

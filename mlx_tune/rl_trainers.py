@@ -1,131 +1,300 @@
 """
-Reinforcement Learning Trainers for MLX-Tune
+Reinforcement learning trainers for MLX-Tune.
 
-Provides Unsloth/TRL-compatible RL training interfaces:
-- DPOTrainer: Direct Preference Optimization
-- ORPOTrainer: Odds Ratio Preference Optimization
-- GRPOTrainer: Group Relative Policy Optimization (DeepSeek R1 style)
-- KTOTrainer: Kahneman-Tversky Optimization
-- SimPOTrainer: Simple Preference Optimization
-
-These trainers use MLX under the hood for Apple Silicon optimization.
-Now with PROPER loss implementations using native MLX training!
+Provides TRL-style trainer interfaces for:
+- DPO
+- ORPO
+- GRPO
+- KTO
+- SimPO
 """
 
-from typing import Optional, Dict, Any, Union, List, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Dict, Any, List, Callable, Tuple
 import json
 import subprocess
 import warnings
 
 import mlx.core as mx
 
-# Try to import native training components
 try:
-    from mlx_lm.tuner.trainer import TrainingArgs
     import mlx.nn as nn
     import mlx.optimizers as optim
+    from mlx.utils import tree_flatten, tree_unflatten
     HAS_NATIVE_TRAINING = True
 except ImportError:
     HAS_NATIVE_TRAINING = False
 
-# Import our loss functions
 from mlx_tune.losses import (
-    dpo_loss as compute_dpo_loss,
-    orpo_loss as compute_orpo_loss,
-    kto_loss as compute_kto_loss,
-    simpo_loss as compute_simpo_loss,
-    grpo_batch_loss,
-    compute_reference_logprobs,
+    compute_completion_log_probs,
     compute_log_probs_with_lengths,
+    compute_reference_logprobs,
+    dpo_loss as compute_dpo_loss,
+    grpo_batch_loss,
+    grpo_recompute_loss,
+    kto_loss as compute_kto_loss,
+    orpo_loss as compute_orpo_loss,
+    precompute_kto_reference_logprobs,
+    precompute_preference_reference_logprobs,
+    simpo_loss as compute_simpo_loss,
 )
+from mlx_tune.model import ReferencePolicy
 
 
-def _save_adapters_and_config(model, adapter_path: Path):
+STATE_FILE = "trainer_state.safetensors"
+METADATA_FILE = "trainer_state.json"
+REFERENCE_FILE = "reference_model.safetensors"
+REFERENCE_METADATA_FILE = "reference_metadata.json"
+
+
+def _actual_model(model: Any) -> Any:
+    return model.model if hasattr(model, "model") else model
+
+
+def _pad_token_id(tokenizer: Any) -> int:
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return 0 if pad_id is None else pad_id
+
+
+def _save_adapters_and_config(model: Any, adapter_path: Path) -> bool:
     """
-    Save adapter weights and config (required for GGUF export).
-
-    This helper function is used by all RL trainers to ensure
-    adapter_config.json is created alongside adapters.safetensors.
+    Save trainable parameters and adapter config in mlx_lm-compatible layout.
     """
     try:
-        from mlx.utils import tree_flatten
-        actual_model = model.model if hasattr(model, 'model') else model
-        adapter_file = adapter_path / "adapters.safetensors"
+        actual_model = _actual_model(model)
         adapter_path.mkdir(parents=True, exist_ok=True)
-
-        # Save adapter weights (trainable parameters only)
+        adapter_file = adapter_path / "adapters.safetensors"
         adapter_weights = dict(tree_flatten(actual_model.trainable_parameters()))
         mx.save_safetensors(str(adapter_file), adapter_weights)
 
-        # Determine number of layers in the model
         num_layers = None
-        if hasattr(actual_model, 'layers'):
+        if hasattr(actual_model, "layers"):
             num_layers = len(actual_model.layers)
-        elif hasattr(actual_model, 'model') and hasattr(actual_model.model, 'layers'):
+        elif hasattr(actual_model, "model") and hasattr(actual_model.model, "layers"):
             num_layers = len(actual_model.model.layers)
 
-        # Save adapter_config.json
         lora_config = {}
-        if hasattr(model, 'lora_config') and model.lora_config:
+        if hasattr(model, "lora_config") and model.lora_config:
             lora_config = model.lora_config.copy()
 
-        r = lora_config.get('r', 16)
-        alpha = lora_config.get('lora_alpha', 16)
-
+        r = lora_config.get("r", 16)
+        alpha = lora_config.get("lora_alpha", 16)
         adapter_config = {
             "fine_tune_type": "lora",
             "num_layers": num_layers,
             "lora_parameters": {
                 "rank": r,
                 "scale": alpha / r,
-                "dropout": lora_config.get('lora_dropout', 0.0),
+                "dropout": lora_config.get("lora_dropout", 0.0),
             },
         }
 
-        target_modules = lora_config.get('target_modules', [])
+        target_modules = lora_config.get("target_modules", [])
         if target_modules:
             short_to_full = {
-                'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
-                'v_proj': 'self_attn.v_proj', 'o_proj': 'self_attn.o_proj',
-                'gate_proj': 'mlp.gate_proj', 'up_proj': 'mlp.up_proj',
-                'down_proj': 'mlp.down_proj',
+                "q_proj": "self_attn.q_proj",
+                "k_proj": "self_attn.k_proj",
+                "v_proj": "self_attn.v_proj",
+                "o_proj": "self_attn.o_proj",
+                "gate_proj": "mlp.gate_proj",
+                "up_proj": "mlp.up_proj",
+                "down_proj": "mlp.down_proj",
             }
             adapter_config["lora_parameters"]["keys"] = [
-                short_to_full.get(m, m) for m in target_modules
+                short_to_full.get(module, module) for module in target_modules
             ]
 
-        config_path = adapter_path / "adapter_config.json"
-        with open(config_path, 'w') as f:
-            json.dump(adapter_config, f, indent=2)
-
+        with open(adapter_path / "adapter_config.json", "w") as handle:
+            json.dump(adapter_config, handle, indent=2)
         return True
-    except Exception as e:
-        print(f"  ⚠ Could not save adapters: {e}")
+    except Exception as exc:
+        print(f"  Warning: could not save adapters: {exc}")
         return False
 
 
+def _save_full_model_state(model: Any, path: Path) -> None:
+    actual_model = _actual_model(model)
+    mx.save_safetensors(str(path), dict(tree_flatten(actual_model.parameters())))
+
+
+def _load_parameter_tree(model: Any, path: Path, strict: bool = False) -> None:
+    if not path.exists():
+        return
+    actual_model = _actual_model(model)
+    weights = mx.load(str(path))
+    actual_model.update(tree_unflatten(list(weights.items())), strict=strict)
+    mx.eval(actual_model.parameters())
+
+
+def _flatten_prefixed_tree(prefix: str, tree: Dict[str, Any]) -> Dict[str, mx.array]:
+    return {f"{prefix}.{key}": value for key, value in tree_flatten(tree)}
+
+
+def _extract_prefixed_tree(prefix: str, flat_state: Dict[str, mx.array]) -> Dict[str, Any]:
+    items = []
+    prefix_with_dot = f"{prefix}."
+    for key, value in flat_state.items():
+        if key.startswith(prefix_with_dot):
+            items.append((key[len(prefix_with_dot):], value))
+    return tree_unflatten(items) if items else {}
+
+
+def _rng_state_to_dict() -> Dict[str, mx.array]:
+    return {f"rng.{idx}": state for idx, state in enumerate(mx.random.state)}
+
+
+def _restore_rng_state(flat_state: Dict[str, mx.array]) -> None:
+    rng_items = []
+    idx = 0
+    while f"rng.{idx}" in flat_state:
+        rng_items.append(mx.array(flat_state[f"rng.{idx}"]))
+        idx += 1
+    if rng_items:
+        mx.random.state = rng_items
+
+
+def _pad_sequences(sequences: List[List[int]], pad_id: int) -> Tuple[mx.array, mx.array]:
+    max_length = max(len(sequence) for sequence in sequences)
+    padded = [sequence + [pad_id] * (max_length - len(sequence)) for sequence in sequences]
+    lengths = [len(sequence) for sequence in sequences]
+    return mx.array(padded), mx.array(lengths)
+
+
+class _RLTrainerBase:
+    algorithm = "rl"
+
+    def _init_native_state(self) -> None:
+        self.global_step = 0
+        self.dataset_cursor = 0
+        self.reference_policy: Optional[ReferencePolicy] = None
+        self.cache_metadata: Dict[str, Any] = {}
+        self.optimizer = None
+
+    def _apply_lora_if_needed(self) -> None:
+        if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
+            self.model._apply_lora()
+
+    def _optimizer_for_training(self):
+        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
+        return optim.AdamW(learning_rate=lr_schedule)
+
+    def _next_samples(self, samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not samples:
+            raise ValueError(f"{self.algorithm} training dataset is empty.")
+
+        batch = []
+        for _ in range(max(1, self.batch_size)):
+            batch.append(samples[self.dataset_cursor])
+            self.dataset_cursor = (self.dataset_cursor + 1) % len(samples)
+        return batch
+
+    def _state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return (checkpoint_dir or self.output_dir) / STATE_FILE
+
+    def _metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return (checkpoint_dir or self.output_dir) / METADATA_FILE
+
+    def _reference_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return (checkpoint_dir or self.output_dir) / REFERENCE_FILE
+
+    def _reference_metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return (checkpoint_dir or self.output_dir) / REFERENCE_METADATA_FILE
+
+    def _save_current_policy(self) -> None:
+        _save_adapters_and_config(self.model, self.adapter_path)
+        if hasattr(self.model, "set_adapter_path"):
+            self.model.set_adapter_path(str(self.adapter_path))
+
+    def _save_reference_policy(self) -> None:
+        if self.reference_policy is None:
+            return
+        _save_full_model_state(self.reference_policy.model, self._reference_path())
+        metadata = {
+            "source": self.reference_policy.source,
+            "metadata": self.reference_policy.metadata,
+        }
+        with open(self._reference_metadata_path(), "w") as handle:
+            json.dump(metadata, handle, indent=2)
+
+    def _build_training_metadata(self) -> Dict[str, Any]:
+        config = self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config)
+        return {
+            "algorithm": self.algorithm,
+            "config": config,
+            "global_step": self.global_step,
+            "dataset_cursor": self.dataset_cursor,
+            "cache_metadata": self.cache_metadata,
+        }
+
+    def save_state(
+        self,
+        optimizer: Any,
+        extra_arrays: Optional[Dict[str, mx.array]] = None,
+    ) -> None:
+        self._save_current_policy()
+        self._save_reference_policy()
+
+        state_arrays = {}
+        state_arrays.update(_flatten_prefixed_tree("optimizer", optimizer.state))
+        state_arrays.update(_rng_state_to_dict())
+        if extra_arrays:
+            state_arrays.update(extra_arrays)
+        mx.save_safetensors(str(self._state_path()), state_arrays)
+
+        with open(self._metadata_path(), "w") as handle:
+            json.dump(self._build_training_metadata(), handle, indent=2)
+
+    def _ensure_reference_policy(self) -> None:
+        if self.reference_policy is None:
+            ref_model = getattr(self, "ref_model", None)
+            self.reference_policy = ReferencePolicy.from_model(self.model, ref_model=ref_model)
+
+    def _load_reference_policy(self, checkpoint_dir: Path) -> None:
+        reference_path = self._reference_path(checkpoint_dir)
+        if reference_path.exists():
+            self.reference_policy = ReferencePolicy.from_model(self.model)
+            _load_parameter_tree(self.reference_policy.model, reference_path, strict=False)
+            _actual_model(self.reference_policy.model).freeze()
+            mx.eval(_actual_model(self.reference_policy.model).parameters())
+        else:
+            self._ensure_reference_policy()
+
+    def load_state(self, optimizer: Any, checkpoint_dir: Path) -> Dict[str, mx.array]:
+        checkpoint_dir = Path(checkpoint_dir)
+        adapter_file = checkpoint_dir / "adapters" / "adapters.safetensors"
+        if adapter_file.exists():
+            _load_parameter_tree(self.model, adapter_file, strict=False)
+            if hasattr(self.model, "set_adapter_path"):
+                self.model.set_adapter_path(str(checkpoint_dir / "adapters"))
+
+        state_path = self._state_path(checkpoint_dir)
+        metadata_path = self._metadata_path(checkpoint_dir)
+        if not state_path.exists() or not metadata_path.exists():
+            raise FileNotFoundError(f"Checkpoint state not found under {checkpoint_dir}")
+
+        with open(metadata_path) as handle:
+            metadata = json.load(handle)
+
+        flat_state = mx.load(str(state_path))
+        optimizer_state = _extract_prefixed_tree("optimizer", flat_state)
+        if optimizer_state:
+            optimizer.state = optimizer_state
+        _restore_rng_state(flat_state)
+
+        self.global_step = metadata.get("global_step", 0)
+        self.dataset_cursor = metadata.get("dataset_cursor", 0)
+        self.cache_metadata = metadata.get("cache_metadata", {})
+        self._load_reference_policy(checkpoint_dir)
+        return flat_state
+
+
 class DPOConfig:
-    """
-    Configuration for Direct Preference Optimization training.
-
-    Compatible with TRL's DPOConfig.
-
-    Example:
-        >>> config = DPOConfig(
-        ...     beta=0.1,
-        ...     learning_rate=5e-7,
-        ...     max_steps=100,
-        ... )
-    """
-
     def __init__(
         self,
-        # DPO-specific
-        beta: float = 0.1,  # KL penalty coefficient
-        loss_type: str = "sigmoid",  # sigmoid, hinge, ipo, kto_pair
+        beta: float = 0.1,
+        loss_type: str = "sigmoid",
         label_smoothing: float = 0.0,
-        # Training args
         output_dir: str = "./dpo_outputs",
         learning_rate: float = 5e-7,
         per_device_train_batch_size: int = 2,
@@ -137,7 +306,7 @@ class DPOConfig:
         save_steps: int = 100,
         max_seq_length: int = 2048,
         max_prompt_length: int = 512,
-        **kwargs
+        **kwargs,
     ):
         self.beta = beta
         self.loss_type = loss_type
@@ -153,34 +322,17 @@ class DPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_prompt_length = max_prompt_length
-
         for key, value in kwargs.items():
             setattr(self, key, value)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
 
 
 class ORPOConfig:
-    """
-    Configuration for Odds Ratio Preference Optimization training.
-
-    ORPO combines SFT and preference learning into a single step,
-    making it simpler and more efficient than traditional RLHF.
-
-    Example:
-        >>> config = ORPOConfig(
-        ...     beta=0.1,
-        ...     learning_rate=8e-6,
-        ...     max_steps=1000,
-        ... )
-    """
-
     def __init__(
         self,
-        # ORPO-specific
-        beta: float = 0.1,  # Odds ratio coefficient
-        # Training args
+        beta: float = 0.1,
         output_dir: str = "./orpo_outputs",
         learning_rate: float = 8e-6,
         per_device_train_batch_size: int = 2,
@@ -192,7 +344,7 @@ class ORPOConfig:
         save_steps: int = 100,
         max_seq_length: int = 2048,
         max_prompt_length: int = 512,
-        **kwargs
+        **kwargs,
     ):
         self.beta = beta
         self.output_dir = output_dir
@@ -206,47 +358,22 @@ class ORPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_prompt_length = max_prompt_length
-
         for key, value in kwargs.items():
             setattr(self, key, value)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
 
 
 class GRPOConfig:
-    """
-    Configuration for Group Relative Policy Optimization training.
-
-    GRPO is used by DeepSeek to train their R1 reasoning models.
-    It replaces the value model with group statistics and uses custom
-    reward functions.
-
-    Supports loss types:
-    - 'grpo': Standard GRPO
-    - 'dr_grpo': Dr. GRPO (distilled)
-    - 'dapo': DAPO variant
-    - 'bnpo': BNPO variant
-
-    Example:
-        >>> config = GRPOConfig(
-        ...     loss_type='grpo',
-        ...     num_generations=4,
-        ...     learning_rate=1e-6,
-        ... )
-    """
-
     def __init__(
         self,
-        # GRPO-specific
-        loss_type: str = "grpo",  # grpo, dr_grpo, dapo, bnpo
-        beta: float = 0.04,  # KL coefficient
-        num_generations: int = 4,  # Number of generations per prompt
+        loss_type: str = "grpo",
+        beta: float = 0.04,
+        num_generations: int = 4,
         temperature: float = 0.7,
         max_completion_length: int = 512,
-        # Reward function (custom callable)
         reward_fn: Optional[Callable] = None,
-        # Training args
         output_dir: str = "./grpo_outputs",
         learning_rate: float = 1e-6,
         per_device_train_batch_size: int = 1,
@@ -257,7 +384,7 @@ class GRPOConfig:
         logging_steps: int = 1,
         save_steps: int = 100,
         max_seq_length: int = 2048,
-        **kwargs
+        **kwargs,
     ):
         self.loss_type = loss_type
         self.beta = beta
@@ -275,45 +402,31 @@ class GRPOConfig:
         self.logging_steps = logging_steps
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
-
         for key, value in kwargs.items():
             setattr(self, key, value)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items()
-                if not k.startswith('_') and k != 'reward_fn'}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if not key.startswith("_") and key != "reward_fn"
+        }
 
 
-class DPOTrainer:
-    """
-    Direct Preference Optimization Trainer.
+@dataclass
+class GRPORolloutBatch:
+    prompt_texts: List[str]
+    prompt_ids: List[List[int]]
+    reward_contexts: List[str]
+    completion_ids: List[List[int]]
+    completion_lengths: List[int]
+    rollout_logprobs: mx.array
+    rewards: mx.array
+    advantages: mx.array
 
-    DPO trains models on preference data (chosen vs rejected responses)
-    without requiring a separate reward model.
 
-    Compatible with TRL's DPOTrainer API.
-    Now with PROPER DPO loss implementation!
-
-    Example:
-        >>> from mlx_tune import FastLanguageModel, DPOTrainer, DPOConfig
-        >>>
-        >>> model, tokenizer = FastLanguageModel.from_pretrained(...)
-        >>> model = FastLanguageModel.get_peft_model(model, r=16)
-        >>>
-        >>> # Preference dataset with chosen/rejected pairs
-        >>> dataset = [
-        ...     {"prompt": "...", "chosen": "...", "rejected": "..."},
-        ... ]
-        >>>
-        >>> trainer = DPOTrainer(
-        ...     model=model,
-        ...     ref_model=None,  # Uses stop_gradient by default
-        ...     train_dataset=dataset,
-        ...     tokenizer=tokenizer,
-        ...     args=DPOConfig(beta=0.1),
-        ... )
-        >>> trainer.train()
-    """
+class DPOTrainer(_RLTrainerBase):
+    algorithm = "dpo"
 
     def __init__(
         self,
@@ -323,269 +436,221 @@ class DPOTrainer:
         tokenizer: Optional[Any] = None,
         args: Optional[DPOConfig] = None,
         use_native: bool = True,
-        **kwargs
+        **kwargs,
     ):
         self.model = model
         self.ref_model = ref_model
         self.train_dataset = train_dataset
-        self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
+        self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.use_native = use_native and HAS_NATIVE_TRAINING
-
-        # Extract config
-        if args is None:
-            args = DPOConfig()
-
-        self.config = args
-        self.beta = args.beta
-        self.loss_type = args.loss_type
-        self.label_smoothing = args.label_smoothing
-        self.output_dir = Path(args.output_dir)
-        self.learning_rate = args.learning_rate
-        self.batch_size = args.per_device_train_batch_size
-        self.max_steps = args.max_steps
-        self.max_seq_length = args.max_seq_length
-        self.max_prompt_length = args.max_prompt_length
-        self.gradient_accumulation_steps = args.gradient_accumulation_steps
-        self.warmup_steps = args.warmup_steps
-        self.logging_steps = args.logging_steps
-        self.save_steps = args.save_steps
-
-        # Calculate iters
-        if self.max_steps > 0:
-            self.iters = self.max_steps
-        else:
-            dataset_size = len(train_dataset) if hasattr(train_dataset, '__len__') else 100
-            self.iters = max(1, (dataset_size // self.batch_size) * args.num_train_epochs)
-
+        self.config = args or DPOConfig()
+        self.beta = self.config.beta
+        self.loss_type = self.config.loss_type
+        self.label_smoothing = self.config.label_smoothing
+        self.output_dir = Path(self.config.output_dir)
+        self.learning_rate = self.config.learning_rate
+        self.batch_size = self.config.per_device_train_batch_size
+        self.max_steps = self.config.max_steps
+        self.max_seq_length = self.config.max_seq_length
+        self.max_prompt_length = self.config.max_prompt_length
+        self.gradient_accumulation_steps = self.config.gradient_accumulation_steps
+        self.warmup_steps = self.config.warmup_steps
+        self.logging_steps = self.config.logging_steps
+        self.save_steps = self.config.save_steps
+        dataset_size = len(train_dataset) if hasattr(train_dataset, "__len__") else 100
+        self.iters = self.max_steps if self.max_steps > 0 else max(
+            1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
+        self.train_samples: List[Dict[str, Any]] = []
+        self._init_native_state()
 
-        print(f"DPOTrainer initialized:")
-        print(f"  Beta: {self.beta}")
-        print(f"  Loss type: {self.loss_type}")
-        print(f"  Learning rate: {self.learning_rate}")
-        print(f"  Iterations: {self.iters}")
-        print(f"  Native training: {self.use_native}")
-        print(f"  Using proper DPO loss: {self.use_native}")
+    def _tokenize_preference_pair(self, sample: Dict[str, Any], sample_index: int) -> Dict[str, Any]:
+        prompt = sample.get("prompt", "")
+        chosen = sample.get("chosen", "")
+        rejected = sample.get("rejected", "")
 
-    def _tokenize_preference_pair(self, sample: Dict) -> Dict:
-        """Tokenize a preference pair (prompt + chosen, prompt + rejected)."""
-        prompt = sample.get('prompt', '')
-        chosen = sample.get('chosen', '')
-        rejected = sample.get('rejected', '')
-
-        # Tokenize chosen and rejected with prompt
-        chosen_text = prompt + chosen
-        rejected_text = prompt + rejected
-
-        chosen_ids = self.tokenizer.encode(chosen_text)
-        rejected_ids = self.tokenizer.encode(rejected_text)
-
-        # Truncate if needed
-        if len(chosen_ids) > self.max_seq_length:
-            chosen_ids = chosen_ids[:self.max_seq_length]
-        if len(rejected_ids) > self.max_seq_length:
-            rejected_ids = rejected_ids[:self.max_seq_length]
-
+        chosen_ids = self.tokenizer.encode(prompt + chosen)[: self.max_seq_length]
+        rejected_ids = self.tokenizer.encode(prompt + rejected)[: self.max_seq_length]
         return {
-            'chosen_ids': chosen_ids,
-            'rejected_ids': rejected_ids,
-            'chosen_length': len(chosen_ids),
-            'rejected_length': len(rejected_ids),
+            "sample_index": sample_index,
+            "chosen_ids": chosen_ids,
+            "rejected_ids": rejected_ids,
+            "chosen_length": len(chosen_ids),
+            "rejected_length": len(rejected_ids),
         }
 
-    def _prepare_dpo_batches(self):
-        """Prepare batched DPO data for training."""
-        tokenized_data = []
-        for sample in self.train_dataset:
-            if 'prompt' in sample and 'chosen' in sample and 'rejected' in sample:
-                tokenized_data.append(self._tokenize_preference_pair(sample))
+    def _prepare_training_samples(self) -> None:
+        self.train_samples = []
+        for sample_index, sample in enumerate(self.train_dataset):
+            if {"prompt", "chosen", "rejected"} <= set(sample.keys()):
+                self.train_samples.append(self._tokenize_preference_pair(sample, sample_index))
+        if not self.train_samples:
+            raise ValueError("DPOTrainer requires prompt/chosen/rejected samples.")
 
-        return tokenized_data
+    def _precompute_reference_cache(self) -> None:
+        self._ensure_reference_policy()
+        pad_id = _pad_token_id(self.tokenizer)
+        chosen_ids, chosen_lengths = _pad_sequences(
+            [sample["chosen_ids"] for sample in self.train_samples],
+            pad_id,
+        )
+        rejected_ids, rejected_lengths = _pad_sequences(
+            [sample["rejected_ids"] for sample in self.train_samples],
+            pad_id,
+        )
+        ref_chosen, ref_rejected = precompute_preference_reference_logprobs(
+            _actual_model(self.reference_policy.model),
+            chosen_ids,
+            rejected_ids,
+            chosen_lengths,
+            rejected_lengths,
+            batch_size=max(1, self.batch_size),
+        )
+        for idx, sample in enumerate(self.train_samples):
+            sample["reference_chosen_logprobs"] = ref_chosen[idx]
+            sample["reference_rejected_logprobs"] = ref_rejected[idx]
+        self.cache_metadata = {
+            "type": "inline_preference_reference_logprobs",
+            "num_samples": len(self.train_samples),
+        }
 
-    def _pad_to_length(self, ids: List[int], length: int, pad_id: int = 0) -> List[int]:
-        """Pad sequence to target length."""
-        if len(ids) >= length:
-            return ids[:length]
-        return ids + [pad_id] * (length - len(ids))
+    def _restore_reference_cache(self, flat_state: Dict[str, mx.array]) -> None:
+        if "dpo.reference_chosen_logprobs" not in flat_state:
+            self._precompute_reference_cache()
+            return
+        ref_chosen = flat_state["dpo.reference_chosen_logprobs"]
+        ref_rejected = flat_state["dpo.reference_rejected_logprobs"]
+        if ref_chosen.shape[0] != len(self.train_samples):
+            raise ValueError("Saved DPO cache does not match current dataset ordering.")
+        for idx, sample in enumerate(self.train_samples):
+            sample["reference_chosen_logprobs"] = ref_chosen[idx]
+            sample["reference_rejected_logprobs"] = ref_rejected[idx]
 
-    def train(self):
-        """
-        Train the model using DPO with proper loss computation.
+    def _build_batch(self, samples: List[Dict[str, Any]]) -> Tuple[mx.array, ...]:
+        pad_id = _pad_token_id(self.tokenizer)
+        chosen_ids, chosen_lengths = _pad_sequences([sample["chosen_ids"] for sample in samples], pad_id)
+        rejected_ids, rejected_lengths = _pad_sequences([sample["rejected_ids"] for sample in samples], pad_id)
+        ref_chosen = mx.array([sample["reference_chosen_logprobs"] for sample in samples])
+        ref_rejected = mx.array([sample["reference_rejected_logprobs"] for sample in samples])
+        return chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, ref_chosen, ref_rejected
 
-        Uses native MLX training with real DPO loss when available,
-        falls back to SFT approximation otherwise.
-        """
-        print("=" * 70)
-        print("Starting DPO Training")
-        print("=" * 70)
+    def _extra_state_arrays(self) -> Dict[str, mx.array]:
+        return {
+            "dpo.reference_chosen_logprobs": mx.array(
+                [sample["reference_chosen_logprobs"] for sample in self.train_samples]
+            ),
+            "dpo.reference_rejected_logprobs": mx.array(
+                [sample["reference_rejected_logprobs"] for sample in self.train_samples]
+            ),
+        }
 
+    def train(self, resume_from_checkpoint: Optional[str] = None):
         if self.use_native:
-            return self._train_native()
+            return self._train_native(resume_from_checkpoint=resume_from_checkpoint)
+        return self._train_subprocess()
+
+    def _train_native(self, resume_from_checkpoint: Optional[str] = None):
+        self._apply_lora_if_needed()
+        self._prepare_training_samples()
+
+        actual_model = _actual_model(self.model)
+        optimizer = self._optimizer_for_training()
+        self.optimizer = optimizer
+
+        if resume_from_checkpoint is not None:
+            flat_state = self.load_state(optimizer, Path(resume_from_checkpoint))
+            self._restore_reference_cache(flat_state)
         else:
-            return self._train_subprocess()
+            self._precompute_reference_cache()
 
-    def _train_native(self):
-        """Train using native MLX with proper DPO loss."""
-        print("\n[Using Native DPO Training with Proper Loss]")
-
-        # Apply LoRA if needed
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
-            print("Applying LoRA adapters...")
-            self.model._apply_lora()
-
-        # Prepare data
-        print("Preparing preference data...")
-        tokenized_data = self._prepare_dpo_batches()
-        print(f"✓ Prepared {len(tokenized_data)} preference pairs")
-
-        # Get actual model
-        actual_model = self.model.model if hasattr(self.model, 'model') else self.model
-
-        # Create optimizer
-        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
-        optimizer = optim.AdamW(learning_rate=lr_schedule)
-
-        # Training loop
-        print(f"\nStarting training for {self.iters} iterations...")
-
-        # Define loss and grad function
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
-
-            loss, ntoks = compute_dpo_loss(
+        def loss_fn(model, batch):
+            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, ref_chosen, ref_rejected = batch
+            loss, _ = compute_dpo_loss(
                 model=model,
                 chosen_ids=chosen_ids,
                 rejected_ids=rejected_ids,
                 chosen_lengths=chosen_lengths,
                 rejected_lengths=rejected_lengths,
                 beta=self.beta,
+                reference_chosen_logprobs=ref_chosen,
+                reference_rejected_logprobs=ref_rejected,
                 label_smoothing=self.label_smoothing,
             )
             return loss
 
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        value_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        running_loss = 0.0
+        last_loss = None
 
-        total_loss = 0.0
-        for step in range(self.iters):
-            # Get batch
-            batch_idx = step % len(tokenized_data)
-            sample = tokenized_data[batch_idx]
-
-            # Pad sequences
-            max_len = max(sample['chosen_length'], sample['rejected_length'])
-            pad_id = self.tokenizer.pad_token_id or 0
-
-            chosen_padded = self._pad_to_length(sample['chosen_ids'], max_len, pad_id)
-            rejected_padded = self._pad_to_length(sample['rejected_ids'], max_len, pad_id)
-
-            # Create batch tensors
-            chosen_ids = mx.array([chosen_padded])
-            rejected_ids = mx.array([rejected_padded])
-            chosen_lengths = mx.array([sample['chosen_length']])
-            rejected_lengths = mx.array([sample['rejected_length']])
-
-            batch_data = (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths)
-
-            # Compute loss and gradients
-            loss, grads = loss_and_grad(actual_model, batch_data)
+        while self.global_step < self.iters:
+            batch_samples = self._next_samples(self.train_samples)
+            batch = self._build_batch(batch_samples)
+            loss, grads = value_and_grad(actual_model, batch)
             optimizer.update(actual_model, grads)
             mx.eval(actual_model.parameters(), optimizer.state)
 
-            total_loss += loss.item()
+            last_loss = loss.item()
+            running_loss += last_loss
+            self.global_step += 1
 
-            # Logging
-            if (step + 1) % self.logging_steps == 0:
-                avg_loss = total_loss / self.logging_steps
-                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f}")
-                total_loss = 0.0
+            if self.global_step % self.logging_steps == 0:
+                print(
+                    f"DPO step {self.global_step}/{self.iters} | "
+                    f"loss={running_loss / self.logging_steps:.4f}"
+                )
+                running_loss = 0.0
 
-            # Save checkpoint
-            if (step + 1) % self.save_steps == 0:
-                self._save_adapters(step + 1)
+            if self.global_step % self.save_steps == 0:
+                self.save_state(optimizer, self._extra_state_arrays())
 
-        # Final save
-        self._save_adapters(self.iters)
-
-        print("\n" + "=" * 70)
-        print("DPO Training Complete!")
-        print("=" * 70)
-        print(f"  Adapters saved to: {self.adapter_path}")
-
-        return {"status": "success", "adapter_path": str(self.adapter_path)}
-
-    def _save_adapters(self, step: int):
-        """Save adapter weights and config."""
-        if _save_adapters_and_config(self.model, self.adapter_path):
-            print(f"  ✓ Saved checkpoint at step {step}")
+        self.save_state(optimizer, self._extra_state_arrays())
+        return {
+            "status": "success",
+            "adapter_path": str(self.adapter_path),
+            "global_step": self.global_step,
+            "final_loss": last_loss,
+        }
 
     def _train_subprocess(self):
-        """Fallback: Train using subprocess (SFT approximation)."""
         warnings.warn(
-            "Native DPO training not available. Using SFT on chosen responses. "
-            "Install mlx-lm[train] for proper DPO loss.",
-            UserWarning
+            "Native DPO training not available. Using SFT-on-chosen approximation.",
+            UserWarning,
         )
-
-        print("\n[Using Subprocess Training (SFT Approximation)]")
-
-        # Prepare SFT data from chosen responses
         train_file = self.output_dir / "train.jsonl"
         valid_file = self.output_dir / "valid.jsonl"
-
-        with open(train_file, 'w') as f:
+        with open(train_file, "w") as handle:
             for sample in self.train_dataset:
-                if 'prompt' in sample and 'chosen' in sample:
+                if "prompt" in sample and "chosen" in sample:
                     messages = [
-                        {"role": "user", "content": sample['prompt']},
-                        {"role": "assistant", "content": sample['chosen']}
+                        {"role": "user", "content": sample["prompt"]},
+                        {"role": "assistant", "content": sample["chosen"]},
                     ]
-                    f.write(json.dumps({"messages": messages}) + '\n')
-
-        import shutil
-        shutil.copy(train_file, valid_file)
-
-        model_name = getattr(self.model, 'model_name', 'model')
-
+                    handle.write(json.dumps({"messages": messages}) + "\n")
+        valid_file.write_text(train_file.read_text())
         cmd = [
             "mlx_lm.lora",
-            "--model", model_name,
+            "--model",
+            getattr(self.model, "model_name", "model"),
             "--train",
-            "--data", str(self.output_dir),
-            "--iters", str(self.iters),
-            "--learning-rate", str(self.learning_rate),
-            "--batch-size", str(self.batch_size),
-            "--adapter-path", str(self.adapter_path),
+            "--data",
+            str(self.output_dir),
+            "--iters",
+            str(self.iters),
+            "--learning-rate",
+            str(self.learning_rate),
+            "--batch-size",
+            str(self.batch_size),
+            "--adapter-path",
+            str(self.adapter_path),
         ]
-
-        print(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
-
-        print("DPO Training Complete (SFT approximation)!")
         return {"status": "success", "adapter_path": str(self.adapter_path)}
 
 
 class ORPOTrainer:
-    """
-    Odds Ratio Preference Optimization Trainer.
-
-    ORPO combines SFT and preference alignment in a single training step,
-    making it simpler and more memory-efficient than DPO.
-
-    Compatible with TRL's ORPOTrainer API.
-    Now with PROPER ORPO loss implementation!
-
-    Example:
-        >>> trainer = ORPOTrainer(
-        ...     model=model,
-        ...     train_dataset=preference_dataset,
-        ...     tokenizer=tokenizer,
-        ...     args=ORPOConfig(beta=0.1),
-        ... )
-        >>> trainer.train()
-    """
-
     def __init__(
         self,
         model: Any,
@@ -593,196 +658,124 @@ class ORPOTrainer:
         tokenizer: Optional[Any] = None,
         args: Optional[ORPOConfig] = None,
         use_native: bool = True,
-        **kwargs
+        **kwargs,
     ):
         self.model = model
         self.train_dataset = train_dataset
-        self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
+        self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.use_native = use_native and HAS_NATIVE_TRAINING
-
-        if args is None:
-            args = ORPOConfig()
-
-        self.config = args
-        self.beta = args.beta
-        self.output_dir = Path(args.output_dir)
-        self.learning_rate = args.learning_rate
-        self.batch_size = args.per_device_train_batch_size
-        self.max_steps = args.max_steps
-        self.max_seq_length = args.max_seq_length
-        self.logging_steps = args.logging_steps
-        self.save_steps = args.save_steps
-
-        if self.max_steps > 0:
-            self.iters = self.max_steps
-        else:
-            dataset_size = len(train_dataset) if hasattr(train_dataset, '__len__') else 100
-            self.iters = max(1, (dataset_size // self.batch_size) * args.num_train_epochs)
-
+        self.config = args or ORPOConfig()
+        self.beta = self.config.beta
+        self.output_dir = Path(self.config.output_dir)
+        self.learning_rate = self.config.learning_rate
+        self.batch_size = self.config.per_device_train_batch_size
+        self.max_steps = self.config.max_steps
+        self.max_seq_length = self.config.max_seq_length
+        self.logging_steps = self.config.logging_steps
+        self.save_steps = self.config.save_steps
+        dataset_size = len(train_dataset) if hasattr(train_dataset, "__len__") else 100
+        self.iters = self.max_steps if self.max_steps > 0 else max(
+            1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"ORPOTrainer initialized:")
-        print(f"  Beta: {self.beta}")
-        print(f"  Learning rate: {self.learning_rate}")
-        print(f"  Iterations: {self.iters}")
-        print(f"  Native training: {self.use_native}")
-
-    def _tokenize_preference_pair(self, sample: Dict) -> Dict:
-        """Tokenize a preference pair."""
-        prompt = sample.get('prompt', '')
-        chosen = sample.get('chosen', '')
-        rejected = sample.get('rejected', '')
-
-        chosen_ids = self.tokenizer.encode(prompt + chosen)
-        rejected_ids = self.tokenizer.encode(prompt + rejected)
-
-        if len(chosen_ids) > self.max_seq_length:
-            chosen_ids = chosen_ids[:self.max_seq_length]
-        if len(rejected_ids) > self.max_seq_length:
-            rejected_ids = rejected_ids[:self.max_seq_length]
-
+    def _tokenize_preference_pair(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = sample.get("prompt", "")
+        chosen = sample.get("chosen", "")
+        rejected = sample.get("rejected", "")
+        chosen_ids = self.tokenizer.encode(prompt + chosen)[: self.max_seq_length]
+        rejected_ids = self.tokenizer.encode(prompt + rejected)[: self.max_seq_length]
         return {
-            'chosen_ids': chosen_ids,
-            'rejected_ids': rejected_ids,
-            'chosen_length': len(chosen_ids),
-            'rejected_length': len(rejected_ids),
+            "chosen_ids": chosen_ids,
+            "rejected_ids": rejected_ids,
+            "chosen_length": len(chosen_ids),
+            "rejected_length": len(rejected_ids),
         }
 
-    def _pad_to_length(self, ids: List[int], length: int, pad_id: int = 0) -> List[int]:
-        if len(ids) >= length:
-            return ids[:length]
-        return ids + [pad_id] * (length - len(ids))
-
     def train(self):
-        """Train using ORPO with proper loss."""
-        print("=" * 70)
-        print("Starting ORPO Training")
-        print("=" * 70)
-
         if self.use_native:
             return self._train_native()
-        else:
-            return self._train_subprocess()
+        return self._train_subprocess()
 
     def _train_native(self):
-        """Train with native ORPO loss."""
-        print("\n[Using Native ORPO Training with Proper Loss]")
-
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
+        if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
             self.model._apply_lora()
 
-        # Prepare data
-        tokenized_data = []
-        for sample in self.train_dataset:
-            if 'prompt' in sample and 'chosen' in sample and 'rejected' in sample:
-                tokenized_data.append(self._tokenize_preference_pair(sample))
-        print(f"✓ Prepared {len(tokenized_data)} preference pairs")
+        tokenized_data = [
+            self._tokenize_preference_pair(sample)
+            for sample in self.train_dataset
+            if {"prompt", "chosen", "rejected"} <= set(sample.keys())
+        ]
+        actual_model = _actual_model(self.model)
+        optimizer = optim.AdamW(learning_rate=optim.cosine_decay(self.learning_rate, self.iters))
 
-        actual_model = self.model.model if hasattr(self.model, 'model') else self.model
-        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
-        optimizer = optim.AdamW(learning_rate=lr_schedule)
-
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+        def loss_fn(model, batch):
+            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch
             loss, _ = compute_orpo_loss(
-                model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, self.beta
+                model,
+                chosen_ids,
+                rejected_ids,
+                chosen_lengths,
+                rejected_lengths,
+                self.beta,
             )
             return loss
 
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        value_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        last_loss = None
+        pad_id = _pad_token_id(self.tokenizer)
 
-        total_loss = 0.0
         for step in range(self.iters):
-            batch_idx = step % len(tokenized_data)
-            sample = tokenized_data[batch_idx]
-
-            max_len = max(sample['chosen_length'], sample['rejected_length'])
-            pad_id = self.tokenizer.pad_token_id or 0
-
-            chosen_ids = mx.array([self._pad_to_length(sample['chosen_ids'], max_len, pad_id)])
-            rejected_ids = mx.array([self._pad_to_length(sample['rejected_ids'], max_len, pad_id)])
-            chosen_lengths = mx.array([sample['chosen_length']])
-            rejected_lengths = mx.array([sample['rejected_length']])
-
-            loss, grads = loss_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
+            samples = tokenized_data[step % len(tokenized_data): step % len(tokenized_data) + self.batch_size]
+            if len(samples) < self.batch_size:
+                samples += tokenized_data[: self.batch_size - len(samples)]
+            chosen_ids, chosen_lengths = _pad_sequences([sample["chosen_ids"] for sample in samples], pad_id)
+            rejected_ids, rejected_lengths = _pad_sequences([sample["rejected_ids"] for sample in samples], pad_id)
+            loss, grads = value_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
             optimizer.update(actual_model, grads)
             mx.eval(actual_model.parameters(), optimizer.state)
+            last_loss = loss.item()
 
-            total_loss += loss.item()
-
-            if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f}")
-                total_loss = 0.0
-
-        # Save adapters and config
         _save_adapters_and_config(self.model, self.adapter_path)
-
-        print("\n" + "=" * 70)
-        print("ORPO Training Complete!")
-        print("=" * 70)
-        print(f"  Adapters saved to: {self.adapter_path}")
-        return {"status": "success", "adapter_path": str(self.adapter_path)}
+        return {"status": "success", "adapter_path": str(self.adapter_path), "final_loss": last_loss}
 
     def _train_subprocess(self):
-        """Fallback subprocess training."""
         warnings.warn("Using SFT approximation for ORPO.", UserWarning)
-
         train_file = self.output_dir / "train.jsonl"
-        with open(train_file, 'w') as f:
+        valid_file = self.output_dir / "valid.jsonl"
+        with open(train_file, "w") as handle:
             for sample in self.train_dataset:
-                if 'prompt' in sample and 'chosen' in sample:
+                if "prompt" in sample and "chosen" in sample:
                     messages = [
-                        {"role": "user", "content": sample['prompt']},
-                        {"role": "assistant", "content": sample['chosen']}
+                        {"role": "user", "content": sample["prompt"]},
+                        {"role": "assistant", "content": sample["chosen"]},
                     ]
-                    f.write(json.dumps({"messages": messages}) + '\n')
-
-        import shutil
-        shutil.copy(train_file, self.output_dir / "valid.jsonl")
-
+                    handle.write(json.dumps({"messages": messages}) + "\n")
+        valid_file.write_text(train_file.read_text())
         cmd = [
-            "mlx_lm.lora", "--model", getattr(self.model, 'model_name', 'model'),
-            "--train", "--data", str(self.output_dir), "--iters", str(self.iters),
-            "--learning-rate", str(self.learning_rate), "--batch-size", str(self.batch_size),
-            "--adapter-path", str(self.adapter_path),
+            "mlx_lm.lora",
+            "--model",
+            getattr(self.model, "model_name", "model"),
+            "--train",
+            "--data",
+            str(self.output_dir),
+            "--iters",
+            str(self.iters),
+            "--learning-rate",
+            str(self.learning_rate),
+            "--batch-size",
+            str(self.batch_size),
+            "--adapter-path",
+            str(self.adapter_path),
         ]
         subprocess.run(cmd, check=True)
-        return {"status": "success"}
+        return {"status": "success", "adapter_path": str(self.adapter_path)}
 
 
-class GRPOTrainer:
-    """
-    Group Relative Policy Optimization Trainer.
-
-    GRPO is the technique used by DeepSeek to train reasoning models like R1.
-    It removes the need for a value model by using group statistics from
-    multiple generations and custom reward functions.
-
-    Key features:
-    - No value model needed (uses group statistics)
-    - Custom reward functions (for math, code verification, etc.)
-    - Supports GRPO, Dr.GRPO, DAPO, BNPO variants
-    - NOW WITH FULL MULTI-GENERATION IMPLEMENTATION!
-
-    Example:
-        >>> def math_reward(response, prompt):
-        ...     # Custom reward for math problems
-        ...     return 1.0 if "correct" in response.lower() else 0.0
-        >>>
-        >>> trainer = GRPOTrainer(
-        ...     model=model,
-        ...     train_dataset=math_dataset,
-        ...     tokenizer=tokenizer,
-        ...     reward_fn=math_reward,
-        ...     args=GRPOConfig(
-        ...         loss_type='grpo',
-        ...         num_generations=4,
-        ...     ),
-        ... )
-        >>> trainer.train()
-    """
+class GRPOTrainer(_RLTrainerBase):
+    algorithm = "grpo"
 
     def __init__(
         self,
@@ -790,168 +783,248 @@ class GRPOTrainer:
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
         reward_fn: Optional[Callable] = None,
+        ref_model: Optional[Any] = None,
         args: Optional[GRPOConfig] = None,
         use_native: bool = True,
-        **kwargs
+        **kwargs,
     ):
         self.model = model
         self.train_dataset = train_dataset
-        self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
+        self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
+        self.ref_model = ref_model
         self.use_native = use_native and HAS_NATIVE_TRAINING
-
-        if args is None:
-            args = GRPOConfig()
-
-        self.config = args
-        self.loss_type = args.loss_type
-        self.beta = args.beta
-        self.num_generations = args.num_generations
-        self.max_completion_length = args.max_completion_length
-        self.reward_fn = reward_fn or args.reward_fn
-        self.output_dir = Path(args.output_dir)
-        self.learning_rate = args.learning_rate
-        self.batch_size = args.per_device_train_batch_size
-        self.max_steps = args.max_steps
-        self.temperature = args.temperature
-        self.logging_steps = args.logging_steps
-        self.save_steps = args.save_steps
-
-        if self.max_steps > 0:
-            self.iters = self.max_steps
-        else:
-            dataset_size = len(train_dataset) if hasattr(train_dataset, '__len__') else 100
-            self.iters = max(1, (dataset_size // self.batch_size) * args.num_train_epochs)
-
+        self.config = args or GRPOConfig()
+        self.loss_type = self.config.loss_type
+        self.beta = self.config.beta
+        self.num_generations = self.config.num_generations
+        self.max_completion_length = self.config.max_completion_length
+        self.reward_fn = reward_fn or self.config.reward_fn
+        self.output_dir = Path(self.config.output_dir)
+        self.learning_rate = self.config.learning_rate
+        self.batch_size = self.config.per_device_train_batch_size
+        self.max_steps = self.config.max_steps
+        self.temperature = self.config.temperature
+        self.logging_steps = self.config.logging_steps
+        self.save_steps = self.config.save_steps
+        self.max_seq_length = self.config.max_seq_length
+        dataset_size = len(train_dataset) if hasattr(train_dataset, "__len__") else 100
+        self.iters = self.max_steps if self.max_steps > 0 else max(
+            1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
+        self.prompt_samples: List[Dict[str, Any]] = []
+        self._last_rollout_batch: Optional[GRPORolloutBatch] = None
+        self._init_native_state()
 
-        # Default reward function if none provided
         if self.reward_fn is None:
-            self.reward_fn = lambda response, prompt: len(response.split()) / 100.0
+            self.reward_fn = lambda response, context: len(response.split()) / 100.0
 
-        print(f"GRPOTrainer initialized:")
-        print(f"  Loss type: {self.loss_type}")
-        print(f"  Beta: {self.beta}")
-        print(f"  Num generations: {self.num_generations}")
-        print(f"  Custom reward fn: {'Yes' if reward_fn else 'Default (length-based)'}")
-        print(f"  Learning rate: {self.learning_rate}")
-        print(f"  Iterations: {self.iters}")
-        print(f"  Native GRPO: {self.use_native}")
-
-    def train(self):
-        """
-        Train using GRPO with multi-generation sampling.
-        """
-        print("=" * 70)
-        print(f"Starting GRPO Training (loss_type={self.loss_type})")
-        print("=" * 70)
-
-        if self.use_native:
-            return self._train_native()
-        else:
-            return self._train_subprocess()
-
-    def _train_native(self):
-        """Train with native GRPO: multi-generation + reward + policy gradient."""
-        print("\n[Using Native GRPO Training with Multi-Generation]")
-
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
-            self.model._apply_lora()
-
-        # Prepare prompts
-        prompts = []
-        for sample in self.train_dataset:
-            if 'prompt' in sample:
-                prompts.append(sample['prompt'])
-            elif 'question' in sample:
-                prompts.append(sample['question'])
-        print(f"✓ Prepared {len(prompts)} prompts")
-
-        actual_model = self.model.model if hasattr(self.model, 'model') else self.model
-        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
-        optimizer = optim.AdamW(learning_rate=lr_schedule)
-
-        print(f"\nStarting training for {self.iters} iterations...")
-        print(f"  Generating {self.num_generations} completions per prompt")
-
-        total_loss = 0.0
-        for step in range(self.iters):
-            # Get prompt for this step
-            prompt_idx = step % len(prompts)
-            prompt = prompts[prompt_idx]
-
-            # Compute GRPO loss with multi-generation
-            loss, n_gen = grpo_batch_loss(
-                model=actual_model,
-                tokenizer=self.tokenizer,
-                prompts=[prompt],
-                reward_fn=self.reward_fn,
-                num_generations=self.num_generations,
-                temperature=self.temperature,
-                max_tokens=self.max_completion_length,
-                beta=self.beta,
+    def _prepare_prompt_samples(self) -> None:
+        self.prompt_samples = []
+        max_prompt_tokens = max(1, self.max_seq_length - self.max_completion_length)
+        for sample_index, sample in enumerate(self.train_dataset):
+            prompt = sample.get("prompt", sample.get("question", ""))
+            if not prompt:
+                continue
+            reward_context = sample.get("answer", sample.get("response", prompt))
+            prompt_ids = self.tokenizer.encode(prompt)[:max_prompt_tokens]
+            self.prompt_samples.append(
+                {
+                    "sample_index": sample_index,
+                    "prompt": prompt,
+                    "prompt_ids": prompt_ids,
+                    "reward_context": reward_context,
+                }
             )
+        if not self.prompt_samples:
+            raise ValueError("GRPOTrainer requires prompt or question fields.")
 
-            # Manual backward pass since grpo_batch_loss generates internally
-            # For a proper implementation, we'd need to track gradients through generation
-            # This is a simplified version that uses the loss for logging
-            mx.eval(loss)
-            total_loss += loss.item()
+    def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> GRPORolloutBatch:
+        prompt_texts: List[str] = []
+        prompt_ids: List[List[int]] = []
+        reward_contexts: List[str] = []
+        completion_ids: List[List[int]] = []
+        completion_lengths: List[int] = []
+        rollout_logprobs: List[mx.array] = []
+        rewards: List[float] = []
+        advantages: List[float] = []
 
-            if (step + 1) % self.logging_steps == 0:
-                avg_loss = total_loss / self.logging_steps
-                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f}")
-                total_loss = 0.0
+        for sample in prompt_samples:
+            prompt_rewards: List[float] = []
+            prompt_start = len(rewards)
 
-        # Save adapters and config
-        _save_adapters_and_config(self.model, self.adapter_path)
+            for _ in range(self.num_generations):
+                generated_ids, token_log_probs = self._generate_completion(sample["prompt_ids"])
+                completion = generated_ids[len(sample["prompt_ids"]):].tolist()
+                completion_text = self.tokenizer.decode(completion)
+                reward = float(self.reward_fn(completion_text, sample["reward_context"]))
 
-        print("\n" + "=" * 70)
-        print("GRPO Training Complete!")
-        print("=" * 70)
-        print(f"  Adapters saved to: {self.adapter_path}")
-        print(f"Note: Full GRPO with gradient flow through generation requires")
-        print(f"      custom implementation. This version uses reward signals.")
-        return {"status": "success", "adapter_path": str(self.adapter_path)}
+                prompt_texts.append(sample["prompt"])
+                prompt_ids.append(list(sample["prompt_ids"]))
+                reward_contexts.append(sample["reward_context"])
+                completion_ids.append(completion)
+                completion_lengths.append(len(completion))
+                rollout_logprobs.append(
+                    token_log_probs.sum() if len(token_log_probs) > 0 else mx.array(0.0, dtype=mx.float32)
+                )
+                rewards.append(reward)
+                prompt_rewards.append(reward)
 
-    def _train_subprocess(self):
-        """Fallback to SFT approximation."""
-        warnings.warn(
-            "Native GRPO not available. Using SFT on provided responses.",
-            UserWarning
+            reward_array = mx.array(prompt_rewards, dtype=mx.float32)
+            reward_std = mx.std(reward_array)
+            if reward_std.item() < 1e-6:
+                prompt_advantages = reward_array - mx.mean(reward_array)
+            else:
+                prompt_advantages = (reward_array - mx.mean(reward_array)) / (reward_std + 1e-8)
+            advantages.extend(prompt_advantages.tolist())
+
+        return GRPORolloutBatch(
+            prompt_texts=prompt_texts,
+            prompt_ids=prompt_ids,
+            reward_contexts=reward_contexts,
+            completion_ids=completion_ids,
+            completion_lengths=completion_lengths,
+            rollout_logprobs=mx.array(rollout_logprobs),
+            rewards=mx.array(rewards),
+            advantages=mx.array(advantages),
         )
 
+    def _generate_completion(self, prompt_ids: List[int]) -> Tuple[mx.array, mx.array]:
+        from mlx_tune.losses import generate_with_log_probs
+
+        return generate_with_log_probs(
+            _actual_model(self.model),
+            self.tokenizer,
+            mx.array(prompt_ids),
+            max_tokens=self.max_completion_length,
+            temperature=self.temperature,
+        )
+
+    def _build_grpo_tensors(self, rollout_batch: GRPORolloutBatch) -> Tuple[mx.array, ...]:
+        pad_id = _pad_token_id(self.tokenizer)
+        full_sequences = [
+            prompt_ids + completion_ids
+            for prompt_ids, completion_ids in zip(rollout_batch.prompt_ids, rollout_batch.completion_ids)
+        ]
+        input_ids, _ = _pad_sequences(full_sequences, pad_id)
+        prompt_lengths = mx.array([len(ids) for ids in rollout_batch.prompt_ids])
+        completion_lengths = mx.array(rollout_batch.completion_lengths)
+        return (
+            input_ids,
+            prompt_lengths,
+            completion_lengths,
+            rollout_batch.rollout_logprobs,
+            rollout_batch.advantages,
+        )
+
+    def train(self, resume_from_checkpoint: Optional[str] = None):
+        if self.use_native:
+            return self._train_native(resume_from_checkpoint=resume_from_checkpoint)
+        return self._train_subprocess()
+
+    def _train_native(self, resume_from_checkpoint: Optional[str] = None):
+        self._apply_lora_if_needed()
+        self._prepare_prompt_samples()
+
+        actual_model = _actual_model(self.model)
+        optimizer = self._optimizer_for_training()
+        self.optimizer = optimizer
+
+        if resume_from_checkpoint is not None:
+            self.load_state(optimizer, Path(resume_from_checkpoint))
+        else:
+            self._ensure_reference_policy()
+
+        reference_model = _actual_model(self.reference_policy.model)
+
+        def loss_fn(model, batch):
+            input_ids, prompt_lengths, completion_lengths, rollout_logprobs, advantages = batch
+            loss, _ = grpo_recompute_loss(
+                model=model,
+                reference_model=reference_model,
+                input_ids=input_ids,
+                prompt_lengths=prompt_lengths,
+                completion_lengths=completion_lengths,
+                rollout_logprobs=rollout_logprobs,
+                advantages=advantages,
+                beta=self.beta,
+            )
+            return loss
+
+        value_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        running_loss = 0.0
+        last_loss = None
+
+        while self.global_step < self.iters:
+            prompt_samples = self._next_samples(self.prompt_samples)
+            rollout_batch = self._collect_rollout_batch(prompt_samples)
+            self._last_rollout_batch = rollout_batch
+            batch = self._build_grpo_tensors(rollout_batch)
+
+            loss, grads = value_and_grad(actual_model, batch)
+            optimizer.update(actual_model, grads)
+            mx.eval(actual_model.parameters(), optimizer.state)
+
+            last_loss = loss.item()
+            running_loss += last_loss
+            self.global_step += 1
+
+            if self.global_step % self.logging_steps == 0:
+                print(
+                    f"GRPO step {self.global_step}/{self.iters} | "
+                    f"loss={running_loss / self.logging_steps:.4f}"
+                )
+                running_loss = 0.0
+
+            if self.global_step % self.save_steps == 0:
+                self.save_state(optimizer)
+
+        self.save_state(optimizer)
+        return {
+            "status": "success",
+            "adapter_path": str(self.adapter_path),
+            "global_step": self.global_step,
+            "final_loss": last_loss,
+        }
+
+    def _train_subprocess(self):
+        warnings.warn(
+            "Native GRPO training not available. Using SFT approximation.",
+            UserWarning,
+        )
         train_file = self.output_dir / "train.jsonl"
-        with open(train_file, 'w') as f:
+        valid_file = self.output_dir / "valid.jsonl"
+        with open(train_file, "w") as handle:
             for sample in self.train_dataset:
-                if 'prompt' in sample:
-                    messages = [{"role": "user", "content": sample['prompt']}]
-                    if 'response' in sample or 'answer' in sample:
-                        response = sample.get('response', sample.get('answer', ''))
-                        messages.append({"role": "assistant", "content": response})
-                    f.write(json.dumps({"messages": messages}) + '\n')
-
-        import shutil
-        shutil.copy(train_file, self.output_dir / "valid.jsonl")
-
+                prompt = sample.get("prompt", sample.get("question", ""))
+                if not prompt:
+                    continue
+                messages = [{"role": "user", "content": prompt}]
+                if "response" in sample or "answer" in sample:
+                    response = sample.get("response", sample.get("answer", ""))
+                    messages.append({"role": "assistant", "content": response})
+                handle.write(json.dumps({"messages": messages}) + "\n")
+        valid_file.write_text(train_file.read_text())
         cmd = [
-            "mlx_lm.lora", "--model", getattr(self.model, 'model_name', 'model'),
-            "--train", "--data", str(self.output_dir), "--iters", str(self.iters),
-            "--adapter-path", str(self.adapter_path),
+            "mlx_lm.lora",
+            "--model",
+            getattr(self.model, "model_name", "model"),
+            "--train",
+            "--data",
+            str(self.output_dir),
+            "--iters",
+            str(self.iters),
+            "--adapter-path",
+            str(self.adapter_path),
         ]
         subprocess.run(cmd, check=True)
-        return {"status": "success"}
+        return {"status": "success", "adapter_path": str(self.adapter_path)}
 
 
-class KTOTrainer:
-    """
-    Kahneman-Tversky Optimization Trainer.
-
-    KTO uses prospect theory for preference optimization,
-    treating gains and losses asymmetrically.
-    Now with proper KTO loss implementation!
-    """
+class KTOTrainer(_RLTrainerBase):
+    algorithm = "kto"
 
     def __init__(
         self,
@@ -959,106 +1032,164 @@ class KTOTrainer:
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
         beta: float = 0.1,
+        ref_model: Optional[Any] = None,
         use_native: bool = True,
-        **kwargs
+        **kwargs,
     ):
         self.model = model
         self.train_dataset = train_dataset
-        self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
+        self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.beta = beta
+        self.ref_model = ref_model
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get('output_dir', './kto_outputs'))
-        self.learning_rate = kwargs.get('learning_rate', 5e-7)
-        self.iters = kwargs.get('max_steps', 100)
-        self.max_seq_length = kwargs.get('max_seq_length', 2048)
-        self.logging_steps = kwargs.get('logging_steps', 10)
-
+        self.output_dir = Path(kwargs.get("output_dir", "./kto_outputs"))
+        self.learning_rate = kwargs.get("learning_rate", 5e-7)
+        self.iters = kwargs.get("max_steps", 100)
+        self.max_seq_length = kwargs.get("max_seq_length", 2048)
+        self.batch_size = kwargs.get("per_device_train_batch_size", 1)
+        self.logging_steps = kwargs.get("logging_steps", 10)
+        self.save_steps = kwargs.get("save_steps", 100)
+        self.config = {
+            "beta": beta,
+            "output_dir": str(self.output_dir),
+            "learning_rate": self.learning_rate,
+            "max_steps": self.iters,
+            "max_seq_length": self.max_seq_length,
+            "per_device_train_batch_size": self.batch_size,
+            "logging_steps": self.logging_steps,
+            "save_steps": self.save_steps,
+        }
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
+        self.train_samples: List[Dict[str, Any]] = []
+        self._init_native_state()
 
-        print(f"KTOTrainer initialized (beta={self.beta}, native={self.use_native})")
+    def _prepare_training_samples(self) -> None:
+        self.train_samples = []
+        for sample_index, sample in enumerate(self.train_dataset):
+            if "text" not in sample or "label" not in sample:
+                continue
+            ids = self.tokenizer.encode(sample["text"])[: self.max_seq_length]
+            self.train_samples.append(
+                {
+                    "sample_index": sample_index,
+                    "ids": ids,
+                    "length": len(ids),
+                    "label": float(sample["label"]),
+                }
+            )
+        if not self.train_samples:
+            raise ValueError("KTOTrainer requires text/label samples.")
 
-    def train(self):
-        """Train using KTO with proper loss."""
-        print("=" * 70)
-        print("Starting KTO Training")
-        print("=" * 70)
+    def _precompute_reference_cache(self) -> None:
+        self._ensure_reference_policy()
+        pad_id = _pad_token_id(self.tokenizer)
+        input_ids, lengths = _pad_sequences([sample["ids"] for sample in self.train_samples], pad_id)
+        reference_logprobs = precompute_kto_reference_logprobs(
+            _actual_model(self.reference_policy.model),
+            input_ids,
+            lengths,
+            batch_size=max(1, self.batch_size),
+        )
+        for idx, sample in enumerate(self.train_samples):
+            sample["reference_logprobs"] = reference_logprobs[idx]
+        self.cache_metadata = {
+            "type": "inline_kto_reference_logprobs",
+            "num_samples": len(self.train_samples),
+        }
 
-        if not self.use_native:
-            warnings.warn("KTO requires native training. Using SFT approximation.", UserWarning)
-            return {"status": "fallback"}
+    def _restore_reference_cache(self, flat_state: Dict[str, mx.array]) -> None:
+        if "kto.reference_logprobs" not in flat_state:
+            self._precompute_reference_cache()
+            return
+        reference_logprobs = flat_state["kto.reference_logprobs"]
+        if reference_logprobs.shape[0] != len(self.train_samples):
+            raise ValueError("Saved KTO cache does not match current dataset ordering.")
+        for idx, sample in enumerate(self.train_samples):
+            sample["reference_logprobs"] = reference_logprobs[idx]
 
-        print("\n[Using Native KTO Training with Proper Loss]")
+    def _build_batch(self, samples: List[Dict[str, Any]]) -> Tuple[mx.array, ...]:
+        pad_id = _pad_token_id(self.tokenizer)
+        input_ids, lengths = _pad_sequences([sample["ids"] for sample in samples], pad_id)
+        labels = mx.array([sample["label"] for sample in samples])
+        reference_logprobs = mx.array([sample["reference_logprobs"] for sample in samples])
+        return input_ids, lengths, labels, reference_logprobs
 
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
-            self.model._apply_lora()
+    def _extra_state_arrays(self) -> Dict[str, mx.array]:
+        return {
+            "kto.reference_logprobs": mx.array(
+                [sample["reference_logprobs"] for sample in self.train_samples]
+            )
+        }
 
-        actual_model = self.model.model if hasattr(self.model, 'model') else self.model
-        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
-        optimizer = optim.AdamW(learning_rate=lr_schedule)
+    def train(self, resume_from_checkpoint: Optional[str] = None):
+        if self.use_native:
+            return self._train_native(resume_from_checkpoint=resume_from_checkpoint)
+        warnings.warn("KTO requires native training. Using SFT approximation.", UserWarning)
+        return {"status": "fallback"}
 
-        # Prepare data - KTO expects samples with 'text' and 'label' (1=positive, 0=negative)
-        tokenized_data = []
-        for sample in self.train_dataset:
-            if 'text' in sample and 'label' in sample:
-                ids = self.tokenizer.encode(sample['text'])[:self.max_seq_length]
-                tokenized_data.append({
-                    'ids': ids,
-                    'length': len(ids),
-                    'label': float(sample['label']),
-                })
+    def _train_native(self, resume_from_checkpoint: Optional[str] = None):
+        self._apply_lora_if_needed()
+        self._prepare_training_samples()
 
-        print(f"✓ Prepared {len(tokenized_data)} samples")
+        actual_model = _actual_model(self.model)
+        optimizer = self._optimizer_for_training()
+        self.optimizer = optimizer
 
-        def loss_fn(model, batch_data):
-            input_ids, lengths, labels = batch_data
-            loss, _ = compute_kto_loss(model, input_ids, lengths, labels, self.beta)
+        if resume_from_checkpoint is not None:
+            flat_state = self.load_state(optimizer, Path(resume_from_checkpoint))
+            self._restore_reference_cache(flat_state)
+        else:
+            self._precompute_reference_cache()
+
+        def loss_fn(model, batch):
+            input_ids, lengths, labels, reference_logprobs = batch
+            loss, _ = compute_kto_loss(
+                model=model,
+                input_ids=input_ids,
+                lengths=lengths,
+                labels=labels,
+                beta=self.beta,
+                reference_logprobs=reference_logprobs,
+            )
             return loss
 
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        value_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        running_loss = 0.0
+        last_loss = None
 
-        total_loss = 0.0
-        for step in range(self.iters):
-            sample = tokenized_data[step % len(tokenized_data)]
-            pad_id = self.tokenizer.pad_token_id or 0
-
-            max_len = sample['length']
-            ids_padded = sample['ids'] + [pad_id] * (max_len - len(sample['ids']))
-
-            input_ids = mx.array([ids_padded])
-            lengths = mx.array([sample['length']])
-            labels = mx.array([sample['label']])
-
-            loss, grads = loss_and_grad(actual_model, (input_ids, lengths, labels))
+        while self.global_step < self.iters:
+            batch_samples = self._next_samples(self.train_samples)
+            batch = self._build_batch(batch_samples)
+            loss, grads = value_and_grad(actual_model, batch)
             optimizer.update(actual_model, grads)
             mx.eval(actual_model.parameters(), optimizer.state)
 
-            total_loss += loss.item()
+            last_loss = loss.item()
+            running_loss += last_loss
+            self.global_step += 1
 
-            if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f}")
-                total_loss = 0.0
+            if self.global_step % self.logging_steps == 0:
+                print(
+                    f"KTO step {self.global_step}/{self.iters} | "
+                    f"loss={running_loss / self.logging_steps:.4f}"
+                )
+                running_loss = 0.0
 
-        # Save adapters and config
-        _save_adapters_and_config(self.model, self.adapter_path)
+            if self.global_step % self.save_steps == 0:
+                self.save_state(optimizer, self._extra_state_arrays())
 
-        print("\n" + "=" * 70)
-        print("KTO Training Complete!")
-        print("=" * 70)
-        print(f"  Adapters saved to: {self.adapter_path}")
-        return {"status": "success", "adapter_path": str(self.adapter_path)}
+        self.save_state(optimizer, self._extra_state_arrays())
+        return {
+            "status": "success",
+            "adapter_path": str(self.adapter_path),
+            "global_step": self.global_step,
+            "final_loss": last_loss,
+        }
 
 
 class SimPOTrainer:
-    """
-    Simple Preference Optimization Trainer.
-
-    SimPO simplifies DPO by removing the reference model requirement.
-    Uses length-normalized log probabilities as implicit rewards.
-    Now with proper SimPO loss implementation!
-    """
-
     def __init__(
         self,
         model: Any,
@@ -1067,206 +1198,141 @@ class SimPOTrainer:
         gamma: float = 0.5,
         beta: float = 2.0,
         use_native: bool = True,
-        **kwargs
+        **kwargs,
     ):
         self.model = model
         self.train_dataset = train_dataset
-        self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
+        self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.gamma = gamma
         self.beta = beta
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get('output_dir', './simpo_outputs'))
-        self.learning_rate = kwargs.get('learning_rate', 5e-7)
-        self.iters = kwargs.get('max_steps', 100)
-        self.max_seq_length = kwargs.get('max_seq_length', 2048)
-        self.logging_steps = kwargs.get('logging_steps', 10)
-
+        self.output_dir = Path(kwargs.get("output_dir", "./simpo_outputs"))
+        self.learning_rate = kwargs.get("learning_rate", 5e-7)
+        self.iters = kwargs.get("max_steps", 100)
+        self.max_seq_length = kwargs.get("max_seq_length", 2048)
+        self.logging_steps = kwargs.get("logging_steps", 10)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"SimPOTrainer initialized (gamma={gamma}, beta={beta}, native={self.use_native})")
-
-    def _tokenize_pair(self, sample):
-        prompt = sample.get('prompt', '')
-        chosen = sample.get('chosen', '')
-        rejected = sample.get('rejected', '')
-
-        chosen_ids = self.tokenizer.encode(prompt + chosen)[:self.max_seq_length]
-        rejected_ids = self.tokenizer.encode(prompt + rejected)[:self.max_seq_length]
-
+    def _tokenize_pair(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = sample.get("prompt", "")
+        chosen = sample.get("chosen", "")
+        rejected = sample.get("rejected", "")
+        chosen_ids = self.tokenizer.encode(prompt + chosen)[: self.max_seq_length]
+        rejected_ids = self.tokenizer.encode(prompt + rejected)[: self.max_seq_length]
         return {
-            'chosen_ids': chosen_ids,
-            'rejected_ids': rejected_ids,
-            'chosen_length': len(chosen_ids),
-            'rejected_length': len(rejected_ids),
+            "chosen_ids": chosen_ids,
+            "rejected_ids": rejected_ids,
+            "chosen_length": len(chosen_ids),
+            "rejected_length": len(rejected_ids),
         }
 
-    def _pad(self, ids, length, pad_id=0):
-        return ids + [pad_id] * (length - len(ids)) if len(ids) < length else ids[:length]
-
     def train(self):
-        """Train using SimPO with proper loss."""
-        print("=" * 70)
-        print("Starting SimPO Training")
-        print("=" * 70)
-
         if not self.use_native:
             warnings.warn("SimPO requires native training. Using SFT approximation.", UserWarning)
             return {"status": "fallback"}
 
-        print("\n[Using Native SimPO Training with Proper Loss]")
-
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
+        if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
             self.model._apply_lora()
 
-        tokenized_data = []
-        for sample in self.train_dataset:
-            if 'prompt' in sample and 'chosen' in sample and 'rejected' in sample:
-                tokenized_data.append(self._tokenize_pair(sample))
-        print(f"✓ Prepared {len(tokenized_data)} preference pairs")
+        tokenized_data = [
+            self._tokenize_pair(sample)
+            for sample in self.train_dataset
+            if {"prompt", "chosen", "rejected"} <= set(sample.keys())
+        ]
+        actual_model = _actual_model(self.model)
+        optimizer = optim.AdamW(learning_rate=optim.cosine_decay(self.learning_rate, self.iters))
+        pad_id = _pad_token_id(self.tokenizer)
 
-        actual_model = self.model.model if hasattr(self.model, 'model') else self.model
-        lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
-        optimizer = optim.AdamW(learning_rate=lr_schedule)
-
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+        def loss_fn(model, batch):
+            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch
             loss, _ = compute_simpo_loss(
-                model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths,
-                self.beta, self.gamma
+                model,
+                chosen_ids,
+                rejected_ids,
+                chosen_lengths,
+                rejected_lengths,
+                self.beta,
+                self.gamma,
             )
             return loss
 
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        value_and_grad = nn.value_and_grad(actual_model, loss_fn)
+        last_loss = None
 
-        total_loss = 0.0
         for step in range(self.iters):
-            sample = tokenized_data[step % len(tokenized_data)]
-            max_len = max(sample['chosen_length'], sample['rejected_length'])
-            pad_id = self.tokenizer.pad_token_id or 0
-
-            chosen_ids = mx.array([self._pad(sample['chosen_ids'], max_len, pad_id)])
-            rejected_ids = mx.array([self._pad(sample['rejected_ids'], max_len, pad_id)])
-            chosen_lengths = mx.array([sample['chosen_length']])
-            rejected_lengths = mx.array([sample['rejected_length']])
-
-            loss, grads = loss_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
+            samples = tokenized_data[step % len(tokenized_data): step % len(tokenized_data) + 1]
+            chosen_ids, chosen_lengths = _pad_sequences([sample["chosen_ids"] for sample in samples], pad_id)
+            rejected_ids, rejected_lengths = _pad_sequences([sample["rejected_ids"] for sample in samples], pad_id)
+            loss, grads = value_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
             optimizer.update(actual_model, grads)
             mx.eval(actual_model.parameters(), optimizer.state)
+            last_loss = loss.item()
 
-            total_loss += loss.item()
-
-            if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f}")
-                total_loss = 0.0
-
-        # Save adapters and config
         _save_adapters_and_config(self.model, self.adapter_path)
+        return {"status": "success", "adapter_path": str(self.adapter_path), "final_loss": last_loss}
 
-        print("\n" + "=" * 70)
-        print("SimPO Training Complete!")
-        print("=" * 70)
-        print(f"  Adapters saved to: {self.adapter_path}")
-        return {"status": "success", "adapter_path": str(self.adapter_path)}
-
-
-# Utility functions for preference data
 
 def prepare_preference_dataset(
     dataset: Any,
     tokenizer: Any,
     format_type: str = "dpo",
-) -> List[Dict]:
-    """
-    Prepare dataset for preference-based training (DPO, ORPO, etc.).
-
-    Args:
-        dataset: HuggingFace dataset with preference pairs
-        tokenizer: Tokenizer for formatting
-        format_type: 'dpo', 'orpo', or 'grpo'
-
-    Returns:
-        Formatted dataset ready for training
-
-    Example:
-        >>> from datasets import load_dataset
-        >>> dataset = load_dataset("Anthropic/hh-rlhf")
-        >>> formatted = prepare_preference_dataset(dataset, tokenizer, "dpo")
-    """
-
+) -> List[Dict[str, Any]]:
     formatted_data = []
-
     for sample in dataset:
         if format_type in ["dpo", "orpo"]:
-            # Expect chosen/rejected format
-            if 'chosen' in sample and 'rejected' in sample:
-                formatted_data.append({
-                    "prompt": sample.get('prompt', ''),
-                    "chosen": sample['chosen'],
-                    "rejected": sample['rejected'],
-                })
+            if "chosen" in sample and "rejected" in sample:
+                formatted_data.append(
+                    {
+                        "prompt": sample.get("prompt", ""),
+                        "chosen": sample["chosen"],
+                        "rejected": sample["rejected"],
+                    }
+                )
         elif format_type == "grpo":
-            # Expect prompt + optional ground truth
-            formatted_data.append({
-                "prompt": sample.get('prompt', sample.get('question', '')),
-                "answer": sample.get('answer', sample.get('response', '')),
-            })
-
+            formatted_data.append(
+                {
+                    "prompt": sample.get("prompt", sample.get("question", "")),
+                    "answer": sample.get("answer", sample.get("response", "")),
+                }
+            )
     return formatted_data
 
 
 def create_reward_function(reward_type: str = "simple") -> Callable:
-    """
-    Create a reward function for GRPO training.
-
-    Args:
-        reward_type: Type of reward function
-            - 'simple': Binary correct/incorrect
-            - 'math': Extract and compare numerical answers
-            - 'code': Execute and verify code output
-            - 'length': Reward based on response length
-
-    Returns:
-        Reward function callable
-
-    Example:
-        >>> reward_fn = create_reward_function('math')
-        >>> trainer = GRPOTrainer(..., reward_fn=reward_fn)
-    """
-
     if reward_type == "simple":
         def simple_reward(response: str, ground_truth: str) -> float:
             return 1.0 if ground_truth.lower() in response.lower() else 0.0
+
         return simple_reward
 
-    elif reward_type == "math":
+    if reward_type == "math":
         def math_reward(response: str, ground_truth: str) -> float:
             import re
-            # Extract numbers from response
-            numbers = re.findall(r'-?\d+\.?\d*', response)
-            target = re.findall(r'-?\d+\.?\d*', ground_truth)
+
+            numbers = re.findall(r"-?\d+\.?\d*", response)
+            target = re.findall(r"-?\d+\.?\d*", ground_truth)
             if numbers and target:
                 try:
                     return 1.0 if float(numbers[-1]) == float(target[-1]) else 0.0
-                except:
+                except Exception:
                     return 0.0
             return 0.0
+
         return math_reward
 
-    elif reward_type == "length":
+    if reward_type == "length":
         def length_reward(response: str, _: str) -> float:
-            # Reward longer, more detailed responses (up to a point)
             length = len(response.split())
             if length < 10:
                 return 0.2
-            elif length < 50:
+            if length < 50:
                 return 0.5
-            elif length < 200:
+            if length < 200:
                 return 1.0
-            else:
-                return 0.8  # Penalize very long responses
+            return 0.8
+
         return length_reward
 
-    else:
-        raise ValueError(f"Unknown reward type: {reward_type}")
+    raise ValueError(f"Unknown reward type: {reward_type}")

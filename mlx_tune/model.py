@@ -7,6 +7,7 @@ using Apple's MLX framework under the hood.
 
 from typing import Optional, Tuple, Union, List, Any, Dict
 from pathlib import Path
+import copy
 import mlx.core as mx
 from mlx_lm import load as mlx_load
 import warnings
@@ -128,7 +129,13 @@ class FastLanguageModel:
 
         try:
             # Load model using MLX (with config for saving later)
-            model, tokenizer, config = mlx_load(model_name, return_config=True, **mlx_kwargs)
+            try:
+                model, tokenizer, config = mlx_load(model_name, return_config=True, **mlx_kwargs)
+            except TypeError as exc:
+                if "return_config" not in str(exc):
+                    raise
+                model, tokenizer = mlx_load(model_name, **mlx_kwargs)
+                config = None
 
             # Wrap model with our compatibility layer
             wrapped_model = MLXModelWrapper(
@@ -802,3 +809,79 @@ class MLXModelWrapper:
         Delegate attribute access to the underlying MLX model.
         """
         return getattr(self.model, name)
+
+
+class ReferencePolicy:
+    """
+    Frozen reference-policy wrapper used by native RL trainers.
+
+    A reference policy can either wrap an explicit reference model provided by
+    the caller or snapshot the current policy into a detached, frozen model
+    instance before RL optimization starts.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        source: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        self.model = model
+        self.source = source
+        self.metadata = metadata or {}
+        self._freeze()
+
+    @classmethod
+    def from_model(
+        cls,
+        policy_model: Any,
+        ref_model: Optional[Any] = None,
+    ) -> "ReferencePolicy":
+        if ref_model is not None:
+            metadata = {
+                "source": "explicit",
+                "snapshot_strategy": "wrapped",
+            }
+            return cls(ref_model, source="explicit", metadata=metadata)
+
+        snapshot = cls._snapshot_model(policy_model)
+        metadata = {
+            "source": "snapshot",
+            "snapshot_strategy": "deepcopy",
+        }
+        return cls(snapshot, source="snapshot", metadata=metadata)
+
+    @staticmethod
+    def _unwrap(model: Any) -> Any:
+        return model.model if hasattr(model, "model") else model
+
+    @classmethod
+    def _snapshot_model(cls, model: Any) -> Any:
+        if isinstance(model, MLXModelWrapper):
+            snapshot = MLXModelWrapper(
+                model=copy.deepcopy(model.model),
+                tokenizer=model.tokenizer,
+                max_seq_length=model.max_seq_length,
+                model_name=model.model_name,
+                config=copy.deepcopy(model.config),
+            )
+            snapshot.lora_config = copy.deepcopy(model.lora_config)
+            snapshot.lora_enabled = model.lora_enabled
+            snapshot._lora_applied = model._lora_applied
+            snapshot._adapter_path = model._adapter_path
+            snapshot.inference_mode = model.inference_mode
+            snapshot.use_cache = model.use_cache
+        else:
+            snapshot = copy.deepcopy(model)
+
+        source_actual = cls._unwrap(model)
+        snapshot_actual = cls._unwrap(snapshot)
+        snapshot_actual.update(source_actual.parameters())
+        mx.eval(snapshot_actual.parameters())
+        return snapshot
+
+    def _freeze(self) -> None:
+        actual_model = self._unwrap(self.model)
+        if hasattr(actual_model, "freeze"):
+            actual_model.freeze()
+            mx.eval(actual_model.parameters())

@@ -261,11 +261,17 @@ def save_model_hf_format(
 
         # CRITICAL: Fuse LoRA adapters into base weights before saving
         # Without this, LoRA layers are saved as-is and won't load properly
-        fused_linears = [
-            (n, m.fuse(dequantize=kwargs.get('dequantize', False)))
-            for n, m in actual_model.named_modules()
-            if hasattr(m, "fuse")
-        ]
+        fused_linears = []
+        for n, m in actual_model.named_modules():
+            if not hasattr(m, "fuse"):
+                continue
+            try:
+                fused = m.fuse(dequantize=kwargs.get('dequantize', False))
+            except TypeError as exc:
+                if "dequantize" not in str(exc):
+                    raise
+                fused = m.fuse()
+            fused_linears.append((n, fused))
 
         if fused_linears:
             print(f"  Fusing {len(fused_linears)} LoRA layers into base model...")
