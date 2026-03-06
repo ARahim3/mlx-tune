@@ -682,6 +682,78 @@ class TestGRPOTrainerIntegration:
         assert trainer._last_rollout_batch is not None
         assert trainer._last_rollout_batch.rewards.tolist() == [1.0, -1.0]
 
+    def test_grpo_single_reward_source_component_preserves_weight_semantics(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer
+
+        trainer = GRPOTrainer(
+            model=make_model(64),
+            train_dataset=[{"prompt": "Solve 2 + 2", "answer": "4"}],
+            tokenizer=tokenizer,
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                num_generations=2,
+                max_completion_length=3,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                reward_sources=[
+                    {"name": "zeroed", "source": "length", "weight": 0.0},
+                ],
+                output_dir=str(tmp_path / "grpo_weighted_single_reward"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert mx.allclose(
+            trainer._last_rollout_batch.rewards,
+            mx.zeros_like(trainer._last_rollout_batch.rewards),
+        )
+
+    def test_grpo_prompt_rollouts_respect_rollout_batch_size(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer
+
+        trainer = GRPOTrainer(
+            model=make_model(65),
+            train_dataset=[
+                {"prompt": "What is 1 + 1?", "answer": "2"},
+                {"prompt": "What is 2 + 2?", "answer": "4"},
+                {"prompt": "What is 3 + 3?", "answer": "6"},
+            ],
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                per_device_train_batch_size=1,
+                rollout_batch_size=3,
+                num_generations=2,
+                max_completion_length=3,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(tmp_path / "grpo_rollout_batch_size"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert len(trainer._last_rollout_batch.prompt_ids) == 6
+        assert sorted(set(trainer._last_rollout_batch.prompt_group_indices.tolist())) == [0, 1, 2]
+
     def test_grpo_manifest_checkpoint_persists_roles_and_metrics(
         self,
         tmp_path,
@@ -983,3 +1055,39 @@ class TestOtherRLTrainers:
         assert result["status"] == "success"
         assert seen_contexts
         assert all(context == "4" for context in seen_contexts)
+
+    def test_online_dpo_prompt_rollouts_respect_rollout_batch_size(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import OnlineDPOConfig, OnlineDPOTrainer
+
+        trainer = OnlineDPOTrainer(
+            model=make_model(66),
+            train_dataset=[
+                {"prompt": "Solve 1 + 1", "answer": "2"},
+                {"prompt": "Solve 2 + 2", "answer": "4"},
+                {"prompt": "Solve 3 + 3", "answer": "6"},
+            ],
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            args=OnlineDPOConfig(
+                learning_rate=1e-2,
+                per_device_train_batch_size=1,
+                rollout_batch_size=3,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "online_dpo_rollout_batch_size"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert len(trainer._last_rollout_batch.prompt_ids) == 6
+        assert sorted(set(trainer._last_rollout_batch.prompt_group_indices.tolist())) == [0, 1, 2]

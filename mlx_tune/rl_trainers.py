@@ -1346,11 +1346,6 @@ def _resolve_reward_evaluator(
     reward_sources: Optional[List[Any]] = None,
 ) -> Any:
     if reward_sources:
-        if len(reward_sources) == 1:
-            component = reward_sources[0]
-            if isinstance(component, dict) and "source" in component and set(component.keys()) <= {"name", "source", "weight", "normalize"}:
-                source = component["source"]
-                return public_create_reward_function(source) if isinstance(source, str) else source
         return public_create_reward_function(rewards=reward_sources)
     if reward_model is not None:
         return reward_model
@@ -2284,7 +2279,10 @@ class GRPOTrainer(_RLTrainerBase):
                     self.rollout_batch_size * self.num_generations,
                 )
             else:
-                prompt_samples = self._next_samples(self.prompt_samples)
+                prompt_samples = self._next_rollout_samples(
+                    self.prompt_samples,
+                    self.rollout_batch_size,
+                )
             rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
             step_loss = 0.0
@@ -2652,7 +2650,10 @@ class PPOTrainer(_RLTrainerBase):
                     self.rollout_batch_size * self.num_generations,
                 )
             else:
-                prompt_samples = self._next_samples(self.prompt_samples)
+                prompt_samples = self._next_rollout_samples(
+                    self.prompt_samples,
+                    self.rollout_batch_size,
+                )
             rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
 
@@ -2944,7 +2945,10 @@ class OnlineDPOTrainer(_RLTrainerBase):
                     self.rollout_batch_size * self.num_generations,
                 )
             else:
-                prompt_samples = self._next_samples(self.prompt_samples)
+                prompt_samples = self._next_rollout_samples(
+                    self.prompt_samples,
+                    self.rollout_batch_size,
+                )
             if prompt_samples and "completion" in prompt_samples[0]:
                 rollout_batch = self._collect_fixed_rollout_batch(prompt_samples)
             else:
