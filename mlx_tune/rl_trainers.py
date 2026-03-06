@@ -49,6 +49,7 @@ from mlx_tune._rl_runtime import (
     compute_advantages,
     compute_returns_and_advantages,
     evaluate_rewards,
+    kl_against_reference,
     make_policy_eval_batch,
     make_preference_batch,
     pad_sequences,
@@ -409,6 +410,29 @@ class _RLTrainerBase:
             batch.append(samples[self.dataset_cursor])
             self.dataset_cursor = (self.dataset_cursor + 1) % len(samples)
         return batch
+
+    def _observed_rollout_kl(self, rollout_batch: Optional[RolloutBatch]) -> Optional[float]:
+        if rollout_batch is None:
+            return None
+        if rollout_batch.reference_logprobs is None or rollout_batch.rollout_logprobs is None:
+            return None
+        kl_values = kl_against_reference(
+            rollout_batch.rollout_logprobs.astype(mx.float32),
+            rollout_batch.reference_logprobs.astype(mx.float32),
+        )
+        return float(mx.mean(kl_values).item())
+
+    def _effective_kl_beta(self, rollout_batch: Optional[RolloutBatch] = None) -> float:
+        base_beta = float(getattr(self, "beta", 0.0))
+        if getattr(self, "kl_penalty_mode", "kl") == "none":
+            return 0.0
+        kl_target = getattr(self, "kl_target", None)
+        observed_kl = self._observed_rollout_kl(rollout_batch)
+        if kl_target is None or observed_kl is None:
+            return base_beta
+        target = max(float(kl_target), 1e-8)
+        scale = min(max(observed_kl / target, 0.0), 10.0)
+        return base_beta * scale
 
     def _checkpoint_dir(self, checkpoint_dir: Optional[Path] = None) -> Path:
         return checkpoint_dir or self.output_dir
@@ -2540,6 +2564,8 @@ class GRPOTrainer(_RLTrainerBase):
         self.reward_fn = reward_fn if reward_fn is not None else self.config.reward_fn
         self.reward_sources = self.config.reward_sources
         self.reward_source = self.config.reward_source
+        self.kl_target = self.config.kl_target
+        self.kl_penalty_mode = self.config.kl_penalty_mode
         self.reward_normalization = self.config.reward_normalization
         self.mask_truncated_completions = self.config.mask_truncated_completions
         self.minibatch_reuse_steps = self.config.minibatch_reuse_steps
@@ -2616,6 +2642,8 @@ class GRPOTrainer(_RLTrainerBase):
             "minibatch_reuse_steps": self.minibatch_reuse_steps,
             "advantage_mode": self.advantage_mode,
             "scale_rewards": self.scale_rewards,
+            "kl_target": self.kl_target,
+            "kl_penalty_mode": self.kl_penalty_mode,
             "reward_source": self.reward_source,
             "reward_normalization": self.reward_normalization,
             "mask_truncated_completions": self.mask_truncated_completions,
@@ -2800,6 +2828,7 @@ class GRPOTrainer(_RLTrainerBase):
         else:
             return {}
         reference_model = _actual_model(self.reference_policy.model)
+        effective_beta = self._effective_kl_beta(rollout_batch)
         loss, _ = grpo_recompute_loss(
             model=_actual_model(self.model),
             reference_model=reference_model,
@@ -2810,7 +2839,7 @@ class GRPOTrainer(_RLTrainerBase):
             old_token_logprobs=rollout_batch.policy_eval.old_token_logprobs,
             reference_logprobs=rollout_batch.policy_eval.reference_logprobs,
             advantages=rollout_batch.policy_eval.advantages,
-            beta=self.beta,
+            beta=effective_beta,
             clip_epsilon=self.clip_epsilon,
             epsilon_low=self.epsilon_low,
             epsilon_high=self.epsilon_high,
@@ -2901,6 +2930,8 @@ class GRPOTrainer(_RLTrainerBase):
                 self.rollout_samples,
             )
 
+        effective_beta = self.beta
+
         def loss_fn(model, batch):
             loss, _ = grpo_recompute_loss(
                 model=model,
@@ -2912,7 +2943,7 @@ class GRPOTrainer(_RLTrainerBase):
                 old_token_logprobs=batch.old_token_logprobs,
                 reference_logprobs=batch.reference_logprobs,
                 advantages=batch.advantages,
-                beta=self.beta,
+                beta=effective_beta,
                 clip_epsilon=self.clip_epsilon,
                 epsilon_low=self.epsilon_low,
                 epsilon_high=self.epsilon_high,
@@ -2937,6 +2968,7 @@ class GRPOTrainer(_RLTrainerBase):
                 prompt_samples = self._next_prompt_batch()
                 rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
+            effective_beta = self._effective_kl_beta(rollout_batch)
             step_loss = 0.0
             step_updates = 0
             for _ in range(max(1, self.minibatch_reuse_steps)):
@@ -3068,6 +3100,9 @@ class PPOTrainer(_RLTrainerBase):
         self.gamma = self.config.gamma
         self.gae_lambda = self.config.gae_lambda
         self.normalize_advantages = self.config.normalize_advantages
+        self.advantage_estimator = self.config.advantage_estimator
+        self.kl_target = self.config.kl_target
+        self.kl_penalty_mode = self.config.kl_penalty_mode
         self.eval_steps = self.config.eval_steps
         self.eval_num_batches = self.config.eval_num_batches
         self.eval_num_generations = self.config.eval_num_generations or self.num_generations
@@ -3124,11 +3159,13 @@ class PPOTrainer(_RLTrainerBase):
             "gae_lambda": self.gae_lambda,
             "normalize_advantages": self.normalize_advantages,
             "value_learning_rate": self.value_learning_rate,
+            "kl_target": self.kl_target,
+            "kl_penalty_mode": self.kl_penalty_mode,
             "reward_source": self.reward_source,
             "reward_normalization": self.reward_normalization,
             "mask_truncated_completions": self.mask_truncated_completions,
             "entropy_bonus": self.entropy_bonus,
-            "advantage_estimator": self.config.advantage_estimator,
+            "advantage_estimator": self.advantage_estimator,
             "temperature": self.temperature,
             "num_generations": self.num_generations,
             "max_completion_length": self.max_completion_length,
@@ -3285,10 +3322,13 @@ class PPOTrainer(_RLTrainerBase):
             batch_size=_rollout_score_batch_size(self, num_generations=generations),
             token_budget=self.score_chunk_size,
         )
+        advantage_mode = self.advantage_estimator
+        rollout_values = rollout_batch.value_predictions if advantage_mode == "gae" else None
         returns, advantages = compute_returns_and_advantages(
             rewards=rollout_batch.rewards,
-            values=rollout_batch.value_predictions,
-            mode="gae",
+            values=rollout_values,
+            prompt_group_indices=rollout_batch.prompt_group_indices,
+            mode=advantage_mode,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             normalize=self.normalize_advantages,
@@ -3316,10 +3356,11 @@ class PPOTrainer(_RLTrainerBase):
             )
         else:
             return {}
+        effective_beta = self._effective_kl_beta(rollout_batch)
         policy_loss, _ = ppo_sequence_loss(
             model=_actual_model(self.model),
             batch=rollout_batch.policy_eval,
-            beta=self.beta,
+            beta=effective_beta,
             clip_epsilon=self.clip_epsilon,
             temperature=self.temperature,
         )
@@ -3423,11 +3464,13 @@ class PPOTrainer(_RLTrainerBase):
                 self.rollout_samples,
             )
 
+        effective_beta = self.beta
+
         def policy_loss_fn(model, batch):
             loss, _ = ppo_sequence_loss(
                 model=model,
                 batch=batch,
-                beta=self.beta,
+                beta=effective_beta,
                 clip_epsilon=self.clip_epsilon,
                 temperature=self.temperature,
             )
@@ -3461,6 +3504,7 @@ class PPOTrainer(_RLTrainerBase):
                 prompt_samples = self._next_prompt_batch()
                 rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
+            effective_beta = self._effective_kl_beta(rollout_batch)
 
             total_policy_loss = 0.0
             total_value_loss = 0.0
@@ -3552,6 +3596,8 @@ class OnlineDPOTrainer(_RLTrainerBase):
         self.reward_source = self.config.reward_source
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.beta = self.config.beta
+        self.kl_target = self.config.kl_target
+        self.kl_penalty_mode = self.config.kl_penalty_mode
         self.label_smoothing = self.config.label_smoothing
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
@@ -3620,6 +3666,8 @@ class OnlineDPOTrainer(_RLTrainerBase):
             "algorithm": self.algorithm,
             "beta": self.beta,
             "label_smoothing": self.label_smoothing,
+            "kl_target": self.kl_target,
+            "kl_penalty_mode": self.kl_penalty_mode,
             "rollout_batch_size": self.rollout_batch_size,
             "minibatch_reuse_steps": self.minibatch_reuse_steps,
             "reward_source": self.reward_source,
@@ -3795,6 +3843,13 @@ class OnlineDPOTrainer(_RLTrainerBase):
                 rollout_batch.prompt_group_indices,
                 self.reward_normalization,
             )
+        if self.kl_penalty_mode != "none" or self.kl_target is not None:
+            rollout_batch = score_rollout_references(
+                _actual_model(self.reference_policy.model),
+                rollout_batch,
+                batch_size=_rollout_score_batch_size(self, num_generations=generations),
+                token_budget=self.score_chunk_size,
+            )
         if self.mask_truncated_completions:
             rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
         return rollout_batch
@@ -3814,13 +3869,14 @@ class OnlineDPOTrainer(_RLTrainerBase):
         preference_batch = self._build_online_preference_batch(rollout_batch)
         metrics = summarize_rollout_metrics(rollout_batch)
         if preference_batch is not None:
+            effective_beta = self._effective_kl_beta(rollout_batch)
             loss, _ = compute_dpo_loss(
                 model=_actual_model(self.model),
                 chosen_ids=preference_batch.chosen.input_ids,
                 rejected_ids=preference_batch.rejected.input_ids,
                 chosen_lengths=preference_batch.chosen.sequence_lengths,
                 rejected_lengths=preference_batch.rejected.sequence_lengths,
-                beta=self.beta,
+                beta=effective_beta,
                 reference_chosen_logprobs=preference_batch.chosen.reference_logprobs,
                 reference_rejected_logprobs=preference_batch.rejected.reference_logprobs,
                 label_smoothing=self.label_smoothing,
@@ -3932,6 +3988,8 @@ class OnlineDPOTrainer(_RLTrainerBase):
                 self.rollout_samples,
             )
 
+        effective_beta = self.beta
+
         def loss_fn(model, batch):
             loss, _ = compute_dpo_loss(
                 model=model,
@@ -3939,7 +3997,7 @@ class OnlineDPOTrainer(_RLTrainerBase):
                 rejected_ids=batch.rejected.input_ids,
                 chosen_lengths=batch.chosen.sequence_lengths,
                 rejected_lengths=batch.rejected.sequence_lengths,
-                beta=self.beta,
+                beta=effective_beta,
                 reference_chosen_logprobs=batch.chosen.reference_logprobs,
                 reference_rejected_logprobs=batch.rejected.reference_logprobs,
                 label_smoothing=self.label_smoothing,
@@ -3961,6 +4019,7 @@ class OnlineDPOTrainer(_RLTrainerBase):
                 prompt_samples = self._next_prompt_batch()
                 rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
+            effective_beta = self._effective_kl_beta(rollout_batch)
             preference_batch = self._build_online_preference_batch(rollout_batch)
             if preference_batch is None:
                 self.global_step += 1

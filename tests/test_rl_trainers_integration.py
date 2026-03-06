@@ -258,6 +258,133 @@ class TestRewardAndPPOIntegration:
         assert (tmp_path / "ppo" / "optimizers" / "policy" / "state.safetensors").exists()
         assert (tmp_path / "ppo" / "optimizers" / "value" / "state.safetensors").exists()
 
+    def test_ppo_trainer_uses_requested_advantage_estimator(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import PPOConfig, PPOTrainer, build_value_model
+        from mlx_tune._rl_runtime import compute_returns_and_advantages
+
+        trainer = PPOTrainer(
+            model=make_model(60),
+            ref_model=make_model(61),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            value_model=build_value_model(make_model(62)),
+            args=PPOConfig(
+                advantage_estimator="rloo",
+                normalize_advantages=False,
+                temperature=0.0,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=4,
+                output_dir=str(tmp_path / "ppo_rloo"),
+            ),
+        )
+
+        trainer._ensure_reference_policy()
+        trainer._prepare_prompt_samples()
+        rollout_batch = trainer._collect_rollout_batch(trainer._next_prompt_batch())
+
+        _, expected_advantages = compute_returns_and_advantages(
+            rewards=rollout_batch.rewards,
+            prompt_group_indices=rollout_batch.prompt_group_indices,
+            mode="rloo",
+            gamma=trainer.gamma,
+            gae_lambda=trainer.gae_lambda,
+            normalize=False,
+        )
+
+        assert mx.allclose(rollout_batch.advantages, expected_advantages)
+
+    def test_on_policy_trainers_activate_kl_controls(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import (
+            GRPOConfig,
+            GRPOTrainer,
+            OnlineDPOConfig,
+            OnlineDPOTrainer,
+            PPOConfig,
+            PPOTrainer,
+            build_value_model,
+        )
+
+        grpo = GRPOTrainer(
+            model=make_model(70),
+            ref_model=make_model(71),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            args=GRPOConfig(
+                beta=0.3,
+                kl_target=1e-4,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "grpo_kl"),
+            ),
+        )
+        grpo._ensure_reference_policy()
+        grpo._prepare_prompt_samples()
+        grpo_rollout = grpo._collect_rollout_batch(grpo._next_prompt_batch())
+        assert grpo._effective_kl_beta(grpo_rollout) != grpo.beta
+
+        ppo = PPOTrainer(
+            model=make_model(72),
+            ref_model=make_model(73),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            value_model=build_value_model(make_model(74)),
+            args=PPOConfig(
+                beta=0.4,
+                kl_penalty_mode="none",
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "ppo_kl_none"),
+            ),
+        )
+        ppo._ensure_reference_policy()
+        ppo._prepare_prompt_samples()
+        ppo_rollout = ppo._collect_rollout_batch(ppo._next_prompt_batch())
+        assert ppo._effective_kl_beta(ppo_rollout) == 0.0
+
+        online_dpo = OnlineDPOTrainer(
+            model=make_model(75),
+            ref_model=make_model(76),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            args=OnlineDPOConfig(
+                beta=0.2,
+                kl_target=1e-4,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "online_dpo_kl"),
+            ),
+        )
+        online_dpo._ensure_reference_policy()
+        online_dpo._prepare_prompt_samples()
+        online_rollout = online_dpo._collect_rollout_batch(online_dpo._next_prompt_batch())
+        assert online_dpo._effective_kl_beta(online_rollout) != online_dpo.beta
+
 
 @pytest.mark.integration
 class TestDPOTrainerIntegration:

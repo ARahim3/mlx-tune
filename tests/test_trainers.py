@@ -151,6 +151,8 @@ class TestPPOAndOnlineDPOConfig:
         assert config.ppo_epochs == 2
         assert config.minibatch_reuse_steps == 2
         assert config.value_learning_rate == config.learning_rate
+        assert config.advantage_estimator == "gae"
+        assert config.kl_penalty_mode == "kl"
 
     def test_online_dpoconfig_defaults(self):
         from mlx_tune import OnlineDPOConfig
