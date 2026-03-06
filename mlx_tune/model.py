@@ -1115,6 +1115,23 @@ def _pad_sequence_batch(
     return mx.array(padded), mx.array(lengths)
 
 
+def _flat_parameter_state(model: Any) -> Dict[str, mx.array]:
+    actual_model = _actual_model(model)
+    return {name: mx.array(value) for name, value in tree_flatten(actual_model.parameters())}
+
+
+def _load_flat_parameter_state(
+    model: Any,
+    parameter_state: Mapping[str, mx.array],
+    strict: bool = False,
+) -> None:
+    if not parameter_state:
+        return
+    actual_model = _actual_model(model)
+    actual_model.update(tree_unflatten(list(parameter_state.items())), strict=strict)
+    mx.eval(actual_model.parameters())
+
+
 @dataclass
 class RLModelRoles:
     policy_model: Any
@@ -1301,6 +1318,10 @@ class ScalarHeadModel:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         mx.save_safetensors(
+            str(output_path / "weights.safetensors"),
+            _flat_parameter_state(self.base_model),
+        )
+        mx.save_safetensors(
             str(output_path / "head.safetensors"),
             dict(tree_flatten(self.head.parameters())),
         )
@@ -1312,6 +1333,7 @@ class ScalarHeadModel:
                     "role": self.role_name,
                     "pooling": self.pooling,
                     "target": self.target,
+                    "backbone_weight_format": "weights.safetensors",
                     "backbone_has_adapters": bool(
                         isinstance(self.base_model, MLXModelWrapper) and self.base_model.has_adapters()
                     ),
@@ -1324,6 +1346,9 @@ class ScalarHeadModel:
 
     def load_pretrained(self, output_dir: str) -> None:
         output_path = Path(output_dir)
+        weights_path = output_path / "weights.safetensors"
+        if weights_path.exists():
+            _load_flat_parameter_state(self.base_model, mx.load(str(weights_path)), strict=False)
         head_weights = mx.load(str(output_path / "head.safetensors"))
         self.head.update(tree_unflatten(list(head_weights.items())), strict=False)
         mx.eval(self.head.parameters())
@@ -1404,7 +1429,7 @@ def build_reward_model(
     head_config: Optional[Dict[str, Any]] = None,
 ) -> RewardModel:
     role_model = _clone_role_model(base_model, freeze=False) if snapshot else base_model
-    if hasattr(role_model, "_adapter_path"):
+    if snapshot and hasattr(role_model, "_adapter_path"):
         role_model._adapter_path = None
     return RewardModel(role_model, pooling=pooling, target=target, head_config=head_config)
 
@@ -1417,7 +1442,7 @@ def build_value_model(
     head_config: Optional[Dict[str, Any]] = None,
 ) -> ValueModel:
     role_model = _clone_role_model(base_model, freeze=False) if snapshot else base_model
-    if hasattr(role_model, "_adapter_path"):
+    if snapshot and hasattr(role_model, "_adapter_path"):
         role_model._adapter_path = None
     return ValueModel(role_model, pooling=pooling, target=target, head_config=head_config)
 

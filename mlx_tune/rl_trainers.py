@@ -330,6 +330,7 @@ class _RLTrainerBase:
         if self.reward_model is not None:
             roles_present.append("reward_model")
             role_weight_formats["reward_model"] = {
+                "backbone": "weights.safetensors",
                 "head": "head.safetensors",
                 "adapters": "adapters.safetensors"
                 if hasattr(reward_base, "has_adapters") and reward_base.has_adapters()
@@ -338,6 +339,7 @@ class _RLTrainerBase:
         if self.value_model is not None:
             roles_present.append("value_model")
             role_weight_formats["value_model"] = {
+                "backbone": "weights.safetensors",
                 "head": "head.safetensors",
                 "adapters": "adapters.safetensors"
                 if hasattr(value_base, "has_adapters") and value_base.has_adapters()

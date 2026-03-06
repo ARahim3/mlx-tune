@@ -583,12 +583,31 @@ class TestGRPOTrainerIntegration:
         from mlx_tune import GRPOConfig, GRPOTrainer, build_reward_model, build_value_model
 
         output_dir = tmp_path / "grpo_manifest"
+        reward_model = build_reward_model(make_model(33))
+        value_model = build_value_model(make_model(34))
+        score_sequence = mx.array([[2, 4, 7]], dtype=mx.int32)
+        score_sequence_lengths = mx.array([3], dtype=mx.int32)
+        score_prompt_lengths = mx.array([1], dtype=mx.int32)
+        score_completion_lengths = mx.array([2], dtype=mx.int32)
+        saved_reward_score = reward_model.score(
+            score_sequence,
+            sequence_lengths=score_sequence_lengths,
+            prompt_lengths=score_prompt_lengths,
+            completion_lengths=score_completion_lengths,
+        )
+        saved_value_score = value_model.predict(
+            score_sequence,
+            sequence_lengths=score_sequence_lengths,
+            prompt_lengths=score_prompt_lengths,
+            completion_lengths=score_completion_lengths,
+        )
+
         trainer = GRPOTrainer(
             model=make_model(32),
             train_dataset=grpo_dataset,
             tokenizer=tokenizer,
-            reward_model=build_reward_model(make_model(33)),
-            value_model=build_value_model(make_model(34)),
+            reward_model=reward_model,
+            value_model=value_model,
             args=GRPOConfig(
                 learning_rate=1e-2,
                 beta=0.01,
@@ -605,7 +624,9 @@ class TestGRPOTrainerIntegration:
         assert (output_dir / "manifest.json").exists()
         assert (output_dir / "policy" / "role.json").exists()
         assert (output_dir / "reference" / "weights.safetensors").exists()
+        assert (output_dir / "reward_model" / "weights.safetensors").exists()
         assert (output_dir / "reward_model" / "head.safetensors").exists()
+        assert (output_dir / "value_model" / "weights.safetensors").exists()
         assert (output_dir / "value_model" / "head.safetensors").exists()
         assert (output_dir / "optimizer" / "state.safetensors").exists()
         assert (output_dir / "scheduler" / "state.json").exists()
@@ -634,6 +655,24 @@ class TestGRPOTrainerIntegration:
         assert result["global_step"] == 2
         assert resumed.reward_model is not None
         assert resumed.value_model is not None
+        assert mx.allclose(
+            resumed.reward_model.score(
+                score_sequence,
+                sequence_lengths=score_sequence_lengths,
+                prompt_lengths=score_prompt_lengths,
+                completion_lengths=score_completion_lengths,
+            ),
+            saved_reward_score,
+        )
+        assert mx.allclose(
+            resumed.value_model.predict(
+                score_sequence,
+                sequence_lengths=score_sequence_lengths,
+                prompt_lengths=score_prompt_lengths,
+                completion_lengths=score_completion_lengths,
+            ),
+            saved_value_score,
+        )
         assert len(resumed.metrics_history) >= len(trainer.metrics_history)
         assert resumed.loaded_checkpoint_manifest is not None
 

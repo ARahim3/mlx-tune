@@ -54,6 +54,26 @@ class DeterministicCausalLM(nn.Module):
         return self.output(self.model(x))
 
 
+class WeightedBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = 2
+        self.proj = nn.Linear(1, 2)
+
+    def __call__(self, x):
+        return self.proj(x.astype(mx.float32)[..., None])
+
+
+class WeightedCausalLM(nn.Module):
+    def __init__(self, vocab_size: int = 64):
+        super().__init__()
+        self.model = WeightedBackbone()
+        self.output = nn.Linear(2, vocab_size)
+
+    def __call__(self, x):
+        return self.output(self.model(x))
+
+
 def make_wrapper() -> MLXModelWrapper:
     model = DeterministicCausalLM()
     mx.eval(model.parameters())
@@ -64,6 +84,18 @@ def make_wrapper() -> MLXModelWrapper:
         model_name="deterministic-model",
     )
     return wrapper
+
+
+def make_weighted_wrapper(seed: int) -> MLXModelWrapper:
+    mx.random.seed(seed)
+    model = WeightedCausalLM()
+    mx.eval(model.parameters())
+    return MLXModelWrapper(
+        model=model,
+        tokenizer=MockTokenizer(),
+        max_seq_length=32,
+        model_name=f"weighted-model-{seed}",
+    )
 
 
 def _set_scalar_head_to_first_feature(role_model) -> None:
@@ -183,6 +215,7 @@ def test_scalar_role_save_load_round_trip_preserves_head_and_adapter_state(tmp_p
 
     assert (output_dir / "head.safetensors").exists()
     assert (output_dir / "head_config.json").exists()
+    assert (output_dir / "weights.safetensors").exists()
     assert (output_dir / "adapters.safetensors").exists()
     assert (output_dir / "adapter_config.json").exists()
     assert mx.allclose(
@@ -199,6 +232,55 @@ def test_scalar_role_save_load_round_trip_preserves_head_and_adapter_state(tmp_p
             completion_lengths=completion_lengths,
         ),
     )
+
+
+def test_scalar_role_save_load_round_trip_preserves_independent_backbone_weights(tmp_path):
+    original_base = make_weighted_wrapper(101)
+
+    reward_model = build_reward_model(original_base)
+    _set_scalar_head_to_first_feature(reward_model)
+
+    output_dir = Path(tmp_path) / "independent_reward_role"
+    reward_model.save_pretrained(str(output_dir))
+
+    restored = build_reward_model(make_weighted_wrapper(202))
+    restored.load_pretrained(str(output_dir))
+
+    sequence = mx.array([[2, 5, 9]], dtype=mx.int32)
+    sequence_lengths = mx.array([3], dtype=mx.int32)
+    prompt_lengths = mx.array([1], dtype=mx.int32)
+    completion_lengths = mx.array([2], dtype=mx.int32)
+
+    assert mx.allclose(
+        reward_model.base_model.model.model.proj.weight,
+        restored.base_model.model.model.proj.weight,
+    )
+    assert mx.allclose(
+        reward_model.score(
+            sequence,
+            sequence_lengths=sequence_lengths,
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+        ),
+        restored.score(
+            sequence,
+            sequence_lengths=sequence_lengths,
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+        ),
+    )
+
+
+def test_snapshot_false_scalar_builders_preserve_caller_adapter_path():
+    base_model = make_wrapper()
+    base_model.set_adapter_path("/tmp/existing-adapters")
+
+    reward_model = build_reward_model(base_model, snapshot=False)
+    value_model = build_value_model(base_model, snapshot=False)
+
+    assert reward_model.base_model is base_model
+    assert value_model.base_model is base_model
+    assert str(base_model.get_adapter_path()) == "/tmp/existing-adapters"
 
 
 def test_scalar_objective_helpers_return_stable_losses_and_metrics():
