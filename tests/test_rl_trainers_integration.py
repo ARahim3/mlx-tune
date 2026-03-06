@@ -1322,6 +1322,141 @@ def test_grpo_reuses_precomputed_rollout_reference_cache_after_resume(tmp_path, 
 
 
 @pytest.mark.integration
+def test_grpo_invalidates_precomputed_rollout_reference_cache_when_dataset_changes(
+    tmp_path,
+    tokenizer,
+    monkeypatch,
+):
+    import mlx_tune.rl_trainers as rl_trainers_module
+    from mlx_tune import GRPOConfig, GRPOTrainer
+
+    output_dir = tmp_path / "grpo_cache_dataset_drift"
+    original_dataset = [
+        {"prompt": "Q1", "completion": "A1", "reward": 1.0},
+        {"prompt": "Q2", "completion": "A2", "reward": 0.5},
+    ]
+    changed_dataset = [
+        {"prompt": "!!!!!!!!", "completion": "zzzzzzzz", "reward": 1.0},
+        {"prompt": "????????", "completion": "yyyyyyyy", "reward": 0.5},
+    ]
+    trainer = GRPOTrainer(
+        model=make_model(88),
+        train_dataset=original_dataset,
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=19,
+            learning_rate=1e-2,
+            reward_source="offline",
+            num_generations=2,
+            precompute_reference_scores=True,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    trainer.train()
+    original_scores = mx.array(trainer.runtime_cache_arrays["grpo.train_rollout_reference_logprobs"])
+
+    resumed = GRPOTrainer(
+        model=make_model(89),
+        train_dataset=changed_dataset,
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=19,
+            learning_rate=1e-2,
+            reward_source="offline",
+            num_generations=2,
+            precompute_reference_scores=True,
+            max_steps=2,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    resumed._apply_lora_if_needed()
+    resumed._prepare_prompt_samples()
+    optimizer = resumed._optimizer_for_training()
+    resumed.optimizer = optimizer
+    resumed.load_state(optimizer=optimizer, checkpoint_dir=output_dir)
+    resumed._ensure_reference_policy()
+
+    original = rl_trainers_module.score_policy_in_chunks
+    reference_model = resumed.reference_policy.model.model
+    calls = {"reference": 0}
+
+    def wrapped(model, *args, **kwargs):
+        if model is reference_model:
+            calls["reference"] += 1
+        return original(model, *args, **kwargs)
+
+    monkeypatch.setattr(rl_trainers_module, "score_policy_in_chunks", wrapped)
+    batch = resumed._collect_fixed_rollout_batch(
+        resumed.rollout_samples,
+        cache_key="grpo.train_rollout_reference_logprobs",
+    )
+
+    assert calls["reference"] > 0
+    assert not mx.allclose(batch.reference_logprobs, original_scores)
+
+
+@pytest.mark.integration
+def test_grpo_resume_rejects_objective_and_update_shape_drift(tmp_path, tokenizer, grpo_dataset):
+    from mlx_tune import GRPOConfig, GRPOTrainer
+
+    output_dir = tmp_path / "grpo_resume_config_drift"
+    trainer = GRPOTrainer(
+        model=make_model(90),
+        train_dataset=grpo_dataset,
+        tokenizer=tokenizer,
+        reward_fn=lambda response, context: float(len(response)),
+        args=GRPOConfig(
+            seed=31,
+            learning_rate=1e-2,
+            beta=0.01,
+            clip_epsilon=0.2,
+            rollout_batch_size=1,
+            minibatch_reuse_steps=1,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    trainer.train()
+
+    resumed = GRPOTrainer(
+        model=make_model(91),
+        train_dataset=grpo_dataset,
+        tokenizer=tokenizer,
+        reward_fn=lambda response, context: float(len(response)),
+        args=GRPOConfig(
+            seed=31,
+            learning_rate=1e-2,
+            beta=0.99,
+            clip_epsilon=0.33,
+            rollout_batch_size=5,
+            minibatch_reuse_steps=7,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=2,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    resumed._apply_lora_if_needed()
+    resumed._prepare_prompt_samples()
+    optimizer = resumed._optimizer_for_training()
+    resumed.optimizer = optimizer
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        resumed.load_state(optimizer=optimizer, checkpoint_dir=output_dir)
+
+
+@pytest.mark.integration
 def test_online_dpo_eval_preference_reference_cache_reused_after_resume(tmp_path, tokenizer, monkeypatch):
     import mlx_tune.rl_trainers as rl_trainers_module
     from mlx_tune import OnlineDPOConfig, OnlineDPOTrainer

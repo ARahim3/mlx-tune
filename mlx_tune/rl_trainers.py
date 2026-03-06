@@ -207,6 +207,10 @@ def _save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def _hash_payload(payload: Any) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 class _ScalarRoleTrainTarget(nn.Module):
     def __init__(self, backbone: Any, head: Any):
         super().__init__()
@@ -263,7 +267,7 @@ class _RLTrainerBase:
         payload = self._sampling_config_payload()
         if not payload:
             return None
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return _hash_payload(payload)
 
     def _validate_resume_sampling_fingerprint(self, trainer_state: Dict[str, Any]) -> None:
         current_fingerprint = self._sampling_config_fingerprint()
@@ -1669,6 +1673,33 @@ def _rollout_score_batch_size(trainer: Any, num_generations: Optional[int] = Non
     return max(1, trainer.rollout_batch_size * max(1, generations))
 
 
+def _fixed_rollout_cache_dataset_fingerprint(samples: List[Dict[str, Any]]) -> str:
+    return _hash_payload(
+        [
+            {
+                "sample_index": sample.get("sample_index"),
+                "prompt": sample.get("prompt"),
+                "completion": sample.get("completion"),
+                "reward_context": sample.get("reward_context"),
+            }
+            for sample in samples
+        ]
+    )
+
+
+def _preference_cache_dataset_fingerprint(samples: List[Dict[str, Any]]) -> str:
+    return _hash_payload(
+        [
+            {
+                "sample_index": sample.get("sample_index"),
+                "chosen_ids": sample.get("chosen_ids"),
+                "rejected_ids": sample.get("rejected_ids"),
+            }
+            for sample in samples
+        ]
+    )
+
+
 def _fixed_rollout_reference_cache_valid(
     trainer: Any,
     cache_key: str,
@@ -1678,7 +1709,11 @@ def _fixed_rollout_reference_cache_valid(
     cached_indices = trainer.runtime_cache_arrays.get(f"{cache_key}.sample_indices")
     if cached_scores is None or cached_indices is None or cached_scores.shape[0] != len(samples):
         return False
-    return cached_indices.tolist() == [sample["sample_index"] for sample in samples]
+    cache_info = trainer.cache_metadata.get("reference_score_caches", {}).get(cache_key, {})
+    return (
+        cached_indices.tolist() == [sample["sample_index"] for sample in samples]
+        and cache_info.get("dataset_fingerprint") == _fixed_rollout_cache_dataset_fingerprint(samples)
+    )
 
 
 def _ensure_fixed_rollout_reference_cache(
@@ -1725,6 +1760,7 @@ def _ensure_fixed_rollout_reference_cache(
     trainer.cache_metadata.setdefault("reference_score_caches", {})[cache_key] = {
         "num_samples": len(samples),
         "sampling_config_fingerprint": trainer._sampling_config_fingerprint(),
+        "dataset_fingerprint": _fixed_rollout_cache_dataset_fingerprint(samples),
     }
     return reference_logprobs
 
@@ -1741,7 +1777,11 @@ def _preference_reference_cache_valid(
         return False
     if chosen.shape[0] != len(samples) or rejected.shape[0] != len(samples):
         return False
-    return sample_indices.tolist() == [sample["sample_index"] for sample in samples]
+    cache_info = trainer.cache_metadata.get("reference_score_caches", {}).get(cache_key, {})
+    return (
+        sample_indices.tolist() == [sample["sample_index"] for sample in samples]
+        and cache_info.get("dataset_fingerprint") == _preference_cache_dataset_fingerprint(samples)
+    )
 
 
 def _ensure_preference_reference_cache(
@@ -1789,6 +1829,7 @@ def _ensure_preference_reference_cache(
     trainer.cache_metadata.setdefault("reference_score_caches", {})[cache_key] = {
         "num_samples": len(samples),
         "sampling_config_fingerprint": trainer._sampling_config_fingerprint(),
+        "dataset_fingerprint": _preference_cache_dataset_fingerprint(samples),
     }
     return (
         trainer.runtime_cache_arrays[f"{cache_key}.chosen"],
@@ -2552,6 +2593,16 @@ class GRPOTrainer(_RLTrainerBase):
     def _sampling_config_payload(self) -> Dict[str, Any]:
         return {
             "algorithm": self.algorithm,
+            "loss_type": self.resolved_loss_type,
+            "beta": self.beta,
+            "clip_epsilon": self.clip_epsilon,
+            "rollout_batch_size": self.rollout_batch_size,
+            "minibatch_reuse_steps": self.minibatch_reuse_steps,
+            "advantage_mode": self.advantage_mode,
+            "reward_source": self.reward_source,
+            "reward_normalization": self.reward_normalization,
+            "mask_truncated_completions": self.mask_truncated_completions,
+            "entropy_bonus": self.entropy_bonus,
             "temperature": self.temperature,
             "num_generations": self.num_generations,
             "max_completion_length": self.max_completion_length,
@@ -3041,6 +3092,19 @@ class PPOTrainer(_RLTrainerBase):
     def _sampling_config_payload(self) -> Dict[str, Any]:
         return {
             "algorithm": self.algorithm,
+            "beta": self.beta,
+            "clip_epsilon": self.clip_epsilon,
+            "rollout_batch_size": self.rollout_batch_size,
+            "minibatch_reuse_steps": self.minibatch_reuse_steps,
+            "gamma": self.gamma,
+            "gae_lambda": self.gae_lambda,
+            "normalize_advantages": self.normalize_advantages,
+            "value_learning_rate": self.value_learning_rate,
+            "reward_source": self.reward_source,
+            "reward_normalization": self.reward_normalization,
+            "mask_truncated_completions": self.mask_truncated_completions,
+            "entropy_bonus": self.entropy_bonus,
+            "advantage_estimator": self.config.advantage_estimator,
             "temperature": self.temperature,
             "num_generations": self.num_generations,
             "max_completion_length": self.max_completion_length,
@@ -3530,6 +3594,14 @@ class OnlineDPOTrainer(_RLTrainerBase):
     def _sampling_config_payload(self) -> Dict[str, Any]:
         return {
             "algorithm": self.algorithm,
+            "beta": self.beta,
+            "label_smoothing": self.label_smoothing,
+            "rollout_batch_size": self.rollout_batch_size,
+            "minibatch_reuse_steps": self.minibatch_reuse_steps,
+            "reward_source": self.reward_source,
+            "reward_normalization": self.reward_normalization,
+            "mask_truncated_completions": self.mask_truncated_completions,
+            "entropy_bonus": self.entropy_bonus,
             "temperature": self.temperature,
             "num_generations": self.num_generations,
             "max_completion_length": self.max_completion_length,
