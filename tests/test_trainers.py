@@ -82,6 +82,7 @@ class TestRewardConfig:
 
         assert config.learning_rate == 5e-6
         assert config.regression_loss_type == "mse"
+        assert config.dataset_mode is None
 
 
 class TestGRPOConfig:
@@ -95,9 +96,12 @@ class TestGRPOConfig:
 
         assert config.loss_type == "grpo"
         assert config.advantage_mode == "group_zscore"
+        assert config.advantage_estimator == "group_zscore"
         assert config.num_generations == 4
         assert config.temperature == 0.7
         assert config.beta == 0.04
+        assert config.kl_beta == 0.04
+        assert config.reward_source == "auto"
 
     def test_grpoconfig_with_reward_fn(self):
         """Test GRPOConfig with custom reward function."""
@@ -111,6 +115,20 @@ class TestGRPOConfig:
         assert config.reward_fn is not None
         assert config.num_generations == 8
 
+    def test_grpoconfig_aliases_and_to_dict(self):
+        from mlx_tune import GRPOConfig
+
+        config = GRPOConfig(
+            generations_per_prompt=6,
+            advantage_estimator="rloo",
+            reward_fn=lambda *_: 1.0,
+        )
+
+        assert config.num_generations == 6
+        assert config.advantage_mode == "rloo"
+        assert config.to_dict()["num_generations"] == 6
+        assert "reward_fn" not in config.to_dict()
+
 
 class TestPPOAndOnlineDPOConfig:
     def test_ppoconfig_defaults(self):
@@ -119,6 +137,7 @@ class TestPPOAndOnlineDPOConfig:
         config = PPOConfig()
 
         assert config.ppo_epochs == 2
+        assert config.minibatch_reuse_steps == 2
         assert config.value_learning_rate == config.learning_rate
 
     def test_online_dpoconfig_defaults(self):
@@ -128,6 +147,15 @@ class TestPPOAndOnlineDPOConfig:
 
         assert config.num_generations == 4
         assert config.beta == 0.1
+
+    def test_new_offline_config_exports(self):
+        from mlx_tune import KTOConfig, SimPOConfig
+
+        kto = KTOConfig()
+        simpo = SimPOConfig()
+
+        assert kto.beta == 0.1
+        assert simpo.gamma == 0.5
 
 
 class TestTrainerInitialization:
@@ -203,6 +231,11 @@ class TestUtilityFunctions:
         from mlx_tune import prepare_preference_dataset
         assert prepare_preference_dataset is not None
 
+    def test_prepare_rl_dataset_import(self):
+        from mlx_tune import prepare_rl_dataset
+
+        assert prepare_rl_dataset is not None
+
     def test_create_reward_function_simple(self):
         """Test create_reward_function with simple type."""
         from mlx_tune import create_reward_function
@@ -242,6 +275,21 @@ class TestUtilityFunctions:
         # Medium response
         medium_result = reward_fn(" ".join(["word"] * 30), "")
         assert medium_result == 0.5
+
+    def test_create_reward_function_composition(self):
+        from mlx_tune import create_reward_function
+
+        reward_fn = create_reward_function(
+            rewards=[
+                {"name": "simple", "source": "simple", "weight": 0.25},
+                {"name": "length", "source": "length", "weight": 0.75},
+            ]
+        )
+
+        result = reward_fn.evaluate({"completion_text": "The answer is 42", "reward_context": "42"})
+
+        assert result["reward"] > 0.0
+        assert set(result["components"]) >= {"simple", "length"}
 
 
 class TestExportFunctions:

@@ -63,6 +63,14 @@ from mlx_tune.model import (
     build_reward_model,
     build_value_model,
 )
+from mlx_tune.rl_api import (
+    RLCheckpointBundle,
+    create_reward_function as public_create_reward_function,
+    prepare_preference_dataset as public_prepare_preference_dataset,
+    prepare_reward_dataset as public_prepare_reward_dataset,
+    prepare_rl_dataset,
+    resume_from_checkpoint,
+)
 
 
 STATE_FILE = "trainer_state.safetensors"
@@ -83,6 +91,13 @@ def _actual_model(model: Any) -> Any:
 def _pad_token_id(tokenizer: Any) -> int:
     pad_id = getattr(tokenizer, "pad_token_id", None)
     return 0 if pad_id is None else pad_id
+
+
+def _encode_text(tokenizer: Any, text: str, add_special_tokens: bool = True) -> List[int]:
+    try:
+        return list(tokenizer.encode(text, add_special_tokens=add_special_tokens))
+    except TypeError:
+        return list(tokenizer.encode(text))
 
 
 def _save_adapters_and_config(model: Any, adapter_path: Path) -> bool:
@@ -115,6 +130,14 @@ def _load_parameter_tree(model: Any, path: Path, strict: bool = False) -> None:
     actual_model = _actual_model(model)
     weights = mx.load(str(path))
     actual_model.update(tree_unflatten(list(weights.items())), strict=strict)
+    mx.eval(actual_model.parameters())
+
+
+def _load_flat_parameter_tree(model: Any, flat_state: Dict[str, Any], strict: bool = False) -> None:
+    if not flat_state:
+        return
+    actual_model = _actual_model(model)
+    actual_model.update(tree_unflatten(list(flat_state.items())), strict=strict)
     mx.eval(actual_model.parameters())
 
 
@@ -247,6 +270,16 @@ class _RLTrainerBase:
 
         batch = []
         for _ in range(max(1, self.batch_size)):
+            batch.append(samples[self.dataset_cursor])
+            self.dataset_cursor = (self.dataset_cursor + 1) % len(samples)
+        return batch
+
+    def _next_rollout_samples(self, samples: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
+        if not samples:
+            raise ValueError(f"{self.algorithm} training dataset is empty.")
+
+        batch = []
+        for _ in range(max(1, count)):
             batch.append(samples[self.dataset_cursor])
             self.dataset_cursor = (self.dataset_cursor + 1) % len(samples)
         return batch
@@ -547,6 +580,86 @@ class _RLTrainerBase:
             return self.value_model
         return None
 
+    def _apply_scalar_role_state(self, role_name: str, role_state: Any) -> Optional[Any]:
+        if role_name == "reward_model":
+            if self.reward_model is None:
+                self.reward_model = build_reward_model(
+                    self.model,
+                    pooling=role_state.head_config.get("pooling", "last_token"),
+                    target=role_state.head_config.get("target", "completion"),
+                )
+            role_model = self.reward_model
+        elif role_name == "value_model":
+            if self.value_model is None:
+                self.value_model = build_value_model(
+                    self.model,
+                    pooling=role_state.head_config.get("pooling", "last_token"),
+                    target=role_state.head_config.get("target", "completion"),
+                )
+            role_model = self.value_model
+        else:
+            return None
+
+        _load_flat_parameter_tree(role_model.base_model, role_state.parameter_state, strict=False)
+        if role_state.adapter_state:
+            _load_flat_parameter_tree(role_model.base_model, role_state.adapter_state, strict=False)
+        if role_state.head_state:
+            role_model.head.update(tree_unflatten(list(role_state.head_state.items())), strict=False)
+            mx.eval(role_model.head.parameters())
+        if role_state.head_config:
+            role_model.head_config.update(role_state.head_config)
+            role_model.pooling = role_model.head_config.get("pooling", role_model.pooling)
+            role_model.target = role_model.head_config.get("target", role_model.target)
+        return role_model
+
+    def _apply_checkpoint_bundle(
+        self,
+        bundle: RLCheckpointBundle,
+        optimizer: Any = None,
+        optimizers: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, mx.array]:
+        self.loaded_checkpoint_manifest = bundle.manifest
+        optimizer_map = self._normalize_optimizers(optimizer=optimizer, optimizers=optimizers)
+        if optimizer_map:
+            for name, current_optimizer in optimizer_map.items():
+                state_tree = bundle.optimizer_state_trees.get(name)
+                if state_tree is None and len(bundle.optimizer_state_trees) == 1:
+                    state_tree = next(iter(bundle.optimizer_state_trees.values()))
+                if state_tree:
+                    current_optimizer.state = state_tree
+            self.optimizers = optimizer_map
+            if len(optimizer_map) == 1:
+                self.optimizer = next(iter(optimizer_map.values()))
+
+        if bundle.rng_state:
+            _restore_rng_state(bundle.rng_state)
+
+        trainer_state = bundle.trainer_state
+        self.global_step = trainer_state.get("global_step", 0)
+        self.dataset_cursor = trainer_state.get("dataset_cursor", 0)
+        self.cache_metadata = trainer_state.get("cache_metadata", {})
+        self.metrics_history = list(bundle.metrics_history)
+
+        for role_name, role_state in bundle.restored_roles.items():
+            if role_name == "policy":
+                _load_flat_parameter_tree(self.model, role_state.parameter_state, strict=False)
+            elif role_name == "reference":
+                self.reference_policy = build_reference_policy(self.model, snapshot=True)
+                _load_flat_parameter_tree(self.reference_policy.model, role_state.parameter_state, strict=False)
+                reference_actual = _actual_model(self.reference_policy.model)
+                if hasattr(reference_actual, "freeze"):
+                    reference_actual.freeze()
+                    mx.eval(reference_actual.parameters())
+                if role_state.metadata:
+                    self.reference_policy.source = role_state.metadata.get("source", self.reference_policy.source)
+                    self.reference_policy.metadata = role_state.metadata.get("metadata", self.reference_policy.metadata)
+            elif role_name in {"reward_model", "value_model"}:
+                self._apply_scalar_role_state(role_name, role_state)
+
+        if self.requires_reference_policy and self.reference_policy is None:
+            self._ensure_reference_policy()
+        return bundle.runtime_cache
+
     def _restore_optimizer_states(
         self,
         checkpoint_dir: Path,
@@ -658,45 +771,12 @@ class _RLTrainerBase:
         checkpoint_dir: Optional[Path] = None,
         optimizers: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, mx.array]:
-        checkpoint_dir = Path(checkpoint_dir)
-        if self._has_manifest_checkpoint(checkpoint_dir):
-            return self._load_manifest_state(optimizer=optimizer, checkpoint_dir=checkpoint_dir, optimizers=optimizers)
-        if self._has_legacy_checkpoint(checkpoint_dir):
-            return self._load_legacy_state(optimizer=optimizer, checkpoint_dir=checkpoint_dir, optimizers=optimizers)
-        raise FileNotFoundError(f"Checkpoint state not found under {checkpoint_dir}")
+        bundle = resume_from_checkpoint(Path(checkpoint_dir))
+        return self._apply_checkpoint_bundle(bundle, optimizer=optimizer, optimizers=optimizers)
 
 
 def prepare_reward_dataset(dataset: Any) -> List[Dict[str, Any]]:
-    normalized: List[Dict[str, Any]] = []
-    for sample in dataset:
-        if {"chosen", "rejected"} <= set(sample.keys()):
-            normalized.append(
-                {
-                    "type": "pairwise",
-                    "prompt": sample.get("prompt", ""),
-                    "chosen": sample["chosen"],
-                    "rejected": sample["rejected"],
-                }
-            )
-        elif "text" in sample:
-            normalized.append(
-                {
-                    "type": "scalar",
-                    "prompt": "",
-                    "response": sample["text"],
-                    **({"score": float(sample["score"])} if "score" in sample else {}),
-                }
-            )
-        elif {"prompt", "response"} <= set(sample.keys()):
-            normalized.append(
-                {
-                    "type": "scalar",
-                    "prompt": sample["prompt"],
-                    "response": sample["response"],
-                    **({"score": float(sample["score"])} if "score" in sample else {}),
-                }
-            )
-    return normalized
+    return public_prepare_reward_dataset(dataset)
 
 
 def _tokenize_reward_scalar_sample(
@@ -753,7 +833,7 @@ def score_reward_model(
     if scoring_tokenizer is None:
         raise ValueError("score_reward_model requires a tokenizer on the reward model or as an argument.")
 
-    normalized = prepare_reward_dataset(samples)
+    normalized = list(prepare_rl_dataset(samples, mode="reward_scalar", tokenizer=scoring_tokenizer))
     if any(sample.get("type") != "scalar" for sample in normalized):
         raise ValueError("score_reward_model only supports scalar reward samples.")
 
@@ -776,7 +856,71 @@ def score_reward_model(
     return scores
 
 
-class RewardConfig:
+class RLConfigBase:
+    _NON_SERIALIZED_FIELDS: set[str] = set()
+
+    @staticmethod
+    def _pop_alias(kwargs: Dict[str, Any], *names: str, default: Any = None) -> Any:
+        found = [name for name in names if name in kwargs]
+        if not found:
+            return default
+        value = kwargs.pop(found[0])
+        for name in found[1:]:
+            kwargs.pop(name)
+        return value
+
+    @staticmethod
+    def _normalize_reward_sources(
+        reward_sources: Optional[Any],
+        reward_fn: Optional[Any],
+        reward_model: Optional[Any],
+    ) -> List[Any]:
+        resolved: List[Any] = []
+        if reward_sources is not None:
+            if isinstance(reward_sources, (list, tuple)):
+                resolved.extend(list(reward_sources))
+            else:
+                resolved.append(reward_sources)
+        if reward_model is not None:
+            resolved.append({"name": "reward_model", "source": reward_model})
+        if reward_fn is not None:
+            resolved.append({"name": "reward_fn", "source": reward_fn})
+        return resolved
+
+    def _set_remaining(self, kwargs: Dict[str, Any]) -> None:
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        self._validate()
+
+    def _validate_choice(self, field: str, value: Any, choices: set[str]) -> None:
+        if value not in choices:
+            raise ValueError(f"Unsupported {field} '{value}'. Supported values: {sorted(choices)}")
+
+    def _validate(self) -> None:
+        reward_source = getattr(self, "reward_source", None)
+        if reward_source is not None:
+            self._validate_choice("reward_source", reward_source, {"auto", "online", "offline", "hybrid"})
+        advantage_estimator = getattr(self, "advantage_estimator", None)
+        if advantage_estimator is not None:
+            self._validate_choice("advantage_estimator", advantage_estimator, {"group_zscore", "rloo", "gae"})
+        kl_penalty_mode = getattr(self, "kl_penalty_mode", None)
+        if kl_penalty_mode is not None:
+            self._validate_choice("kl_penalty_mode", kl_penalty_mode, {"kl", "none"})
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        for key, value in self.__dict__.items():
+            if key.startswith("_") or key in self._NON_SERIALIZED_FIELDS:
+                continue
+            if callable(value):
+                continue
+            if hasattr(value, "parameters") or hasattr(value, "score") or hasattr(value, "predict"):
+                continue
+            payload[key] = value
+        return payload
+
+
+class RewardConfig(RLConfigBase):
     def __init__(
         self,
         output_dir: str = "./reward_outputs",
@@ -789,6 +933,9 @@ class RewardConfig:
         max_seq_length: int = 2048,
         pairwise_margin: float = 0.0,
         regression_loss_type: str = "mse",
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
         self.output_dir = output_dir
@@ -801,14 +948,13 @@ class RewardConfig:
         self.max_seq_length = max_seq_length
         self.pairwise_margin = pairwise_margin
         self.regression_loss_type = regression_loss_type
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
 
-
-class DPOConfig:
+class DPOConfig(RLConfigBase):
     def __init__(
         self,
         beta: float = 0.1,
@@ -825,6 +971,9 @@ class DPOConfig:
         save_steps: int = 100,
         max_seq_length: int = 2048,
         max_prompt_length: int = 512,
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
         self.beta = beta
@@ -841,14 +990,13 @@ class DPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_prompt_length = max_prompt_length
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
 
-
-class ORPOConfig:
+class ORPOConfig(RLConfigBase):
     def __init__(
         self,
         beta: float = 0.1,
@@ -863,6 +1011,9 @@ class ORPOConfig:
         save_steps: int = 100,
         max_seq_length: int = 2048,
         max_prompt_length: int = 512,
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
         self.beta = beta
@@ -877,14 +1028,15 @@ class ORPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_prompt_length = max_prompt_length
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
 
+class GRPOConfig(RLConfigBase):
+    _NON_SERIALIZED_FIELDS = {"reward_fn", "reward_model", "value_model"}
 
-class GRPOConfig:
     def __init__(
         self,
         loss_type: str = "grpo",
@@ -907,17 +1059,51 @@ class GRPOConfig:
         save_steps: int = 100,
         max_seq_length: int = 2048,
         clip_epsilon: float = 0.2,
+        rollout_batch_size: Optional[int] = None,
+        reward_normalization: str = "none",
+        mask_truncated_completions: bool = False,
+        minibatch_reuse_steps: int = 1,
+        entropy_bonus: float = 0.0,
+        advantage_estimator: Optional[str] = None,
+        reward_source: str = "auto",
+        reward_sources: Optional[Any] = None,
+        kl_target: Optional[float] = None,
+        kl_penalty_mode: str = "kl",
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
         self.loss_type = loss_type
-        self.advantage_mode = kwargs.pop("baseline_mode", kwargs.pop("advantage_estimator", advantage_mode))
-        self.beta = beta
-        self.num_generations = num_generations
+        resolved_advantage = self._pop_alias(
+            kwargs,
+            "baseline_mode",
+            "advantage_estimator",
+            default=advantage_estimator or advantage_mode,
+        )
+        self.advantage_estimator = resolved_advantage
+        self.advantage_mode = resolved_advantage
+        self.kl_beta = self._pop_alias(kwargs, "kl_beta", default=beta)
+        self.beta = self.kl_beta
+        self.kl_target = kl_target
+        self.kl_penalty_mode = kl_penalty_mode
+        self.num_generations = self._pop_alias(kwargs, "generations_per_prompt", default=num_generations)
         self.temperature = temperature
         self.max_completion_length = max_completion_length
         self.reward_fn = reward_fn
         self.reward_model = reward_model
         self.value_model = value_model
+        self.reward_sources = self._normalize_reward_sources(
+            self._pop_alias(kwargs, "reward_sources", default=reward_sources),
+            reward_fn,
+            reward_model,
+        )
+        self.reward_source = reward_source
+        self.reward_normalization = reward_normalization
+        self.mask_truncated_completions = mask_truncated_completions
+        self.minibatch_reuse_steps = minibatch_reuse_steps
+        self.entropy_bonus = entropy_bonus
+        self.rollout_batch_size = rollout_batch_size
         self.output_dir = output_dir
         self.learning_rate = learning_rate
         self.per_device_train_batch_size = per_device_train_batch_size
@@ -929,18 +1115,15 @@ class GRPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.clip_epsilon = clip_epsilon
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-            if not key.startswith("_") and key not in {"reward_fn", "reward_model", "value_model"}
-        }
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
 
-class PPOConfig:
+class PPOConfig(RLConfigBase):
+    _NON_SERIALIZED_FIELDS = {"reward_fn", "reward_model", "value_model"}
+
     def __init__(
         self,
         output_dir: str = "./ppo_outputs",
@@ -964,8 +1147,22 @@ class PPOConfig:
         reward_model: Optional[Any] = None,
         value_model: Optional[Any] = None,
         normalize_advantages: bool = True,
+        rollout_batch_size: Optional[int] = None,
+        reward_normalization: str = "none",
+        mask_truncated_completions: bool = False,
+        minibatch_reuse_steps: Optional[int] = None,
+        entropy_bonus: float = 0.0,
+        advantage_estimator: str = "gae",
+        reward_source: str = "auto",
+        reward_sources: Optional[Any] = None,
+        kl_target: Optional[float] = None,
+        kl_penalty_mode: str = "kl",
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
+        reuse_steps = ppo_epochs if minibatch_reuse_steps is None else minibatch_reuse_steps
         self.output_dir = output_dir
         self.learning_rate = learning_rate
         self.value_learning_rate = learning_rate if value_learning_rate is None else value_learning_rate
@@ -976,29 +1173,41 @@ class PPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_completion_length = max_completion_length
-        self.num_generations = num_generations
-        self.ppo_epochs = ppo_epochs
+        self.num_generations = self._pop_alias(kwargs, "generations_per_prompt", default=num_generations)
+        self.minibatch_reuse_steps = reuse_steps
+        self.ppo_epochs = reuse_steps
         self.temperature = temperature
         self.clip_epsilon = clip_epsilon
-        self.beta = beta
+        self.kl_beta = self._pop_alias(kwargs, "kl_beta", default=beta)
+        self.beta = self.kl_beta
+        self.kl_target = kl_target
+        self.kl_penalty_mode = kl_penalty_mode
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.reward_fn = reward_fn
         self.reward_model = reward_model
         self.value_model = value_model
+        self.reward_sources = self._normalize_reward_sources(
+            self._pop_alias(kwargs, "reward_sources", default=reward_sources),
+            reward_fn,
+            reward_model,
+        )
+        self.reward_source = reward_source
+        self.reward_normalization = reward_normalization
+        self.mask_truncated_completions = mask_truncated_completions
+        self.entropy_bonus = entropy_bonus
+        self.advantage_estimator = advantage_estimator
+        self.rollout_batch_size = rollout_batch_size
         self.normalize_advantages = normalize_advantages
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-            if not key.startswith("_") and key not in {"reward_fn", "reward_model", "value_model"}
-        }
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
 
-class OnlineDPOConfig:
+class OnlineDPOConfig(RLConfigBase):
+    _NON_SERIALIZED_FIELDS = {"reward_fn", "reward_model"}
+
     def __init__(
         self,
         beta: float = 0.1,
@@ -1016,9 +1225,24 @@ class OnlineDPOConfig:
         temperature: float = 0.7,
         reward_fn: Optional[Callable] = None,
         reward_model: Optional[Any] = None,
+        rollout_batch_size: Optional[int] = None,
+        reward_normalization: str = "none",
+        mask_truncated_completions: bool = False,
+        minibatch_reuse_steps: int = 1,
+        entropy_bonus: float = 0.0,
+        reward_source: str = "auto",
+        reward_sources: Optional[Any] = None,
+        kl_target: Optional[float] = None,
+        kl_penalty_mode: str = "kl",
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
         **kwargs,
     ):
-        self.beta = beta
+        self.kl_beta = self._pop_alias(kwargs, "kl_beta", default=beta)
+        self.beta = self.kl_beta
+        self.kl_target = kl_target
+        self.kl_penalty_mode = kl_penalty_mode
         self.label_smoothing = label_smoothing
         self.output_dir = output_dir
         self.learning_rate = learning_rate
@@ -1029,19 +1253,169 @@ class OnlineDPOConfig:
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.max_completion_length = max_completion_length
-        self.num_generations = num_generations
+        self.num_generations = self._pop_alias(kwargs, "generations_per_prompt", default=num_generations)
         self.temperature = temperature
         self.reward_fn = reward_fn
         self.reward_model = reward_model
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.reward_sources = self._normalize_reward_sources(
+            self._pop_alias(kwargs, "reward_sources", default=reward_sources),
+            reward_fn,
+            reward_model,
+        )
+        self.reward_source = reward_source
+        self.reward_normalization = reward_normalization
+        self.mask_truncated_completions = mask_truncated_completions
+        self.minibatch_reuse_steps = minibatch_reuse_steps
+        self.entropy_bonus = entropy_bonus
+        self.rollout_batch_size = rollout_batch_size
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-            if not key.startswith("_") and key not in {"reward_fn", "reward_model"}
-        }
+
+class KTOConfig(RLConfigBase):
+    def __init__(
+        self,
+        beta: float = 0.1,
+        output_dir: str = "./kto_outputs",
+        learning_rate: float = 5e-7,
+        per_device_train_batch_size: int = 1,
+        num_train_epochs: int = 1,
+        max_steps: int = 100,
+        logging_steps: int = 10,
+        save_steps: int = 100,
+        max_seq_length: int = 2048,
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
+        **kwargs,
+    ):
+        self.beta = beta
+        self.output_dir = output_dir
+        self.learning_rate = learning_rate
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.num_train_epochs = num_train_epochs
+        self.max_steps = max_steps
+        self.logging_steps = logging_steps
+        self.save_steps = save_steps
+        self.max_seq_length = max_seq_length
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
+
+
+class SimPOConfig(RLConfigBase):
+    def __init__(
+        self,
+        gamma: float = 0.5,
+        beta: float = 2.0,
+        output_dir: str = "./simpo_outputs",
+        learning_rate: float = 5e-7,
+        per_device_train_batch_size: int = 1,
+        num_train_epochs: int = 1,
+        max_steps: int = 100,
+        logging_steps: int = 10,
+        save_steps: int = 100,
+        max_seq_length: int = 2048,
+        dataset_mode: Optional[str] = None,
+        chat_template: Optional[Any] = None,
+        auto_detect_dataset: bool = True,
+        **kwargs,
+    ):
+        self.gamma = gamma
+        self.beta = beta
+        self.output_dir = output_dir
+        self.learning_rate = learning_rate
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.num_train_epochs = num_train_epochs
+        self.max_steps = max_steps
+        self.logging_steps = logging_steps
+        self.save_steps = save_steps
+        self.max_seq_length = max_seq_length
+        self.dataset_mode = dataset_mode
+        self.chat_template = chat_template
+        self.auto_detect_dataset = auto_detect_dataset
+        self._set_remaining(kwargs)
+
+
+def _resolve_reward_evaluator(
+    reward_model: Optional[Any],
+    reward_fn: Optional[Any],
+    reward_sources: Optional[List[Any]] = None,
+) -> Any:
+    if reward_sources:
+        if len(reward_sources) == 1:
+            component = reward_sources[0]
+            if isinstance(component, dict) and "source" in component and set(component.keys()) <= {"name", "source", "weight", "normalize"}:
+                source = component["source"]
+                return public_create_reward_function(source) if isinstance(source, str) else source
+        return public_create_reward_function(rewards=reward_sources)
+    if reward_model is not None:
+        return reward_model
+    if reward_fn is not None:
+        return reward_fn
+    return None
+
+
+def _normalize_reward_values(
+    rewards: mx.array,
+    prompt_group_indices: mx.array,
+    mode: str,
+) -> mx.array:
+    if mode in {"none", "off", ""}:
+        return rewards
+    if mode not in {"center", "zscore"}:
+        raise ValueError(f"Unsupported reward normalization mode: {mode}")
+    reward_values = rewards.tolist()
+    groups = prompt_group_indices.tolist()
+    adjusted = [0.0] * len(reward_values)
+    grouped: Dict[int, List[int]] = {}
+    for index, group in enumerate(groups):
+        grouped.setdefault(int(group), []).append(index)
+    for positions in grouped.values():
+        group_rewards = mx.array([reward_values[position] for position in positions], dtype=mx.float32)
+        mean_value = mx.mean(group_rewards)
+        centered = group_rewards - mean_value
+        if mode == "zscore":
+            std_value = mx.std(group_rewards)
+            centered = centered if float(std_value.item()) < 1e-6 else centered / std_value
+        for offset, position in enumerate(positions):
+            adjusted[position] = float(centered[offset].item())
+    return mx.array(adjusted, dtype=mx.float32)
+
+
+def _apply_truncation_mask_to_rollout(rollout_batch: RolloutBatch) -> RolloutBatch:
+    if rollout_batch.truncation_flags is None or not bool(mx.any(rollout_batch.truncation_flags).item()):
+        return rollout_batch
+
+    keep_mask = (~rollout_batch.truncation_flags).astype(mx.float32)
+    zero_lengths = mx.where(rollout_batch.truncation_flags, mx.zeros_like(rollout_batch.completion_lengths), rollout_batch.completion_lengths)
+    rollout_batch.completion_lengths = zero_lengths
+    rollout_batch.policy_eval.completion_lengths = zero_lengths
+    rollout_batch.rollout_logprobs = rollout_batch.rollout_logprobs * keep_mask
+    rollout_batch.policy_eval.rollout_logprobs = rollout_batch.rollout_logprobs
+    rollout_batch.policy_eval.old_logprobs = rollout_batch.rollout_logprobs
+    if rollout_batch.old_logprobs is not None:
+        rollout_batch.old_logprobs = rollout_batch.old_logprobs * keep_mask
+    if rollout_batch.policy_eval.old_token_logprobs is not None:
+        rollout_batch.policy_eval.old_token_logprobs = rollout_batch.policy_eval.old_token_logprobs * keep_mask[:, None]
+    if rollout_batch.reference_logprobs is not None:
+        rollout_batch.reference_logprobs = rollout_batch.reference_logprobs * keep_mask
+        rollout_batch.policy_eval.reference_logprobs = rollout_batch.reference_logprobs
+    if rollout_batch.value_predictions is not None:
+        rollout_batch.value_predictions = rollout_batch.value_predictions * keep_mask
+        rollout_batch.policy_eval.value_predictions = rollout_batch.value_predictions
+    if rollout_batch.rewards is not None:
+        rollout_batch.rewards = rollout_batch.rewards * keep_mask
+    if rollout_batch.returns is not None:
+        rollout_batch.returns = rollout_batch.returns * keep_mask
+        rollout_batch.policy_eval.returns = rollout_batch.returns
+    if rollout_batch.advantages is not None:
+        rollout_batch.advantages = rollout_batch.advantages * keep_mask
+        rollout_batch.policy_eval.advantages = rollout_batch.advantages
+    return rollout_batch
 
 
 class RewardTrainer(_RLTrainerBase):
@@ -1107,9 +1481,22 @@ class RewardTrainer(_RLTrainerBase):
             self.reward_model.load_pretrained(str(role_dir))
 
     def _prepare_training_samples(self) -> None:
-        normalized = prepare_reward_dataset(self.train_dataset)
-        if not normalized:
+        records = list(self.train_dataset)
+        dataset_mode = self.config.dataset_mode
+        if dataset_mode is None and records:
+            first_sample = records[0]
+            dataset_mode = "reward_pairwise" if {"chosen", "rejected"} <= set(first_sample.keys()) else "reward_scalar"
+        prepared = prepare_rl_dataset(
+            records,
+            mode=dataset_mode,
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        if not prepared:
             raise ValueError("RewardTrainer requires pairwise or scalar reward samples.")
+        if prepared.mode not in {"reward_scalar", "reward_pairwise"}:
+            raise ValueError("RewardTrainer requires reward_scalar or reward_pairwise datasets.")
+        normalized = list(prepared)
         sample_types = {sample["type"] for sample in normalized}
         if len(sample_types) != 1:
             raise ValueError("RewardTrainer currently requires all reward samples to use the same supervision type.")
@@ -1313,9 +1700,14 @@ class DPOTrainer(_RLTrainerBase):
 
     def _prepare_training_samples(self) -> None:
         self.train_samples = []
-        for sample_index, sample in enumerate(self.train_dataset):
-            if {"prompt", "chosen", "rejected"} <= set(sample.keys()):
-                self.train_samples.append(self._tokenize_preference_pair(sample, sample_index))
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode or "preference",
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        for sample_index, sample in enumerate(prepared):
+            self.train_samples.append(self._tokenize_preference_pair(sample, sample_index))
         if not self.train_samples:
             raise ValueError("DPOTrainer requires prompt/chosen/rejected samples.")
 
@@ -1541,11 +1933,13 @@ class ORPOTrainer:
         if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
             self.model._apply_lora()
 
-        tokenized_data = [
-            self._tokenize_preference_pair(sample)
-            for sample in self.train_dataset
-            if {"prompt", "chosen", "rejected"} <= set(sample.keys())
-        ]
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode or "preference",
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        tokenized_data = [self._tokenize_preference_pair(sample) for sample in prepared]
         actual_model = _actual_model(self.model)
         optimizer = optim.AdamW(learning_rate=optim.cosine_decay(self.learning_rate, self.iters))
 
@@ -1640,14 +2034,21 @@ class GRPOTrainer(_RLTrainerBase):
         self.loss_type = self.config.loss_type
         self.phase1_loss_type = "phase1_shared_rollout_recompute"
         self.resolved_loss_type = self._resolve_loss_type(self.loss_type)
-        self.advantage_mode = self.config.advantage_mode
-        self.beta = self.config.beta
+        self.advantage_mode = self.config.advantage_estimator
+        self.beta = self.config.kl_beta
         self.num_generations = self.config.num_generations
         self.max_completion_length = self.config.max_completion_length
         self.reward_fn = reward_fn if reward_fn is not None else self.config.reward_fn
+        self.reward_sources = self.config.reward_sources
+        self.reward_source = self.config.reward_source
+        self.reward_normalization = self.config.reward_normalization
+        self.mask_truncated_completions = self.config.mask_truncated_completions
+        self.minibatch_reuse_steps = self.config.minibatch_reuse_steps
+        self.entropy_bonus = self.config.entropy_bonus
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
         self.batch_size = self.config.per_device_train_batch_size
+        self.rollout_batch_size = self.config.rollout_batch_size or self.batch_size
         self.max_steps = self.config.max_steps
         self.temperature = self.config.temperature
         self.clip_epsilon = self.config.clip_epsilon
@@ -1662,6 +2063,8 @@ class GRPOTrainer(_RLTrainerBase):
         self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.prompt_samples: List[Dict[str, Any]] = []
+        self.rollout_samples: List[Dict[str, Any]] = []
+        self.prepared_dataset_mode: Optional[str] = None
         self._last_rollout_batch: Optional[RolloutBatch] = None
         self._init_native_state()
 
@@ -1678,61 +2081,153 @@ class GRPOTrainer(_RLTrainerBase):
 
     def _prepare_prompt_samples(self) -> None:
         self.prompt_samples = []
-        for sample_index, sample in enumerate(self.train_dataset):
-            prompt = sample.get("prompt", sample.get("question", ""))
-            if not prompt:
-                continue
-            reward_context = sample.get("answer", sample.get("response", prompt))
-            prompt_ids = self.tokenizer.encode(prompt)
-            self.prompt_samples.append(
-                {
-                    "sample_index": sample_index,
-                    "prompt": prompt,
-                    "prompt_ids": prompt_ids,
-                    "reward_context": reward_context,
-                }
-            )
-        if not self.prompt_samples:
-            raise ValueError("GRPOTrainer requires prompt or question fields.")
+        self.rollout_samples = []
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode,
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        self.prepared_dataset_mode = prepared.mode
+        for sample_index, sample in enumerate(prepared):
+            if prepared.mode == "prompt":
+                prompt = sample.get("prompt", "")
+                if not prompt:
+                    continue
+                self.prompt_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": prompt,
+                        "prompt_ids": _encode_text(self.tokenizer, prompt),
+                        "reward_context": sample.get("reward_context", prompt),
+                    }
+                )
+            elif prepared.mode == "rollout":
+                self.rollout_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": sample["prompt"],
+                        "completion": sample["completion"],
+                        "reward": sample.get("reward"),
+                        "reward_context": sample.get("reward_context", sample["completion"]),
+                    }
+                )
+        if not self.prompt_samples and not self.rollout_samples:
+            raise ValueError("GRPOTrainer requires prompt or rollout samples.")
 
     def _resolve_reward_evaluator(self) -> Any:
-        if self.reward_model is not None:
-            return self.reward_model
-        if self.reward_fn is not None:
-            return self.reward_fn
-        config_reward_fn = getattr(self.config, "reward_fn", None)
-        if config_reward_fn is not None:
-            return config_reward_fn
+        evaluator = _resolve_reward_evaluator(
+            self.reward_model,
+            self.reward_fn,
+            self.reward_sources,
+        )
+        if evaluator is not None:
+            return evaluator
         return lambda response, context: len(response.split()) / 100.0
+
+    def _collect_fixed_rollout_batch(self, samples: List[Dict[str, Any]]) -> RolloutBatch:
+        prompt_ids = [_encode_text(self.tokenizer, sample["prompt"]) for sample in samples]
+        completion_ids = [_encode_text(self.tokenizer, sample["completion"], add_special_tokens=False) for sample in samples]
+        full_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids)]
+        prompt_lengths = [len(prompt) for prompt in prompt_ids]
+        completion_lengths = [len(completion) for completion in completion_ids]
+        prompt_group_map: Dict[str, int] = {}
+        grouped_indices = []
+        for sample in samples:
+            grouped_indices.append(prompt_group_map.setdefault(sample["prompt"], len(prompt_group_map)))
+        eval_batch = make_policy_eval_batch(
+            full_sequences,
+            pad_id=_pad_token_id(self.tokenizer),
+            mode="completion",
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            prompt_group_indices=mx.array(grouped_indices),
+        )
+        scored = score_policy_in_chunks(
+            _actual_model(self.model),
+            eval_batch,
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
+            mode="completion",
+        )
+        rollout_batch = RolloutBatch(
+            prompt_ids=prompt_ids,
+            prompt_lengths=mx.array(prompt_lengths),
+            completion_ids=completion_ids,
+            completion_lengths=mx.array(completion_lengths),
+            prompt_texts=[sample["prompt"] for sample in samples],
+            original_prompt_texts=[sample["prompt"] for sample in samples],
+            completion_texts=[sample["completion"] for sample in samples],
+            reward_contexts=[sample.get("reward_context") for sample in samples],
+            sampled_token_logprobs=mx.zeros((len(samples), max(completion_lengths) if completion_lengths else 0), dtype=mx.float32),
+            rollout_logprobs=scored.summed_logprobs,
+            eos_flags=mx.array([True] * len(samples)),
+            truncation_flags=mx.array([False] * len(samples)),
+            prompt_group_indices=mx.array(grouped_indices),
+            policy_eval=scored,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            old_logprobs=scored.summed_logprobs,
+        )
+        rollout_batch.policy_eval.old_logprobs = scored.summed_logprobs
+        rollout_batch.policy_eval.old_token_logprobs = scored.token_logprobs
+        rollout_batch.rewards = mx.array(
+            [float(sample.get("reward", 0.0) or 0.0) for sample in samples],
+            dtype=mx.float32,
+        )
+        return rollout_batch
 
     def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> RolloutBatch:
         reward_evaluator = self._resolve_reward_evaluator()
-        rollout_batch = collect_rollouts(
-            _actual_model(self.model),
-            self.tokenizer,
-            prompt_samples=prompt_samples,
-            sampling_config={
-                "num_generations": self.num_generations,
-                "temperature": self.temperature,
-                "max_completion_length": self.max_completion_length,
-                "max_seq_length": self.max_seq_length,
-            },
-            reward_evaluator=None,
-            collect_sample_stats=False,
-        )
-        reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
-        rollout_batch.rewards = reward_batch.scalar_rewards
+        if prompt_samples and "completion" in prompt_samples[0]:
+            rollout_batch = self._collect_fixed_rollout_batch(prompt_samples)
+        else:
+            rollout_batch = collect_rollouts(
+                _actual_model(self.model),
+                self.tokenizer,
+                prompt_samples=prompt_samples,
+                sampling_config={
+                    "num_generations": self.num_generations,
+                    "temperature": self.temperature,
+                    "max_completion_length": self.max_completion_length,
+                    "max_seq_length": self.max_seq_length,
+                },
+                reward_evaluator=None,
+                collect_sample_stats=self.entropy_bonus != 0.0,
+            )
+            if self.reward_source == "offline":
+                raise ValueError("reward_source='offline' requires rollout samples with completion/reward fields.")
+            reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+            rollout_batch.rewards = reward_batch.scalar_rewards
+        if prompt_samples and "completion" in prompt_samples[0]:
+            if self.reward_source == "online":
+                reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                rollout_batch.rewards = reward_batch.scalar_rewards
+            elif self.reward_source == "hybrid":
+                reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                rollout_batch.rewards = rollout_batch.rewards + reward_batch.scalar_rewards
+        if rollout_batch.rewards is None:
+            rollout_batch.rewards = mx.zeros((len(rollout_batch.prompt_ids),), dtype=mx.float32)
+        if self.entropy_bonus and rollout_batch.token_entropies is not None:
+            entropy_bonus = mx.mean(rollout_batch.token_entropies, axis=-1) * self.entropy_bonus
+            rollout_batch.rewards = rollout_batch.rewards + entropy_bonus.astype(mx.float32)
+        if self.reward_normalization != "none":
+            rollout_batch.rewards = _normalize_reward_values(
+                rollout_batch.rewards,
+                rollout_batch.prompt_group_indices,
+                self.reward_normalization,
+            )
         rollout_batch = score_rollout_references(
             _actual_model(self.reference_policy.model) if self.reference_policy is not None else None,
             rollout_batch,
-            batch_size=max(1, self.batch_size * self.num_generations),
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
         )
+        if self.mask_truncated_completions:
+            rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
         returns, advantages = compute_returns_and_advantages(
-            rewards=reward_batch.scalar_rewards,
+            rewards=rollout_batch.rewards,
             prompt_group_indices=rollout_batch.prompt_group_indices,
             mode="rloo" if self.advantage_mode == "rloo" else "group_zscore",
         )
-        rollout_batch.rewards = reward_batch.scalar_rewards
         rollout_batch.returns = returns
         rollout_batch.advantages = advantages
         rollout_batch.policy_eval.returns = returns
@@ -1783,23 +2278,31 @@ class GRPOTrainer(_RLTrainerBase):
         last_loss = None
 
         while self.global_step < self.iters:
-            prompt_samples = self._next_samples(self.prompt_samples)
+            if self.reward_source == "offline" and self.rollout_samples:
+                prompt_samples = self._next_rollout_samples(
+                    self.rollout_samples,
+                    self.rollout_batch_size * self.num_generations,
+                )
+            else:
+                prompt_samples = self._next_samples(self.prompt_samples)
             rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
-            minibatches = assemble_minibatches(
-                rollout_batch.policy_eval,
-                minibatch_size=max(1, self.batch_size * self.num_generations),
-                shuffle=False,
-            )
-
             step_loss = 0.0
-            for minibatch in minibatches:
-                loss, grads = value_and_grad(actual_model, minibatch)
-                optimizer.update(actual_model, grads)
-                mx.eval(actual_model.parameters(), optimizer.state)
-                step_loss += loss.item()
+            step_updates = 0
+            for _ in range(max(1, self.minibatch_reuse_steps)):
+                minibatches = assemble_minibatches(
+                    rollout_batch.policy_eval,
+                    minibatch_size=max(1, self.rollout_batch_size * self.num_generations),
+                    shuffle=False,
+                )
+                for minibatch in minibatches:
+                    loss, grads = value_and_grad(actual_model, minibatch)
+                    optimizer.update(actual_model, grads)
+                    mx.eval(actual_model.parameters(), optimizer.state)
+                    step_loss += loss.item()
+                    step_updates += 1
 
-            last_loss = step_loss / max(1, len(minibatches))
+            last_loss = step_loss / max(1, step_updates)
             running_loss += last_loss
             self.global_step += 1
             mean_reward = float(mx.mean(rollout_batch.rewards).item()) if rollout_batch.rewards is not None else None
@@ -1881,20 +2384,27 @@ class PPOTrainer(_RLTrainerBase):
         self.config = args or PPOConfig()
         self.reward_model = reward_model or self.config.reward_model
         self.reward_fn = reward_fn if reward_fn is not None else self.config.reward_fn
+        self.reward_sources = self.config.reward_sources
+        self.reward_source = self.config.reward_source
         self.value_model = value_model or self.config.value_model or build_value_model(model)
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
         self.value_learning_rate = self.config.value_learning_rate
         self.batch_size = self.config.per_device_train_batch_size
+        self.rollout_batch_size = self.config.rollout_batch_size or self.batch_size
         self.max_steps = self.config.max_steps
         self.max_seq_length = self.config.max_seq_length
         self.max_completion_length = self.config.max_completion_length
         self.num_generations = self.config.num_generations
         self.ppo_epochs = self.config.ppo_epochs
+        self.minibatch_reuse_steps = self.config.minibatch_reuse_steps
         self.temperature = self.config.temperature
         self.clip_epsilon = self.config.clip_epsilon
-        self.beta = self.config.beta
+        self.beta = self.config.kl_beta
+        self.reward_normalization = self.config.reward_normalization
+        self.mask_truncated_completions = self.config.mask_truncated_completions
+        self.entropy_bonus = self.config.entropy_bonus
         self.gamma = self.config.gamma
         self.gae_lambda = self.config.gae_lambda
         self.normalize_advantages = self.config.normalize_advantages
@@ -1908,6 +2418,8 @@ class PPOTrainer(_RLTrainerBase):
         self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.prompt_samples: List[Dict[str, Any]] = []
+        self.rollout_samples: List[Dict[str, Any]] = []
+        self.prepared_dataset_mode: Optional[str] = None
         self._last_rollout_batch: Optional[RolloutBatch] = None
         self._value_train_target = _ScalarRoleTrainTarget(
             _actual_model(self.value_model.base_model),
@@ -1920,57 +2432,150 @@ class PPOTrainer(_RLTrainerBase):
 
     def _prepare_prompt_samples(self) -> None:
         self.prompt_samples = []
-        for sample_index, sample in enumerate(self.train_dataset):
-            prompt = sample.get("prompt", sample.get("question", ""))
-            if not prompt:
-                continue
-            self.prompt_samples.append(
-                {
-                    "sample_index": sample_index,
-                    "prompt": prompt,
-                    "prompt_ids": self.tokenizer.encode(prompt),
-                    "reward_context": sample.get(
-                        "reward_context",
-                        sample.get("answer", sample.get("response", prompt)),
-                    ),
-                }
-            )
-        if not self.prompt_samples:
-            raise ValueError("PPOTrainer requires prompt or question fields.")
+        self.rollout_samples = []
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode,
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        self.prepared_dataset_mode = prepared.mode
+        for sample_index, sample in enumerate(prepared):
+            if prepared.mode == "prompt":
+                prompt = sample.get("prompt", "")
+                if not prompt:
+                    continue
+                self.prompt_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": prompt,
+                        "prompt_ids": _encode_text(self.tokenizer, prompt),
+                        "reward_context": sample.get("reward_context", prompt),
+                    }
+                )
+            elif prepared.mode == "rollout":
+                self.rollout_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": sample["prompt"],
+                        "completion": sample["completion"],
+                        "reward": sample.get("reward"),
+                        "reward_context": sample.get("reward_context", sample["completion"]),
+                    }
+                )
+        if not self.prompt_samples and not self.rollout_samples:
+            raise ValueError("PPOTrainer requires prompt or rollout samples.")
 
     def _resolve_reward_evaluator(self) -> Any:
-        if self.reward_model is not None:
-            return self.reward_model
-        if self.reward_fn is not None:
-            return self.reward_fn
+        evaluator = _resolve_reward_evaluator(
+            self.reward_model,
+            self.reward_fn,
+            self.reward_sources,
+        )
+        if evaluator is not None:
+            return evaluator
         return lambda response, context: len(response.split()) / 100.0
+
+    def _collect_fixed_rollout_batch(self, samples: List[Dict[str, Any]]) -> RolloutBatch:
+        prompt_ids = [_encode_text(self.tokenizer, sample["prompt"]) for sample in samples]
+        completion_ids = [_encode_text(self.tokenizer, sample["completion"], add_special_tokens=False) for sample in samples]
+        full_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids)]
+        prompt_lengths = [len(prompt) for prompt in prompt_ids]
+        completion_lengths = [len(completion) for completion in completion_ids]
+        prompt_group_map: Dict[str, int] = {}
+        grouped_indices = []
+        for sample in samples:
+            grouped_indices.append(prompt_group_map.setdefault(sample["prompt"], len(prompt_group_map)))
+        eval_batch = make_policy_eval_batch(
+            full_sequences,
+            pad_id=_pad_token_id(self.tokenizer),
+            mode="completion",
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            prompt_group_indices=mx.array(grouped_indices),
+        )
+        scored = score_policy_in_chunks(
+            _actual_model(self.model),
+            eval_batch,
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
+            mode="completion",
+        )
+        reward_values = [float(sample.get("reward", 0.0) or 0.0) for sample in samples]
+        rollout_batch = RolloutBatch(
+            prompt_ids=prompt_ids,
+            prompt_lengths=mx.array(prompt_lengths),
+            completion_ids=completion_ids,
+            completion_lengths=mx.array(completion_lengths),
+            prompt_texts=[sample["prompt"] for sample in samples],
+            original_prompt_texts=[sample["prompt"] for sample in samples],
+            completion_texts=[sample["completion"] for sample in samples],
+            reward_contexts=[sample.get("reward_context") for sample in samples],
+            sampled_token_logprobs=mx.zeros((len(samples), max(completion_lengths) if completion_lengths else 0), dtype=mx.float32),
+            rollout_logprobs=scored.summed_logprobs,
+            eos_flags=mx.array([True] * len(samples)),
+            truncation_flags=mx.array([False] * len(samples)),
+            prompt_group_indices=mx.array(grouped_indices),
+            policy_eval=scored,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            old_logprobs=scored.summed_logprobs,
+            rewards=mx.array(reward_values, dtype=mx.float32),
+        )
+        rollout_batch.policy_eval.old_logprobs = scored.summed_logprobs
+        rollout_batch.policy_eval.old_token_logprobs = scored.token_logprobs
+        return rollout_batch
 
     def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> RolloutBatch:
         reward_evaluator = self._resolve_reward_evaluator()
-        rollout_batch = collect_rollouts(
-            _actual_model(self.model),
-            self.tokenizer,
-            prompt_samples=prompt_samples,
-            sampling_config={
-                "num_generations": self.num_generations,
-                "temperature": self.temperature,
-                "max_completion_length": self.max_completion_length,
-                "max_seq_length": self.max_seq_length,
-            },
-            reward_evaluator=None,
-            collect_sample_stats=False,
-        )
-        reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
-        rollout_batch.rewards = reward_batch.scalar_rewards
+        if prompt_samples and "completion" in prompt_samples[0]:
+            rollout_batch = self._collect_fixed_rollout_batch(prompt_samples)
+        else:
+            rollout_batch = collect_rollouts(
+                _actual_model(self.model),
+                self.tokenizer,
+                prompt_samples=prompt_samples,
+                sampling_config={
+                    "num_generations": self.num_generations,
+                    "temperature": self.temperature,
+                    "max_completion_length": self.max_completion_length,
+                    "max_seq_length": self.max_seq_length,
+                },
+                reward_evaluator=None,
+                collect_sample_stats=self.entropy_bonus != 0.0,
+            )
+            if self.reward_source == "offline":
+                raise ValueError("reward_source='offline' requires rollout samples with completion/reward fields.")
+            reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+            rollout_batch.rewards = reward_batch.scalar_rewards
+        if prompt_samples and "completion" in prompt_samples[0]:
+            if self.reward_source == "online":
+                reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                rollout_batch.rewards = reward_batch.scalar_rewards
+            elif self.reward_source == "hybrid":
+                reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                rollout_batch.rewards = rollout_batch.rewards + reward_batch.scalar_rewards
+        if rollout_batch.rewards is None:
+            rollout_batch.rewards = mx.zeros((len(rollout_batch.prompt_ids),), dtype=mx.float32)
+        if self.entropy_bonus and rollout_batch.token_entropies is not None:
+            entropy_bonus = mx.mean(rollout_batch.token_entropies, axis=-1) * self.entropy_bonus
+            rollout_batch.rewards = rollout_batch.rewards + entropy_bonus.astype(mx.float32)
+        if self.reward_normalization != "none":
+            rollout_batch.rewards = _normalize_reward_values(
+                rollout_batch.rewards,
+                rollout_batch.prompt_group_indices,
+                self.reward_normalization,
+            )
         rollout_batch = score_rollout_references(
             _actual_model(self.reference_policy.model),
             rollout_batch,
-            batch_size=max(1, self.batch_size * self.num_generations),
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
         )
+        if self.mask_truncated_completions:
+            rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
         rollout_batch = predict_rollout_values(
             self.value_model,
             rollout_batch,
-            batch_size=max(1, self.batch_size * self.num_generations),
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
         )
         returns, advantages = compute_returns_and_advantages(
             rewards=rollout_batch.rewards,
@@ -2041,17 +2646,23 @@ class PPOTrainer(_RLTrainerBase):
         last_value_loss = None
 
         while self.global_step < self.iters:
-            prompt_samples = self._next_samples(self.prompt_samples)
+            if self.reward_source == "offline" and self.rollout_samples:
+                prompt_samples = self._next_rollout_samples(
+                    self.rollout_samples,
+                    self.rollout_batch_size * self.num_generations,
+                )
+            else:
+                prompt_samples = self._next_samples(self.prompt_samples)
             rollout_batch = self._collect_rollout_batch(prompt_samples)
             self._last_rollout_batch = rollout_batch
 
             total_policy_loss = 0.0
             total_value_loss = 0.0
             update_count = 0
-            for _ in range(self.ppo_epochs):
+            for _ in range(max(1, self.minibatch_reuse_steps)):
                 minibatches = assemble_minibatches(
                     rollout_batch.policy_eval,
-                    minibatch_size=max(1, self.batch_size * self.num_generations),
+                    minibatch_size=max(1, self.rollout_batch_size * self.num_generations),
                     shuffle=True,
                 )
                 for minibatch in minibatches:
@@ -2120,17 +2731,24 @@ class OnlineDPOTrainer(_RLTrainerBase):
         self.config = args or OnlineDPOConfig()
         self.reward_model = reward_model or self.config.reward_model
         self.reward_fn = reward_fn if reward_fn is not None else self.config.reward_fn
+        self.reward_sources = self.config.reward_sources
+        self.reward_source = self.config.reward_source
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.beta = self.config.beta
         self.label_smoothing = self.config.label_smoothing
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
         self.batch_size = self.config.per_device_train_batch_size
+        self.rollout_batch_size = self.config.rollout_batch_size or self.batch_size
         self.max_steps = self.config.max_steps
         self.max_seq_length = self.config.max_seq_length
         self.max_completion_length = self.config.max_completion_length
         self.num_generations = self.config.num_generations
         self.temperature = self.config.temperature
+        self.reward_normalization = self.config.reward_normalization
+        self.mask_truncated_completions = self.config.mask_truncated_completions
+        self.minibatch_reuse_steps = self.config.minibatch_reuse_steps
+        self.entropy_bonus = self.config.entropy_bonus
         self.logging_steps = self.config.logging_steps
         self.save_steps = self.config.save_steps
         dataset_size = len(train_dataset) if hasattr(train_dataset, "__len__") else 100
@@ -2141,6 +2759,8 @@ class OnlineDPOTrainer(_RLTrainerBase):
         self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.prompt_samples: List[Dict[str, Any]] = []
+        self.rollout_samples: List[Dict[str, Any]] = []
+        self.prepared_dataset_mode: Optional[str] = None
         self._last_rollout_batch: Optional[RolloutBatch] = None
         self._init_native_state()
         if self.num_generations < 2:
@@ -2148,30 +2768,98 @@ class OnlineDPOTrainer(_RLTrainerBase):
 
     def _prepare_prompt_samples(self) -> None:
         self.prompt_samples = []
-        for sample_index, sample in enumerate(self.train_dataset):
-            prompt = sample.get("prompt", sample.get("question", ""))
-            if not prompt:
-                continue
-            self.prompt_samples.append(
-                {
-                    "sample_index": sample_index,
-                    "prompt": prompt,
-                    "prompt_ids": self.tokenizer.encode(prompt),
-                    "reward_context": sample.get(
-                        "reward_context",
-                        sample.get("answer", sample.get("response")),
-                    ),
-                }
-            )
-        if not self.prompt_samples:
-            raise ValueError("OnlineDPOTrainer requires prompt or question fields.")
+        self.rollout_samples = []
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode,
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        self.prepared_dataset_mode = prepared.mode
+        for sample_index, sample in enumerate(prepared):
+            if prepared.mode == "prompt":
+                prompt = sample.get("prompt", "")
+                if not prompt:
+                    continue
+                self.prompt_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": prompt,
+                        "prompt_ids": _encode_text(self.tokenizer, prompt),
+                        "reward_context": sample.get("reward_context", prompt),
+                    }
+                )
+            elif prepared.mode == "rollout":
+                self.rollout_samples.append(
+                    {
+                        "sample_index": sample_index,
+                        "prompt": sample["prompt"],
+                        "completion": sample["completion"],
+                        "reward": sample.get("reward"),
+                        "reward_context": sample.get("reward_context", sample["completion"]),
+                    }
+                )
+        if not self.prompt_samples and not self.rollout_samples:
+            raise ValueError("OnlineDPOTrainer requires prompt or rollout samples.")
 
     def _resolve_reward_evaluator(self) -> Any:
-        if self.reward_model is not None:
-            return self.reward_model
-        if self.reward_fn is not None:
-            return self.reward_fn
+        evaluator = _resolve_reward_evaluator(
+            self.reward_model,
+            self.reward_fn,
+            self.reward_sources,
+        )
+        if evaluator is not None:
+            return evaluator
         return lambda response, context: len(response.split()) / 100.0
+
+    def _collect_fixed_rollout_batch(self, samples: List[Dict[str, Any]]) -> RolloutBatch:
+        prompt_ids = [_encode_text(self.tokenizer, sample["prompt"]) for sample in samples]
+        completion_ids = [_encode_text(self.tokenizer, sample["completion"], add_special_tokens=False) for sample in samples]
+        full_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids)]
+        prompt_lengths = [len(prompt) for prompt in prompt_ids]
+        completion_lengths = [len(completion) for completion in completion_ids]
+        prompt_group_map: Dict[str, int] = {}
+        grouped_indices = []
+        for sample in samples:
+            grouped_indices.append(prompt_group_map.setdefault(sample["prompt"], len(prompt_group_map)))
+        eval_batch = make_policy_eval_batch(
+            full_sequences,
+            pad_id=_pad_token_id(self.tokenizer),
+            mode="completion",
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            prompt_group_indices=mx.array(grouped_indices),
+        )
+        scored = score_policy_in_chunks(
+            _actual_model(self.model),
+            eval_batch,
+            batch_size=max(1, self.rollout_batch_size * self.num_generations),
+            mode="completion",
+        )
+        reward_values = [float(sample.get("reward", 0.0) or 0.0) for sample in samples]
+        rollout_batch = RolloutBatch(
+            prompt_ids=prompt_ids,
+            prompt_lengths=mx.array(prompt_lengths),
+            completion_ids=completion_ids,
+            completion_lengths=mx.array(completion_lengths),
+            prompt_texts=[sample["prompt"] for sample in samples],
+            original_prompt_texts=[sample["prompt"] for sample in samples],
+            completion_texts=[sample["completion"] for sample in samples],
+            reward_contexts=[sample.get("reward_context") for sample in samples],
+            sampled_token_logprobs=mx.zeros((len(samples), max(completion_lengths) if completion_lengths else 0), dtype=mx.float32),
+            rollout_logprobs=scored.summed_logprobs,
+            eos_flags=mx.array([True] * len(samples)),
+            truncation_flags=mx.array([False] * len(samples)),
+            prompt_group_indices=mx.array(grouped_indices),
+            policy_eval=scored,
+            sample_indices=mx.array([sample["sample_index"] for sample in samples]),
+            old_logprobs=scored.summed_logprobs,
+            rewards=mx.array(reward_values, dtype=mx.float32),
+        )
+        rollout_batch.policy_eval.old_logprobs = scored.summed_logprobs
+        rollout_batch.policy_eval.old_token_logprobs = scored.token_logprobs
+        return rollout_batch
 
     def _build_online_preference_batch(self, rollout_batch: RolloutBatch) -> Optional[PreferenceBatch]:
         rankings = rank_grouped_rollouts(rollout_batch)
@@ -2250,22 +2938,51 @@ class OnlineDPOTrainer(_RLTrainerBase):
         last_loss = None
 
         while self.global_step < self.iters:
-            prompt_samples = self._next_samples(self.prompt_samples)
-            rollout_batch = collect_rollouts(
-                _actual_model(self.model),
-                self.tokenizer,
-                prompt_samples=prompt_samples,
-                sampling_config={
-                    "num_generations": self.num_generations,
-                    "temperature": self.temperature,
-                    "max_completion_length": self.max_completion_length,
-                    "max_seq_length": self.max_seq_length,
-                },
-                reward_evaluator=None,
-                collect_sample_stats=False,
-            )
-            reward_batch = evaluate_rewards(rollout_batch, self._resolve_reward_evaluator())
-            rollout_batch.rewards = reward_batch.scalar_rewards
+            if self.reward_source == "offline" and self.rollout_samples:
+                prompt_samples = self._next_rollout_samples(
+                    self.rollout_samples,
+                    self.rollout_batch_size * self.num_generations,
+                )
+            else:
+                prompt_samples = self._next_samples(self.prompt_samples)
+            if prompt_samples and "completion" in prompt_samples[0]:
+                rollout_batch = self._collect_fixed_rollout_batch(prompt_samples)
+            else:
+                rollout_batch = collect_rollouts(
+                    _actual_model(self.model),
+                    self.tokenizer,
+                    prompt_samples=prompt_samples,
+                    sampling_config={
+                        "num_generations": self.num_generations,
+                        "temperature": self.temperature,
+                        "max_completion_length": self.max_completion_length,
+                        "max_seq_length": self.max_seq_length,
+                    },
+                    reward_evaluator=None,
+                    collect_sample_stats=self.entropy_bonus != 0.0,
+                )
+                if self.reward_source == "offline":
+                    raise ValueError("reward_source='offline' requires rollout samples with completion/reward fields.")
+                reward_batch = evaluate_rewards(rollout_batch, self._resolve_reward_evaluator())
+                rollout_batch.rewards = reward_batch.scalar_rewards
+            if prompt_samples and "completion" in prompt_samples[0]:
+                if self.reward_source == "online":
+                    reward_batch = evaluate_rewards(rollout_batch, self._resolve_reward_evaluator())
+                    rollout_batch.rewards = reward_batch.scalar_rewards
+                elif self.reward_source == "hybrid":
+                    reward_batch = evaluate_rewards(rollout_batch, self._resolve_reward_evaluator())
+                    rollout_batch.rewards = rollout_batch.rewards + reward_batch.scalar_rewards
+            if self.entropy_bonus and rollout_batch.token_entropies is not None:
+                entropy_bonus = mx.mean(rollout_batch.token_entropies, axis=-1) * self.entropy_bonus
+                rollout_batch.rewards = rollout_batch.rewards + entropy_bonus.astype(mx.float32)
+            if self.reward_normalization != "none":
+                rollout_batch.rewards = _normalize_reward_values(
+                    rollout_batch.rewards,
+                    rollout_batch.prompt_group_indices,
+                    self.reward_normalization,
+                )
+            if self.mask_truncated_completions:
+                rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
             self._last_rollout_batch = rollout_batch
             preference_batch = self._build_online_preference_batch(rollout_batch)
             if preference_batch is None:
@@ -2311,6 +3028,7 @@ class KTOTrainer(_RLTrainerBase):
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
         beta: float = 0.1,
+        args: Optional[KTOConfig] = None,
         ref_model: Optional[Any] = None,
         reward_model: Optional[Any] = None,
         value_model: Optional[Any] = None,
@@ -2320,28 +3038,19 @@ class KTOTrainer(_RLTrainerBase):
         self.model = model
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
-        self.beta = beta
+        self.config = args or KTOConfig(beta=beta, **kwargs)
+        self.beta = self.config.beta
         self.ref_model = ref_model
         self.reward_model = reward_model
         self.value_model = value_model
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get("output_dir", "./kto_outputs"))
-        self.learning_rate = kwargs.get("learning_rate", 5e-7)
-        self.iters = kwargs.get("max_steps", 100)
-        self.max_seq_length = kwargs.get("max_seq_length", 2048)
-        self.batch_size = kwargs.get("per_device_train_batch_size", 1)
-        self.logging_steps = kwargs.get("logging_steps", 10)
-        self.save_steps = kwargs.get("save_steps", 100)
-        self.config = {
-            "beta": beta,
-            "output_dir": str(self.output_dir),
-            "learning_rate": self.learning_rate,
-            "max_steps": self.iters,
-            "max_seq_length": self.max_seq_length,
-            "per_device_train_batch_size": self.batch_size,
-            "logging_steps": self.logging_steps,
-            "save_steps": self.save_steps,
-        }
+        self.output_dir = Path(self.config.output_dir)
+        self.learning_rate = self.config.learning_rate
+        self.iters = self.config.max_steps
+        self.max_seq_length = self.config.max_seq_length
+        self.batch_size = self.config.per_device_train_batch_size
+        self.logging_steps = self.config.logging_steps
+        self.save_steps = self.config.save_steps
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
@@ -2489,20 +3198,22 @@ class SimPOTrainer:
         tokenizer: Optional[Any] = None,
         gamma: float = 0.5,
         beta: float = 2.0,
+        args: Optional[SimPOConfig] = None,
         use_native: bool = True,
         **kwargs,
     ):
         self.model = model
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
-        self.gamma = gamma
-        self.beta = beta
+        self.config = args or SimPOConfig(gamma=gamma, beta=beta, **kwargs)
+        self.gamma = self.config.gamma
+        self.beta = self.config.beta
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get("output_dir", "./simpo_outputs"))
-        self.learning_rate = kwargs.get("learning_rate", 5e-7)
-        self.iters = kwargs.get("max_steps", 100)
-        self.max_seq_length = kwargs.get("max_seq_length", 2048)
-        self.logging_steps = kwargs.get("logging_steps", 10)
+        self.output_dir = Path(self.config.output_dir)
+        self.learning_rate = self.config.learning_rate
+        self.iters = self.config.max_steps
+        self.max_seq_length = self.config.max_seq_length
+        self.logging_steps = self.config.logging_steps
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
@@ -2528,11 +3239,13 @@ class SimPOTrainer:
         if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
             self.model._apply_lora()
 
-        tokenized_data = [
-            self._tokenize_pair(sample)
-            for sample in self.train_dataset
-            if {"prompt", "chosen", "rejected"} <= set(sample.keys())
-        ]
+        prepared = prepare_rl_dataset(
+            self.train_dataset,
+            mode=self.config.dataset_mode or "preference",
+            tokenizer=self.tokenizer,
+            chat_template=getattr(self.config, "chat_template", None),
+        )
+        tokenized_data = [self._tokenize_pair(sample) for sample in prepared]
         actual_model = _actual_model(self.model)
         optimizer = optim.AdamW(learning_rate=optim.cosine_decay(self.learning_rate, self.iters))
         pad_id = _pad_token_id(self.tokenizer)
@@ -2571,60 +3284,8 @@ def prepare_preference_dataset(
     tokenizer: Any,
     format_type: str = "dpo",
 ) -> List[Dict[str, Any]]:
-    formatted_data = []
-    for sample in dataset:
-        if format_type in ["dpo", "orpo"]:
-            if "chosen" in sample and "rejected" in sample:
-                formatted_data.append(
-                    {
-                        "prompt": sample.get("prompt", ""),
-                        "chosen": sample["chosen"],
-                        "rejected": sample["rejected"],
-                    }
-                )
-        elif format_type == "grpo":
-            formatted_data.append(
-                {
-                    "prompt": sample.get("prompt", sample.get("question", "")),
-                    "answer": sample.get("answer", sample.get("response", "")),
-                }
-            )
-    return formatted_data
+    return public_prepare_preference_dataset(dataset, tokenizer=tokenizer, format_type=format_type)
 
 
-def create_reward_function(reward_type: str = "simple") -> Callable:
-    if reward_type == "simple":
-        def simple_reward(response: str, ground_truth: str) -> float:
-            return 1.0 if ground_truth.lower() in response.lower() else 0.0
-
-        return simple_reward
-
-    if reward_type == "math":
-        def math_reward(response: str, ground_truth: str) -> float:
-            import re
-
-            numbers = re.findall(r"-?\d+\.?\d*", response)
-            target = re.findall(r"-?\d+\.?\d*", ground_truth)
-            if numbers and target:
-                try:
-                    return 1.0 if float(numbers[-1]) == float(target[-1]) else 0.0
-                except Exception:
-                    return 0.0
-            return 0.0
-
-        return math_reward
-
-    if reward_type == "length":
-        def length_reward(response: str, _: str) -> float:
-            length = len(response.split())
-            if length < 10:
-                return 0.2
-            if length < 50:
-                return 0.5
-            if length < 200:
-                return 1.0
-            return 0.8
-
-        return length_reward
-
-    raise ValueError(f"Unknown reward type: {reward_type}")
+def create_reward_function(reward_type: Any = "simple", *, rewards: Optional[List[Any]] = None) -> Callable:
+    return public_create_reward_function(reward_type, rewards=rewards)

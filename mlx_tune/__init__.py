@@ -21,8 +21,6 @@ from mlx_tune.model import (
     RLModelRoles,
     RewardModel,
     ValueModel,
-    build_reference_policy,
-    build_reward_model,
     build_value_model,
     create_rl_model_roles,
 )
@@ -35,6 +33,15 @@ from mlx_tune.trainer import (
     get_training_config,
 )
 from mlx_tune.sft_trainer import SFTTrainer, SFTConfig, TrainingArguments
+from mlx_tune.rl_api import (
+    RLCheckpointBundle,
+    PreparedRLDataset,
+    prepare_rl_dataset,
+    build_reference_policy,
+    build_reward_model,
+    create_reward_function,
+    resume_from_checkpoint,
+)
 
 # RL Trainers
 from mlx_tune.rl_trainers import (
@@ -50,11 +57,12 @@ from mlx_tune.rl_trainers import (
     PPOConfig,
     OnlineDPOTrainer,
     OnlineDPOConfig,
+    KTOConfig,
+    SimPOConfig,
     KTOTrainer,
     SimPOTrainer,
     prepare_reward_dataset,
     prepare_preference_dataset,
-    create_reward_function,
     score_reward_model,
 )
 
@@ -133,6 +141,10 @@ __all__ = [
     "build_reward_model",
     "build_value_model",
     "create_rl_model_roles",
+    "PreparedRLDataset",
+    "RLCheckpointBundle",
+    "prepare_rl_dataset",
+    "resume_from_checkpoint",
     "__version__",
     # SFT Training
     "SFTTrainer",
@@ -151,6 +163,8 @@ __all__ = [
     "PPOConfig",
     "OnlineDPOTrainer",
     "OnlineDPOConfig",
+    "KTOConfig",
+    "SimPOConfig",
     "KTOTrainer",
     "SimPOTrainer",
     # Vision Models

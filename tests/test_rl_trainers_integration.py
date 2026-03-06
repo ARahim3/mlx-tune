@@ -649,6 +649,39 @@ class TestGRPOTrainerIntegration:
             mx.ones_like(trainer._last_rollout_batch.rewards),
         )
 
+    def test_grpo_offline_reward_source_uses_dataset_rewards_without_reward_evaluator(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer
+
+        trainer = GRPOTrainer(
+            model=make_model(63),
+            train_dataset=[
+                {"prompt": "Solve 2 + 2", "completion": "4", "reward": 1.0},
+                {"prompt": "Solve 2 + 2", "completion": "5", "reward": -1.0},
+            ],
+            tokenizer=tokenizer,
+            reward_fn=lambda *_: (_ for _ in ()).throw(RuntimeError("reward_fn should not run")),
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                num_generations=2,
+                reward_source="offline",
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(tmp_path / "grpo_offline"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert trainer._last_rollout_batch.rewards.tolist() == [1.0, -1.0]
+
     def test_grpo_manifest_checkpoint_persists_roles_and_metrics(
         self,
         tmp_path,
