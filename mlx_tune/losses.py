@@ -532,6 +532,8 @@ def grpo_recompute_loss(
     advantages: mx.array,
     beta: float = 0.04,
     clip_epsilon: float = 0.2,
+    epsilon_low: Optional[float] = None,
+    epsilon_high: Optional[float] = None,
     temperature: float = 1.0,
     loss_type: str = "grpo",
     max_completion_length: Optional[int] = None,
@@ -541,6 +543,8 @@ def grpo_recompute_loss(
     """
     Recompute GRPO-family losses on fixed sampled completions.
     """
+    epsilon_low = clip_epsilon if epsilon_low is None else epsilon_low
+    epsilon_high = clip_epsilon if epsilon_high is None else epsilon_high
     batch = _policy_eval_from_padded(
         input_ids=input_ids,
         lengths=prompt_lengths + completion_lengths,
@@ -589,14 +593,14 @@ def grpo_recompute_loss(
 
     if loss_type == "gspo":
         sequence_ratios = mx.exp(normalized_current - normalize_logprobs(rollout_logprobs, completion_lengths, mode="mean"))
-        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - epsilon_low, 1.0 + epsilon_high)
         policy_objective = mx.minimum(sequence_ratios * advantages, clipped_sequence_ratios * advantages)
         loss = -mx.mean(policy_objective - beta * sequence_kl_penalty)
         return loss, completion_lengths.sum()
 
     if old_token_logprobs is None:
         sequence_ratios = mx.exp(sequence_logprobs - rollout_logprobs)
-        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - epsilon_low, 1.0 + epsilon_high)
         policy_objective = mx.minimum(
             sequence_ratios * advantages,
             clipped_sequence_ratios * advantages,
@@ -607,7 +611,7 @@ def grpo_recompute_loss(
     mask = completion_token_mask(input_ids, prompt_lengths, completion_lengths).astype(mx.float32)
     current_token_logprobs = scored_batch.token_logprobs
     token_ratios = mx.exp(current_token_logprobs - old_token_logprobs)
-    clipped_token_ratios = mx.clip(token_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    clipped_token_ratios = mx.clip(token_ratios, 1.0 - epsilon_low, 1.0 + epsilon_high)
     per_token_objective = mx.minimum(
         token_ratios * advantages[:, None],
         clipped_token_ratios * advantages[:, None],

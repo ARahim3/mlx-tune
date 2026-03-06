@@ -941,6 +941,21 @@ def compute_returns_and_advantages(
         )
         advantages = compute_advantages(reward_batch)
         returns = rewards
+    elif mode == "group_center":
+        if prompt_group_indices is None:
+            raise ValueError("prompt_group_indices is required for grouped advantages.")
+        reward_values = rewards.tolist()
+        advantages_list = [0.0] * len(reward_values)
+        grouped_positions: Dict[int, List[int]] = {}
+        for position, group_value in enumerate(prompt_group_indices.tolist()):
+            grouped_positions.setdefault(int(group_value), []).append(position)
+        for positions in grouped_positions.values():
+            group_rewards = [reward_values[position] for position in positions]
+            baseline = sum(group_rewards) / float(len(group_rewards))
+            for offset, position in enumerate(positions):
+                advantages_list[position] = group_rewards[offset] - baseline
+        advantages = mx.array(advantages_list, dtype=mx.float32)
+        returns = rewards
     elif mode == "rloo":
         if prompt_group_indices is None:
             raise ValueError("prompt_group_indices is required for RLOO advantages.")

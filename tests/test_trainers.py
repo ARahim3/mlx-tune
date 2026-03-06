@@ -129,6 +129,18 @@ class TestGRPOConfig:
         assert config.to_dict()["num_generations"] == 6
         assert "reward_fn" not in config.to_dict()
 
+    def test_grpoconfig_variant_defaults_match_loss_family(self):
+        from mlx_tune import GRPOConfig
+
+        dapo = GRPOConfig(loss_type="dapo")
+        dr_grpo = GRPOConfig(loss_type="dr_grpo")
+
+        assert dapo.mask_truncated_completions is True
+        assert dapo.epsilon_high == 0.28
+        assert dr_grpo.scale_rewards is False
+        assert dr_grpo.epsilon_low == dr_grpo.clip_epsilon
+        assert dr_grpo.epsilon_high == dr_grpo.clip_epsilon
+
 
 class TestPPOAndOnlineDPOConfig:
     def test_ppoconfig_defaults(self):

@@ -1217,7 +1217,10 @@ class GRPOConfig(RLConfigBase):
         save_steps: int = 100,
         max_seq_length: int = 2048,
         clip_epsilon: float = 0.2,
+        epsilon_low: Optional[float] = None,
+        epsilon_high: Optional[float] = None,
         rollout_batch_size: Optional[int] = None,
+        scale_rewards: Optional[bool] = None,
         reward_normalization: str = "none",
         mask_truncated_completions: bool = False,
         minibatch_reuse_steps: int = 1,
@@ -1280,6 +1283,9 @@ class GRPOConfig(RLConfigBase):
         self.save_steps = save_steps
         self.max_seq_length = max_seq_length
         self.clip_epsilon = clip_epsilon
+        self.epsilon_low = clip_epsilon if epsilon_low is None else epsilon_low
+        self.epsilon_high = clip_epsilon if epsilon_high is None else epsilon_high
+        self.scale_rewards = scale_rewards
         self.eval_steps = eval_steps
         self.eval_num_batches = eval_num_batches
         self.eval_num_generations = eval_num_generations
@@ -1289,6 +1295,11 @@ class GRPOConfig(RLConfigBase):
         self.dataset_mode = dataset_mode
         self.chat_template = chat_template
         self.auto_detect_dataset = auto_detect_dataset
+        if self.loss_type == "dapo":
+            self.mask_truncated_completions = True
+            self.epsilon_high = 0.28 if epsilon_high is None else epsilon_high
+        if self.scale_rewards is None:
+            self.scale_rewards = self.loss_type != "dr_grpo"
         self._set_remaining(kwargs)
 
 
@@ -2540,6 +2551,9 @@ class GRPOTrainer(_RLTrainerBase):
         self.max_steps = self.config.max_steps
         self.temperature = self.config.temperature
         self.clip_epsilon = self.config.clip_epsilon
+        self.epsilon_low = self.config.epsilon_low
+        self.epsilon_high = self.config.epsilon_high
+        self.scale_rewards = self.config.scale_rewards
         self.eval_steps = self.config.eval_steps
         self.eval_num_batches = self.config.eval_num_batches
         self.eval_num_generations = self.config.eval_num_generations or self.num_generations
@@ -2596,9 +2610,12 @@ class GRPOTrainer(_RLTrainerBase):
             "loss_type": self.resolved_loss_type,
             "beta": self.beta,
             "clip_epsilon": self.clip_epsilon,
+            "epsilon_low": self.epsilon_low,
+            "epsilon_high": self.epsilon_high,
             "rollout_batch_size": self.rollout_batch_size,
             "minibatch_reuse_steps": self.minibatch_reuse_steps,
             "advantage_mode": self.advantage_mode,
+            "scale_rewards": self.scale_rewards,
             "reward_source": self.reward_source,
             "reward_normalization": self.reward_normalization,
             "mask_truncated_completions": self.mask_truncated_completions,
@@ -2753,10 +2770,13 @@ class GRPOTrainer(_RLTrainerBase):
         )
         if self.mask_truncated_completions:
             rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
+        returns_mode = "rloo" if self.advantage_mode == "rloo" else "group_zscore"
+        if returns_mode == "group_zscore" and self.scale_rewards is False:
+            returns_mode = "group_center"
         returns, advantages = compute_returns_and_advantages(
             rewards=rollout_batch.rewards,
             prompt_group_indices=rollout_batch.prompt_group_indices,
-            mode="rloo" if self.advantage_mode == "rloo" else "group_zscore",
+            mode=returns_mode,
         )
         rollout_batch.returns = returns
         rollout_batch.advantages = advantages
@@ -2792,6 +2812,8 @@ class GRPOTrainer(_RLTrainerBase):
             advantages=rollout_batch.policy_eval.advantages,
             beta=self.beta,
             clip_epsilon=self.clip_epsilon,
+            epsilon_low=self.epsilon_low,
+            epsilon_high=self.epsilon_high,
             temperature=self.temperature,
             loss_type=self.resolved_loss_type,
             max_completion_length=self.max_completion_length,
@@ -2892,6 +2914,8 @@ class GRPOTrainer(_RLTrainerBase):
                 advantages=batch.advantages,
                 beta=self.beta,
                 clip_epsilon=self.clip_epsilon,
+                epsilon_low=self.epsilon_low,
+                epsilon_high=self.epsilon_high,
                 temperature=self.temperature,
                 loss_type=self.resolved_loss_type,
                 max_completion_length=self.max_completion_length,

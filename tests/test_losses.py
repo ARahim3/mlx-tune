@@ -318,3 +318,60 @@ def test_grpo_loss_routes_produce_distinct_losses_from_same_rollout():
 
     unique_losses = {round(float(loss.item()), 6) for loss in losses.values()}
     assert len(unique_losses) >= 3
+
+
+def test_grpo_recompute_loss_supports_asymmetric_clip_bounds():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]], dtype=mx.int32)
+    prompt_lengths = mx.array([3, 2], dtype=mx.int32)
+    completion_lengths = mx.array([2, 3], dtype=mx.int32)
+    batch = make_policy_eval_batch(
+        input_ids.tolist(),
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths.tolist(),
+        completion_lengths=completion_lengths.tolist(),
+    )
+    scored = score_policy(policy, batch, mode="completion")
+    advantages = mx.array([1.0, 0.5], dtype=mx.float32)
+    token_mask = batch.token_mask.astype(mx.float32)
+    old_token_logprobs = (scored.token_logprobs - (0.24 * token_mask)) * token_mask
+
+    symmetric_loss, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=scored.summed_logprobs,
+        old_token_logprobs=old_token_logprobs,
+        advantages=advantages,
+        loss_type="dapo",
+        clip_epsilon=0.2,
+        epsilon_low=0.2,
+        epsilon_high=0.2,
+        max_completion_length=4,
+    )
+    asymmetric_loss, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=scored.summed_logprobs,
+        old_token_logprobs=old_token_logprobs,
+        advantages=advantages,
+        loss_type="dapo",
+        clip_epsilon=0.2,
+        epsilon_low=0.2,
+        epsilon_high=0.28,
+        max_completion_length=4,
+    )
+
+    assert not mx.allclose(symmetric_loss, asymmetric_loss)
