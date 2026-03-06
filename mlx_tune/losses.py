@@ -353,7 +353,7 @@ def grpo_recompute_loss(
     """
     Recompute GRPO loss on fixed sampled completions.
     """
-    batch = score_policy(
+    ratio_batch = score_policy(
         model,
         _policy_eval_from_padded(
             input_ids=input_ids,
@@ -368,13 +368,26 @@ def grpo_recompute_loss(
         reference_model=reference_model,
         temperature=temperature,
     )
+    kl_batch = score_policy(
+        model,
+        _policy_eval_from_padded(
+            input_ids=input_ids,
+            lengths=prompt_lengths + completion_lengths,
+            mode="completion",
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+        ),
+        mode="completion",
+        reference_model=reference_model,
+        temperature=1.0,
+    )
 
-    ratios = mx.exp(batch.summed_logprobs - rollout_logprobs)
+    ratios = mx.exp(ratio_batch.summed_logprobs - rollout_logprobs)
     clipped_ratios = mx.clip(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
     unclipped_objective = ratios * advantages
     clipped_objective = clipped_ratios * advantages
     policy_objective = mx.minimum(unclipped_objective, clipped_objective)
-    kl_penalty = kl_against_reference(batch.summed_logprobs, batch.reference_logprobs)
+    kl_penalty = kl_against_reference(kl_batch.summed_logprobs, kl_batch.reference_logprobs)
 
     loss = -mx.mean(policy_objective - beta * kl_penalty)
     return loss, completion_lengths.sum()
@@ -474,4 +487,3 @@ def compute_reference_logprobs(
         chosen_lengths,
         rejected_lengths,
     )
-

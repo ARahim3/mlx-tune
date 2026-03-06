@@ -147,6 +147,45 @@ def test_grpo_recompute_loss_is_finite_and_trainable():
     assert ntoks.item() == 5
 
 
+def test_grpo_recompute_kl_penalty_is_temperature_invariant_when_advantages_are_zero():
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]])
+    prompt_lengths = mx.array([3, 2])
+    completion_lengths = mx.array([2, 3])
+    rollout_logprobs = mx.array([0.0, 0.0], dtype=mx.float32)
+    advantages = mx.array([0.0, 0.0], dtype=mx.float32)
+
+    loss_at_one, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+        temperature=1.0,
+    )
+    loss_at_point_seven, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+        temperature=0.7,
+    )
+
+    assert mx.allclose(loss_at_one, loss_at_point_seven)
+
+
 def test_grpo_rollout_and_recompute_logprobs_match_with_temperature():
     from mlx_tune.losses import compute_completion_log_probs, generate_with_log_probs
 

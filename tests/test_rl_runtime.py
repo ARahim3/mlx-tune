@@ -70,6 +70,8 @@ def test_collect_rollouts_returns_metadata_and_truncates_prompt_left():
 
     assert rollout.prompt_ids == [[7, 8], [7, 8]]
     assert rollout.prompt_lengths.tolist() == [2, 2]
+    assert rollout.prompt_texts == [tokenizer.decode([7, 8]), tokenizer.decode([7, 8])]
+    assert rollout.original_prompt_texts == ["abcdef", "abcdef"]
     assert rollout.completion_ids == [[5, 1], [5, 1]]
     assert rollout.completion_lengths.tolist() == [2, 2]
     assert rollout.sampled_token_logprobs.shape == (2, 2)
@@ -216,8 +218,11 @@ def test_reward_adapter_supports_legacy_and_structured_evaluators():
         lambda response, context: float(len(response) + len(context)),
     )
 
+    seen_payloads = []
+
     class StructuredEvaluator:
         def evaluate(self, payload):
+            seen_payloads.append(payload)
             return {
                 "reward": float(payload["completion_length"]),
                 "components": {"length": float(payload["completion_length"])},
@@ -230,6 +235,44 @@ def test_reward_adapter_supports_legacy_and_structured_evaluators():
     assert structured.scalar_rewards.tolist() == [2.0]
     assert structured.named_reward_components == [{"length": 2.0}]
     assert structured.diagnostics == [{"used_context": "ctx"}]
+    assert seen_payloads[0]["prompt_text"] == tokenizer.decode([3, 4])
+    assert seen_payloads[0]["original_prompt_text"] == "ab"
+
+
+def test_reward_payload_exposes_effective_and_original_prompt_when_truncated():
+    from mlx_tune._rl_runtime import collect_rollouts, evaluate_rewards
+
+    tokenizer = TinyTokenizer()
+    model = ScriptedModel({2: 5, 3: 1, "default": 1})
+    captured = []
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "abcdef",
+                "prompt_ids": [3, 4, 5, 6, 7, 8],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 1,
+            "temperature": 0.0,
+            "max_completion_length": 2,
+            "max_seq_length": 4,
+        },
+    )
+
+    evaluate_rewards(
+        rollout,
+        lambda payload: captured.append(payload) or float(payload["completion_length"]),
+    )
+
+    assert captured[0]["prompt_ids"] == [7, 8]
+    assert captured[0]["prompt_text"] == tokenizer.decode([7, 8])
+    assert captured[0]["original_prompt_text"] == "abcdef"
 
 
 def test_compute_advantages_uses_zero_variance_fallback_per_prompt():

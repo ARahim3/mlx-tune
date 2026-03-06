@@ -30,6 +30,7 @@ class RolloutBatch:
     completion_ids: List[List[int]]
     completion_lengths: mx.array
     prompt_texts: List[str]
+    original_prompt_texts: Optional[List[str]]
     completion_texts: List[str]
     reward_contexts: List[Any]
     sampled_token_logprobs: mx.array
@@ -52,6 +53,7 @@ class RewardBatch:
     reward_contexts: List[Any]
     scalar_rewards: mx.array
     prompt_group_indices: mx.array
+    original_prompt_texts: Optional[List[str]] = None
     named_reward_components: Optional[List[Dict[str, float]]] = None
     diagnostics: Optional[List[Dict[str, Any]]] = None
 
@@ -444,6 +446,7 @@ def collect_rollouts(
         max_prompt_length = max(1, int(max_seq_length) - max_completion_length)
 
     prompt_texts: List[str] = []
+    original_prompt_texts: List[str] = []
     prompt_ids: List[List[int]] = []
     prompt_lengths: List[int] = []
     completion_ids: List[List[int]] = []
@@ -461,9 +464,10 @@ def collect_rollouts(
 
     for group_index, sample in enumerate(prompt_samples):
         sample_index = int(sample.get("sample_index", group_index))
-        prompt_text = sample.get("prompt", sample.get("prompt_text", ""))
+        original_prompt_text = sample.get("prompt", sample.get("prompt_text", ""))
         reward_context = sample.get("reward_context")
         prepared_prompt_ids = truncate_prompt_tokens(sample.get("prompt_ids", []), max_prompt_length)
+        effective_prompt_text = tokenizer.decode(prepared_prompt_ids)
 
         for _ in range(num_generations):
             sample_output = sample_completion(
@@ -482,7 +486,8 @@ def collect_rollouts(
             sampled_logits = sample_output["sampled_logits"][: len(prepared_completion_ids)]
             entropies = sample_output["token_entropies"][: len(prepared_completion_ids)]
 
-            prompt_texts.append(prompt_text)
+            prompt_texts.append(effective_prompt_text)
+            original_prompt_texts.append(original_prompt_text)
             prompt_ids.append(prepared_prompt_ids)
             prompt_lengths.append(len(prepared_prompt_ids))
             reward_contexts.append(reward_context)
@@ -556,6 +561,7 @@ def collect_rollouts(
         completion_ids=completion_ids,
         completion_lengths=mx.array(completion_lengths),
         prompt_texts=prompt_texts,
+        original_prompt_texts=original_prompt_texts,
         completion_texts=completion_texts,
         reward_contexts=reward_contexts,
         sampled_token_logprobs=padded_token_logprobs,
@@ -583,6 +589,11 @@ def evaluate_rewards(rollout_batch: RolloutBatch, evaluator: Any) -> RewardBatch
     for index in range(len(rollout_batch.prompt_texts)):
         payload = {
             "prompt_text": rollout_batch.prompt_texts[index],
+            "original_prompt_text": (
+                rollout_batch.original_prompt_texts[index]
+                if rollout_batch.original_prompt_texts is not None
+                else rollout_batch.prompt_texts[index]
+            ),
             "completion_text": rollout_batch.completion_texts[index],
             "reward_context": rollout_batch.reward_contexts[index],
             "prompt_ids": list(rollout_batch.prompt_ids[index]),
@@ -611,6 +622,9 @@ def evaluate_rewards(rollout_batch: RolloutBatch, evaluator: Any) -> RewardBatch
         reward_contexts=list(rollout_batch.reward_contexts),
         scalar_rewards=mx.array(scalar_rewards, dtype=mx.float32),
         prompt_group_indices=mx.array(rollout_batch.prompt_group_indices),
+        original_prompt_texts=list(rollout_batch.original_prompt_texts)
+        if rollout_batch.original_prompt_texts is not None
+        else None,
         named_reward_components=named_components if has_components else None,
         diagnostics=diagnostics if has_diagnostics else None,
     )
