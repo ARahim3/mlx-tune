@@ -99,6 +99,31 @@ def truncate_completion_tokens(
     return completion_tokens[:max_completion_length], True
 
 
+def cap_prompt_and_completion_lengths(
+    prompt_ids: Sequence[int],
+    completion_ids: Sequence[int],
+    max_seq_length: Optional[int],
+    max_completion_length: Optional[int],
+) -> tuple[List[int], List[int], bool]:
+    effective_completion_cap = max_completion_length
+    if max_seq_length is not None:
+        effective_completion_cap = (
+            int(max_seq_length)
+            if effective_completion_cap is None
+            else min(int(effective_completion_cap), int(max_seq_length))
+        )
+    capped_completion_ids, truncated_completion = truncate_completion_tokens(
+        completion_ids,
+        effective_completion_cap,
+    )
+
+    capped_prompt_ids = list(prompt_ids)
+    if max_seq_length is not None:
+        remaining_prompt_budget = max(0, int(max_seq_length) - len(capped_completion_ids))
+        capped_prompt_ids = truncate_prompt_tokens(prompt_ids, remaining_prompt_budget)
+    return capped_prompt_ids, capped_completion_ids, truncated_completion
+
+
 def length_mask(lengths: mx.array, width: int) -> mx.array:
     positions = mx.arange(width)[None, :]
     return positions < lengths[:, None]
@@ -563,6 +588,9 @@ def collect_rollouts(
         reward_context = sample.get("reward_context")
         prepared_prompt_ids = truncate_prompt_tokens(sample.get("prompt_ids", []), max_prompt_length)
         effective_prompt_text = tokenizer.decode(prepared_prompt_ids)
+        generation_budget = max_completion_length
+        if max_seq_length is not None:
+            generation_budget = min(max_completion_length, max(0, int(max_seq_length) - len(prepared_prompt_ids)))
         for _ in range(num_generations):
             expanded_samples.append(
                 {
@@ -577,7 +605,9 @@ def collect_rollouts(
                     "sampled_logits": [],
                     "token_entropies": [],
                     "eos_flag": False,
-                    "done": False,
+                    "done": generation_budget == 0,
+                    "max_completion_tokens": generation_budget,
+                    "hit_length_limit": generation_budget == 0,
                 }
             )
 
@@ -621,6 +651,9 @@ def collect_rollouts(
                 if hasattr(tokenizer, "eos_token_id") and token_id == tokenizer.eos_token_id:
                     row["eos_flag"] = True
                     row["done"] = True
+                elif len(row["generated_ids"]) - len(row["prompt_ids"]) >= row["max_completion_tokens"]:
+                    row["done"] = True
+                    row["hit_length_limit"] = True
 
     prompt_texts: List[str] = []
     original_prompt_texts: List[str] = []
@@ -660,7 +693,9 @@ def collect_rollouts(
         sampled_logprob_rows.append(sampled_logprobs)
         rollout_logprobs.append(sum(sampled_logprobs))
         eos_flags.append(bool(row["eos_flag"]))
-        truncation_flags.append(bool((not row["eos_flag"]) and len(prepared_completion_ids) >= max_completion_length or truncated))
+        truncation_flags.append(
+            bool(((not row["eos_flag"]) and row.get("hit_length_limit", False)) or truncated)
+        )
         prompt_group_indices.append(int(row["prompt_group_index"]))
         sample_indices.append(int(row["sample_index"]))
         if collect_sample_stats:

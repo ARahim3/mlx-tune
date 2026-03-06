@@ -1105,6 +1105,49 @@ class TestOtherRLTrainers:
         assert orpo.train()["status"] == "success"
         assert simpo.train()["status"] == "success"
 
+    def test_simpo_uses_configured_per_device_train_batch_size(
+        self,
+        tmp_path,
+        tokenizer,
+        preference_dataset,
+        monkeypatch,
+    ):
+        import mlx_tune.rl_trainers as rl_trainers_module
+        from mlx_tune import SimPOConfig, SimPOTrainer
+
+        observed_batch_sizes = []
+        original = rl_trainers_module.compute_simpo_loss
+
+        def wrapped(model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, beta, gamma):
+            observed_batch_sizes.append(int(chosen_ids.shape[0]))
+            return original(
+                model,
+                chosen_ids,
+                rejected_ids,
+                chosen_lengths,
+                rejected_lengths,
+                beta,
+                gamma,
+            )
+
+        monkeypatch.setattr(rl_trainers_module, "compute_simpo_loss", wrapped)
+        trainer = SimPOTrainer(
+            model=make_model(16),
+            train_dataset=preference_dataset,
+            tokenizer=tokenizer,
+            args=SimPOConfig(
+                learning_rate=1e-2,
+                per_device_train_batch_size=2,
+                max_steps=1,
+                output_dir=str(tmp_path / "simpo_batch"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert observed_batch_sizes == [2]
+
     def test_online_dpo_uses_reward_model_preference_ordering(
         self,
         tmp_path,
@@ -1446,6 +1489,39 @@ def test_grpo_reuses_precomputed_rollout_reference_cache_after_resume(tmp_path, 
 
     assert calls["reference"] == 0
     assert batch.reference_logprobs is not None
+
+
+@pytest.mark.integration
+def test_grpo_fixed_rollouts_respect_length_caps(tmp_path, tokenizer):
+    from mlx_tune import GRPOConfig, GRPOTrainer
+
+    trainer = GRPOTrainer(
+        model=make_model(87),
+        train_dataset=[
+            {"prompt": "abcdefghij", "completion": "klmnopqrst", "reward": 1.0},
+        ],
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=13,
+            learning_rate=1e-2,
+            reward_source="offline",
+            max_seq_length=4,
+            max_completion_length=2,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(tmp_path / "grpo_fixed_rollout_caps"),
+        ),
+    )
+
+    trainer._apply_lora_if_needed()
+    trainer._prepare_prompt_samples()
+    batch = trainer._collect_fixed_rollout_batch(trainer.rollout_samples)
+
+    assert batch.prompt_lengths.tolist() == [2]
+    assert batch.completion_lengths.tolist() == [2]
+    assert batch.policy_eval.input_ids.shape == (1, 4)
+    assert batch.truncation_flags.tolist() == [True]
 
 
 @pytest.mark.integration

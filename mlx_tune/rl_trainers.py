@@ -45,6 +45,7 @@ from mlx_tune._rl_runtime import (
     PreferenceBatch,
     RolloutBatch,
     assemble_minibatches,
+    cap_prompt_and_completion_lengths,
     collect_rollouts,
     compute_advantages,
     compute_returns_and_advantages,
@@ -1877,11 +1878,27 @@ def _collect_fixed_rollout_batch(
     samples: List[Dict[str, Any]],
     cached_reference_logprobs: Optional[mx.array] = None,
 ) -> RolloutBatch:
-    prompt_ids = [_encode_text(trainer.tokenizer, sample["prompt"]) for sample in samples]
-    completion_ids = [
-        _encode_text(trainer.tokenizer, sample["completion"], add_special_tokens=False)
-        for sample in samples
-    ]
+    prompt_ids = []
+    completion_ids = []
+    truncation_flags = []
+    max_seq_length = getattr(trainer, "max_seq_length", getattr(trainer.config, "max_seq_length", None))
+    max_completion_length = getattr(
+        trainer,
+        "max_completion_length",
+        getattr(trainer.config, "max_completion_length", None),
+    )
+    for sample in samples:
+        raw_prompt_ids = _encode_text(trainer.tokenizer, sample["prompt"])
+        raw_completion_ids = _encode_text(trainer.tokenizer, sample["completion"], add_special_tokens=False)
+        capped_prompt_ids, capped_completion_ids, truncated = cap_prompt_and_completion_lengths(
+            raw_prompt_ids,
+            raw_completion_ids,
+            max_seq_length=max_seq_length,
+            max_completion_length=max_completion_length,
+        )
+        prompt_ids.append(capped_prompt_ids)
+        completion_ids.append(capped_completion_ids)
+        truncation_flags.append(bool(truncated))
     full_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids)]
     prompt_lengths = [len(prompt) for prompt in prompt_ids]
     completion_lengths = [len(completion) for completion in completion_ids]
@@ -1922,7 +1939,7 @@ def _collect_fixed_rollout_batch(
         ),
         rollout_logprobs=scored.summed_logprobs,
         eos_flags=mx.array([True] * len(samples)),
-        truncation_flags=mx.array([False] * len(samples)),
+        truncation_flags=mx.array(truncation_flags),
         prompt_group_indices=mx.array(grouped_indices),
         policy_eval=scored,
         sample_indices=mx.array([sample["sample_index"] for sample in samples]),
@@ -4257,6 +4274,7 @@ class SimPOTrainer:
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
+        self.batch_size = self.config.per_device_train_batch_size
         self.iters = self.config.max_steps
         self.max_seq_length = self.config.max_seq_length
         self.logging_steps = self.config.logging_steps
@@ -4313,7 +4331,10 @@ class SimPOTrainer:
         last_loss = None
 
         for step in range(self.iters):
-            samples = tokenized_data[step % len(tokenized_data): step % len(tokenized_data) + 1]
+            start = (step * max(1, self.batch_size)) % len(tokenized_data)
+            samples = tokenized_data[start:start + max(1, self.batch_size)]
+            if len(samples) < max(1, self.batch_size):
+                samples += tokenized_data[: max(1, self.batch_size) - len(samples)]
             chosen_ids, chosen_lengths = _pad_sequences([sample["chosen_ids"] for sample in samples], pad_id)
             rejected_ids, rejected_lengths = _pad_sequences([sample["rejected_ids"] for sample in samples], pad_id)
             loss, grads = value_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
