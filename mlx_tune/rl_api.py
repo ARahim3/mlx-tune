@@ -20,7 +20,7 @@ METADATA_FILE = "trainer_state.json"
 REFERENCE_FILE = "reference_model.safetensors"
 REFERENCE_METADATA_FILE = "reference_metadata.json"
 CHECKPOINT_FORMAT_NAME = "mlx_tune_rl_checkpoint"
-CHECKPOINT_FORMAT_VERSION = 3
+CHECKPOINT_FORMAT_VERSION = 4
 SUPPORTED_RL_DATASET_MODES = (
     "prompt",
     "preference",

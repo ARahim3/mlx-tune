@@ -1091,3 +1091,305 @@ class TestOtherRLTrainers:
         assert trainer._last_rollout_batch is not None
         assert len(trainer._last_rollout_batch.prompt_ids) == 6
         assert sorted(set(trainer._last_rollout_batch.prompt_group_indices.tolist())) == [0, 1, 2]
+
+
+@pytest.mark.integration
+def test_grpo_evaluate_records_namespaced_metrics_and_preference_accuracy(tmp_path, tokenizer):
+    from mlx_tune import GRPOConfig, GRPOTrainer
+
+    output_dir = tmp_path / "grpo_eval"
+    trainer = GRPOTrainer(
+        model=make_model(80),
+        train_dataset=[{"prompt": "Solve 2 + 2", "answer": "4"}],
+        eval_dataset=[{"prompt": "Solve 3 + 3", "answer": "6"}],
+        eval_preference_dataset=[
+            {"prompt": "Q", "chosen": "AAAA", "rejected": "B"},
+            {"prompt": "Q", "chosen": "CCCC", "rejected": "D"},
+        ],
+        tokenizer=tokenizer,
+        reward_fn=lambda response, context: float(len(response)),
+        args=GRPOConfig(
+            seed=123,
+            learning_rate=1e-2,
+            beta=0.01,
+            num_generations=2,
+            max_completion_length=3,
+            max_steps=1,
+            eval_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+
+    trainer.train()
+    eval_metrics = trainer.evaluate()
+    history_rows = [json.loads(line) for line in (output_dir / "metrics" / "history.jsonl").read_text().splitlines()]
+
+    assert "eval/reward_mean" in eval_metrics
+    assert "eval/preference_win_rate" in eval_metrics
+    assert any("train/policy_loss" in row for row in history_rows)
+    assert any("eval/reward_mean" in row for row in history_rows)
+    assert any("eval/preference_win_rate" in row for row in history_rows)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("trainer_kind", ["grpo", "ppo", "online_dpo"])
+def test_on_policy_trainers_with_same_seed_are_reproducible(tmp_path, tokenizer, grpo_dataset, trainer_kind):
+    from mlx_tune import (
+        GRPOConfig,
+        GRPOTrainer,
+        OnlineDPOConfig,
+        OnlineDPOTrainer,
+        PPOConfig,
+        PPOTrainer,
+        build_value_model,
+    )
+
+    def build_trainer(output_dir):
+        if trainer_kind == "grpo":
+            return GRPOTrainer(
+                model=make_model(81),
+                train_dataset=grpo_dataset,
+                tokenizer=tokenizer,
+                reward_fn=lambda response, context: float(len(response)),
+                args=GRPOConfig(
+                    seed=777,
+                    learning_rate=1e-2,
+                    beta=0.01,
+                    num_generations=2,
+                    max_completion_length=3,
+                    max_steps=1,
+                    logging_steps=1,
+                    save_steps=1,
+                    output_dir=str(output_dir),
+                ),
+            )
+        if trainer_kind == "ppo":
+            return PPOTrainer(
+                model=make_model(81),
+                train_dataset=grpo_dataset,
+                tokenizer=tokenizer,
+                reward_fn=lambda response, context: float(len(response)),
+                value_model=build_value_model(make_model(82)),
+                args=PPOConfig(
+                    seed=777,
+                    learning_rate=1e-2,
+                    value_learning_rate=1e-2,
+                    num_generations=2,
+                    max_completion_length=3,
+                    max_steps=1,
+                    logging_steps=1,
+                    save_steps=1,
+                    output_dir=str(output_dir),
+                ),
+            )
+        return OnlineDPOTrainer(
+            model=make_model(81),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            args=OnlineDPOConfig(
+                seed=777,
+                learning_rate=1e-2,
+                num_generations=2,
+                max_completion_length=3,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(output_dir),
+            ),
+        )
+
+    trainer_a = build_trainer(tmp_path / f"{trainer_kind}_a")
+    trainer_b = build_trainer(tmp_path / f"{trainer_kind}_b")
+    trainer_a.train()
+    trainer_b.train()
+
+    assert trainer_a.metrics_history == trainer_b.metrics_history
+    assert trainer_a._last_rollout_batch is not None
+    assert trainer_b._last_rollout_batch is not None
+    assert trainer_a._last_rollout_batch.completion_ids == trainer_b._last_rollout_batch.completion_ids
+
+
+@pytest.mark.integration
+def test_grpo_checkpoint_records_step_boundary_and_independent_cursors(tmp_path, tokenizer):
+    from mlx_tune import GRPOConfig, GRPOTrainer, resume_from_checkpoint
+
+    output_dir = tmp_path / "grpo_cursor_checkpoint"
+    trainer = GRPOTrainer(
+        model=make_model(83),
+        train_dataset=[
+            {"prompt": "Q1", "completion": "A1", "reward": 1.0},
+            {"prompt": "Q2", "completion": "A2", "reward": 0.5},
+            {"prompt": "Q3", "completion": "A3", "reward": 0.2},
+            {"prompt": "Q4", "completion": "A4", "reward": -0.1},
+        ],
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=99,
+            learning_rate=1e-2,
+            reward_source="offline",
+            num_generations=2,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+
+    trainer.train()
+    bundle = resume_from_checkpoint(output_dir)
+    state = bundle.trainer_state
+
+    assert bundle.manifest["format_version"] == 4
+    assert state["seed"] == 99
+    assert state["trainer_state"]["step_boundary"]["completed_optimizer_step"] == 1
+    assert state["trainer_state"]["step_boundary"]["checkpoint_authoritative"] is True
+    assert state["trainer_state"]["cursors"]["prompt_dataset"] == 0
+    assert state["trainer_state"]["cursors"]["offline_rollout_dataset"] == 2
+
+
+@pytest.mark.integration
+def test_grpo_reuses_precomputed_rollout_reference_cache_after_resume(tmp_path, tokenizer, monkeypatch):
+    import mlx_tune.rl_trainers as rl_trainers_module
+    from mlx_tune import GRPOConfig, GRPOTrainer
+
+    output_dir = tmp_path / "grpo_cache_resume"
+    train_dataset = [
+        {"prompt": "Q1", "completion": "A1", "reward": 1.0},
+        {"prompt": "Q2", "completion": "A2", "reward": 0.5},
+        {"prompt": "Q3", "completion": "A3", "reward": -0.2},
+    ]
+    trainer = GRPOTrainer(
+        model=make_model(84),
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=11,
+            learning_rate=1e-2,
+            reward_source="offline",
+            num_generations=2,
+            precompute_reference_scores=True,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    trainer.train()
+
+    resumed = GRPOTrainer(
+        model=make_model(85),
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+        args=GRPOConfig(
+            seed=11,
+            learning_rate=1e-2,
+            reward_source="offline",
+            num_generations=2,
+            precompute_reference_scores=True,
+            max_steps=2,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    resumed._apply_lora_if_needed()
+    resumed._prepare_prompt_samples()
+    optimizer = resumed._optimizer_for_training()
+    resumed.optimizer = optimizer
+    resumed.load_state(optimizer=optimizer, checkpoint_dir=output_dir)
+    resumed._ensure_reference_policy()
+
+    original = rl_trainers_module.score_policy_in_chunks
+    reference_model = resumed.reference_policy.model.model
+    calls = {"reference": 0}
+
+    def wrapped(model, *args, **kwargs):
+        if model is reference_model:
+            calls["reference"] += 1
+        return original(model, *args, **kwargs)
+
+    monkeypatch.setattr(rl_trainers_module, "score_policy_in_chunks", wrapped)
+    batch = resumed._collect_fixed_rollout_batch(
+        resumed.rollout_samples[:2],
+        cache_key="grpo.train_rollout_reference_logprobs",
+    )
+
+    assert calls["reference"] == 0
+    assert batch.reference_logprobs is not None
+
+
+@pytest.mark.integration
+def test_online_dpo_eval_preference_reference_cache_reused_after_resume(tmp_path, tokenizer, monkeypatch):
+    import mlx_tune.rl_trainers as rl_trainers_module
+    from mlx_tune import OnlineDPOConfig, OnlineDPOTrainer
+
+    output_dir = tmp_path / "online_dpo_eval_cache"
+    eval_preference_dataset = [
+        {"prompt": "Q", "chosen": "AA", "rejected": "B"},
+        {"prompt": "Q", "chosen": "CC", "rejected": "D"},
+    ]
+    trainer = OnlineDPOTrainer(
+        model=make_model(86),
+        train_dataset=[{"prompt": "Solve 2 + 2", "answer": "4"}],
+        eval_preference_dataset=eval_preference_dataset,
+        tokenizer=tokenizer,
+        reward_fn=lambda response, context: float(len(response)),
+        args=OnlineDPOConfig(
+            seed=22,
+            learning_rate=1e-2,
+            num_generations=2,
+            max_completion_length=3,
+            max_steps=1,
+            eval_steps=1,
+            precompute_reference_scores=True,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    trainer.train()
+    trainer.evaluate()
+    trainer.save_state(optimizer=trainer.optimizer)
+
+    resumed = OnlineDPOTrainer(
+        model=make_model(87),
+        train_dataset=[{"prompt": "Solve 2 + 2", "answer": "4"}],
+        eval_preference_dataset=eval_preference_dataset,
+        tokenizer=tokenizer,
+        reward_fn=lambda response, context: float(len(response)),
+        args=OnlineDPOConfig(
+            seed=22,
+            learning_rate=1e-2,
+            num_generations=2,
+            max_completion_length=3,
+            max_steps=2,
+            eval_steps=1,
+            precompute_reference_scores=True,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(output_dir),
+        ),
+    )
+    resumed._apply_lora_if_needed()
+    resumed._prepare_prompt_samples()
+    optimizer = resumed._optimizer_for_training()
+    resumed.optimizer = optimizer
+    resumed.load_state(optimizer=optimizer, checkpoint_dir=output_dir)
+
+    original = rl_trainers_module.score_policy_in_chunks
+    reference_model = resumed.reference_policy.model.model
+    calls = {"reference": 0}
+
+    def wrapped(model, *args, **kwargs):
+        if model is reference_model:
+            calls["reference"] += 1
+        return original(model, *args, **kwargs)
+
+    monkeypatch.setattr(rl_trainers_module, "score_policy_in_chunks", wrapped)
+    eval_metrics = resumed.evaluate()
+
+    assert calls["reference"] == 0
+    assert "eval/preference_win_rate" in eval_metrics

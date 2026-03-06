@@ -377,3 +377,142 @@ def test_length_normalization_and_kl_helpers_match_expected_math():
         kl,
         mx.array([0.0, float((mx.exp(mx.array(0.5)) - 0.5 - 1.0).item())], dtype=mx.float32),
     )
+
+
+def test_collect_rollouts_batched_decode_matches_per_sequence_sampler():
+    from mlx_tune._rl_runtime import collect_rollouts, sample_completion
+
+    tokenizer = TinyTokenizer()
+    model = ScriptedModel({2: 5, 3: 6, 4: 1, "default": 1})
+    prompt_samples = [
+        {"sample_index": 0, "prompt": "ab", "prompt_ids": [3, 4], "reward_context": "x"},
+        {"sample_index": 1, "prompt": "cd", "prompt_ids": [5, 6], "reward_context": "y"},
+    ]
+
+    expected = []
+    for sample in prompt_samples:
+        for _ in range(2):
+            expected.append(
+                sample_completion(
+                    policy=model,
+                    tokenizer=tokenizer,
+                    prompt_ids=sample["prompt_ids"],
+                    max_tokens=3,
+                    temperature=0.0,
+                    collect_sample_stats=True,
+                )
+            )
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=prompt_samples,
+        sampling_config={
+            "num_generations": 2,
+            "temperature": 0.0,
+            "max_completion_length": 3,
+            "generation_batch_size": 2,
+        },
+        collect_sample_stats=True,
+    )
+
+    assert rollout.completion_ids == [item["completion_ids"] for item in expected]
+    assert rollout.eos_flags.tolist() == [item["eos_flag"] for item in expected]
+    assert rollout.truncation_flags.tolist() == [item["truncation_flag"] for item in expected]
+    assert mx.allclose(
+        rollout.sampled_token_logprobs,
+        mx.array([item["sampled_logprobs"] for item in expected], dtype=mx.float32),
+    )
+    assert mx.allclose(
+        rollout.sampled_token_logits,
+        mx.array([item["sampled_logits"] for item in expected], dtype=mx.float32),
+    )
+    assert mx.allclose(
+        rollout.token_entropies,
+        mx.array([item["token_entropies"] for item in expected], dtype=mx.float32),
+    )
+
+
+def test_reward_adapter_prefers_evaluate_batch_when_available():
+    from mlx_tune._rl_runtime import collect_rollouts, evaluate_rewards
+
+    tokenizer = TinyTokenizer()
+    model = ScriptedModel({2: 5, 3: 1, "default": 1})
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {"sample_index": 0, "prompt": "ab", "prompt_ids": [3, 4], "reward_context": "ctx0"},
+            {"sample_index": 1, "prompt": "cd", "prompt_ids": [5, 6], "reward_context": "ctx1"},
+        ],
+        sampling_config={"num_generations": 1, "temperature": 0.0, "max_completion_length": 2},
+    )
+
+    calls = []
+
+    class BatchEvaluator:
+        def evaluate_batch(self, payloads):
+            calls.append([payload["reward_context"] for payload in payloads])
+            return [
+                {"reward": float(payload["completion_length"]), "components": {"len": float(payload["completion_length"])}}
+                for payload in payloads
+            ]
+
+    reward_batch = evaluate_rewards(rollout, BatchEvaluator())
+
+    assert calls == [["ctx0", "ctx1"]]
+    assert reward_batch.scalar_rewards.tolist() == [2.0, 2.0]
+    assert reward_batch.named_reward_components == [{"len": 2.0}, {"len": 2.0}]
+
+
+def test_token_budget_chunking_matches_unchunked_policy_and_value_scoring():
+    from mlx_tune._rl_runtime import (
+        collect_rollouts,
+        make_policy_eval_batch,
+        predict_rollout_values,
+        score_policy_in_chunks,
+    )
+
+    class LengthValueModel:
+        def predict(self, input_ids, sequence_lengths, **kwargs):
+            del input_ids, kwargs
+            return sequence_lengths.astype(mx.float32)
+
+    model = TinyModel()
+    mx.eval(model.parameters())
+    batch = make_policy_eval_batch(
+        [[1, 2, 3, 4, 5], [1, 4, 5], [1, 6, 7, 8], [1, 9, 10, 11, 12, 13]],
+        pad_id=0,
+        mode="sequence",
+    )
+
+    full_scores = score_policy_in_chunks(model, batch, batch_size=8, mode="sequence")
+    chunked_scores = score_policy_in_chunks(
+        model,
+        batch,
+        batch_size=8,
+        token_budget=4,
+        mode="sequence",
+    )
+
+    tokenizer = TinyTokenizer()
+    rollout = collect_rollouts(
+        policy=ScriptedModel({2: 5, 3: 1, "default": 1}),
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {"sample_index": 0, "prompt": "ab", "prompt_ids": [3, 4], "reward_context": "x"},
+            {"sample_index": 1, "prompt": "cde", "prompt_ids": [5, 6, 7], "reward_context": "y"},
+        ],
+        sampling_config={"num_generations": 2, "temperature": 0.0, "max_completion_length": 2},
+    )
+    full_values = predict_rollout_values(LengthValueModel(), rollout, batch_size=8).value_predictions
+    chunked_values = predict_rollout_values(
+        LengthValueModel(),
+        rollout,
+        batch_size=8,
+        token_budget=4,
+    ).value_predictions
+
+    assert mx.allclose(full_scores.summed_logprobs, chunked_scores.summed_logprobs)
+    assert mx.allclose(full_scores.token_logprobs, chunked_scores.token_logprobs)
+    assert mx.allclose(full_values, chunked_values)

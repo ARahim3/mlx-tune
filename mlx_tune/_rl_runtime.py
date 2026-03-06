@@ -1,6 +1,6 @@
 from dataclasses import dataclass, fields, replace
 import inspect
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -277,12 +277,25 @@ def score_policy(
 def score_policy_in_chunks(
     model: Any,
     batch: PolicyEvalBatch,
-    batch_size: int,
+    batch_size: Optional[int],
     mode: str = "sequence",
     reference_model: Optional[Any] = None,
     temperature: float = 1.0,
+    token_budget: Optional[int] = None,
 ) -> PolicyEvalBatch:
-    if batch.input_ids.shape[0] <= batch_size:
+    if batch.input_ids.shape[0] == 0:
+        return score_policy(
+            model,
+            batch,
+            mode=mode,
+            reference_model=reference_model,
+            temperature=temperature,
+        )
+
+    if token_budget is None and batch_size is None:
+        batch_size = batch.input_ids.shape[0]
+
+    if token_budget is None and batch_size is not None and batch.input_ids.shape[0] <= batch_size:
         return score_policy(
             model,
             batch,
@@ -292,7 +305,13 @@ def score_policy_in_chunks(
         )
 
     scored_chunks = []
-    for minibatch in assemble_minibatches(batch, batch_size, shuffle=False):
+    for minibatch in assemble_minibatches(
+        batch,
+        minibatch_size=batch_size,
+        shuffle=False,
+        mode=mode,
+        token_budget=token_budget,
+    ):
         scored_chunks.append(
             score_policy(
                 model,
@@ -303,6 +322,14 @@ def score_policy_in_chunks(
             )
         )
     return _concat_policy_eval_batches(scored_chunks)
+
+
+def _policy_eval_effective_lengths(batch: PolicyEvalBatch, mode: str) -> List[int]:
+    if batch.input_ids.shape[0] == 0:
+        return []
+    if mode == "completion" and batch.completion_lengths is not None:
+        return [max(1, int(value)) for value in batch.completion_lengths.tolist()]
+    return [max(1, int(value) - 1) for value in batch.sequence_lengths.tolist()]
 
 
 def _concat_policy_eval_batches(chunks: Sequence[PolicyEvalBatch]) -> PolicyEvalBatch:
@@ -402,6 +429,8 @@ class _RewardEvaluatorAdapter:
     def _resolve_mode(self, evaluator: Any) -> str:
         if evaluator is None:
             return "none"
+        if hasattr(evaluator, "evaluate_batch"):
+            return "evaluate_batch"
         if hasattr(evaluator, "evaluate"):
             return "evaluate"
         if not callable(evaluator):
@@ -429,6 +458,8 @@ class _RewardEvaluatorAdapter:
     def evaluate(self, payload: Dict[str, Any]) -> tuple[float, Optional[Dict[str, float]], Optional[Dict[str, Any]]]:
         if self.mode == "none":
             result = 0.0
+        elif self.mode == "evaluate_batch":
+            result = self.evaluator.evaluate_batch([payload])[0]
         elif self.mode == "evaluate":
             result = self.evaluator.evaluate(payload)
         elif self.mode == "structured":
@@ -448,6 +479,62 @@ class _RewardEvaluatorAdapter:
             return reward, dict(components) if components is not None else None, diagnostics
         return float(result), None, None
 
+    def evaluate_batch(
+        self,
+        payloads: Sequence[Dict[str, Any]],
+    ) -> List[tuple[float, Optional[Dict[str, float]], Optional[Dict[str, Any]]]]:
+        if self.mode == "none":
+            return [(0.0, None, None) for _ in payloads]
+        if hasattr(self.evaluator, "evaluate_batch"):
+            results = self.evaluator.evaluate_batch(list(payloads))
+            return [self._normalize_result(result) for result in results]
+        return [self.evaluate(payload) for payload in payloads]
+
+
+def _batched_last_token_logits(
+    policy: Any,
+    input_rows: Sequence[Sequence[int]],
+    pad_id: int,
+    cache_state: Any = None,
+) -> Tuple[mx.array, Any]:
+    if not input_rows:
+        return mx.zeros((0, 0), dtype=mx.float32), cache_state
+
+    lengths = [len(row) for row in input_rows]
+    call_signature = None
+    try:
+        call_signature = inspect.signature(policy.__call__)
+    except (TypeError, ValueError):
+        call_signature = None
+    use_cache = (
+        cache_state is not False
+        and len(set(lengths)) == 1
+        and (
+            hasattr(policy, "forward_with_cache")
+            or (call_signature is not None and "cache" in call_signature.parameters)
+        )
+    )
+    if use_cache:
+        inputs = mx.array(input_rows if cache_state is None else [[row[-1]] for row in input_rows])
+        try:
+            if hasattr(policy, "forward_with_cache"):
+                outputs = policy.forward_with_cache(inputs, cache=cache_state)
+                if isinstance(outputs, tuple) and len(outputs) == 2:
+                    logits, next_cache = outputs
+                    return logits[:, -1, :], next_cache
+            outputs = policy(inputs, cache=cache_state)
+            if isinstance(outputs, tuple) and len(outputs) == 2:
+                logits, next_cache = outputs
+                return logits[:, -1, :], next_cache
+        except Exception:
+            cache_state = False
+
+    padded, seq_lengths = pad_sequences(input_rows, pad_id)
+    logits = policy(padded)
+    row_positions = mx.arange(padded.shape[0])
+    last_positions = seq_lengths - 1
+    return logits[row_positions, last_positions, :], cache_state
+
 
 def collect_rollouts(
     policy: Any,
@@ -464,6 +551,76 @@ def collect_rollouts(
     max_prompt_length = None
     if max_seq_length is not None:
         max_prompt_length = max(1, int(max_seq_length) - max_completion_length)
+
+    generation_batch_size = int(sampling_config.get("generation_batch_size") or 0)
+    generation_batch_size = max(1, generation_batch_size or (len(prompt_samples) * max(1, num_generations)))
+    pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+
+    expanded_samples: List[Dict[str, Any]] = []
+    for group_index, sample in enumerate(prompt_samples):
+        sample_index = int(sample.get("sample_index", group_index))
+        original_prompt_text = sample.get("prompt", sample.get("prompt_text", ""))
+        reward_context = sample.get("reward_context")
+        prepared_prompt_ids = truncate_prompt_tokens(sample.get("prompt_ids", []), max_prompt_length)
+        effective_prompt_text = tokenizer.decode(prepared_prompt_ids)
+        for _ in range(num_generations):
+            expanded_samples.append(
+                {
+                    "prompt_ids": list(prepared_prompt_ids),
+                    "prompt_text": effective_prompt_text,
+                    "original_prompt_text": original_prompt_text,
+                    "reward_context": reward_context,
+                    "sample_index": sample_index,
+                    "prompt_group_index": group_index,
+                    "generated_ids": list(prepared_prompt_ids),
+                    "sampled_logprobs": [],
+                    "sampled_logits": [],
+                    "token_entropies": [],
+                    "eos_flag": False,
+                    "done": False,
+                }
+            )
+
+    for start in range(0, len(expanded_samples), generation_batch_size):
+        chunk = expanded_samples[start:start + generation_batch_size]
+        cache_state: Any = None
+        for _ in range(max_completion_length):
+            active_rows = [row for row in chunk if not row["done"]]
+            if not active_rows:
+                break
+
+            logits, cache_state = _batched_last_token_logits(
+                policy,
+                [row["generated_ids"] for row in active_rows],
+                pad_id=pad_id,
+                cache_state=cache_state,
+            )
+            if temperature > 0:
+                scaled = logits / temperature
+                log_probs = nn.log_softmax(scaled, axis=-1)
+                probs = mx.softmax(scaled, axis=-1)
+                entropies = -mx.sum(probs * log_probs, axis=-1)
+                next_tokens = []
+                for row_index in range(logits.shape[0]):
+                    sampled = mx.random.categorical(log_probs[row_index:row_index + 1])
+                    next_tokens.append(int(sampled.item()))
+            else:
+                scaled = logits
+                log_probs = nn.log_softmax(logits, axis=-1)
+                probs = mx.softmax(logits, axis=-1)
+                entropies = -mx.sum(probs * log_probs, axis=-1)
+                next_tokens = [int(value) for value in mx.argmax(logits, axis=-1).tolist()]
+
+            for row_index, row in enumerate(active_rows):
+                token_id = next_tokens[row_index]
+                row["generated_ids"].append(token_id)
+                row["sampled_logprobs"].append(float(log_probs[row_index, token_id].item()))
+                if collect_sample_stats:
+                    row["sampled_logits"].append(float(scaled[row_index, token_id].item()))
+                    row["token_entropies"].append(float(entropies[row_index].item()))
+                if hasattr(tokenizer, "eos_token_id") and token_id == tokenizer.eos_token_id:
+                    row["eos_flag"] = True
+                    row["done"] = True
 
     prompt_texts: List[str] = []
     original_prompt_texts: List[str] = []
@@ -482,47 +639,33 @@ def collect_rollouts(
     prompt_group_indices: List[int] = []
     sample_indices: List[int] = []
 
-    for group_index, sample in enumerate(prompt_samples):
-        sample_index = int(sample.get("sample_index", group_index))
-        original_prompt_text = sample.get("prompt", sample.get("prompt_text", ""))
-        reward_context = sample.get("reward_context")
-        prepared_prompt_ids = truncate_prompt_tokens(sample.get("prompt_ids", []), max_prompt_length)
-        effective_prompt_text = tokenizer.decode(prepared_prompt_ids)
+    for row in expanded_samples:
+        raw_completion_ids = row["generated_ids"][len(row["prompt_ids"]):]
+        prepared_completion_ids, truncated = truncate_completion_tokens(
+            raw_completion_ids,
+            max_completion_length,
+        )
+        sampled_logprobs = row["sampled_logprobs"][: len(prepared_completion_ids)]
+        sampled_logits = row["sampled_logits"][: len(prepared_completion_ids)]
+        entropies = row["token_entropies"][: len(prepared_completion_ids)]
 
-        for _ in range(num_generations):
-            sample_output = sample_completion(
-                policy=policy,
-                tokenizer=tokenizer,
-                prompt_ids=prepared_prompt_ids,
-                max_tokens=max_completion_length,
-                temperature=temperature,
-                collect_sample_stats=collect_sample_stats,
-            )
-            prepared_completion_ids, truncated = truncate_completion_tokens(
-                sample_output["completion_ids"],
-                max_completion_length,
-            )
-            sampled_logprobs = sample_output["sampled_logprobs"][: len(prepared_completion_ids)]
-            sampled_logits = sample_output["sampled_logits"][: len(prepared_completion_ids)]
-            entropies = sample_output["token_entropies"][: len(prepared_completion_ids)]
-
-            prompt_texts.append(effective_prompt_text)
-            original_prompt_texts.append(original_prompt_text)
-            prompt_ids.append(prepared_prompt_ids)
-            prompt_lengths.append(len(prepared_prompt_ids))
-            reward_contexts.append(reward_context)
-            completion_ids.append(prepared_completion_ids)
-            completion_lengths.append(len(prepared_completion_ids))
-            completion_texts.append(tokenizer.decode(prepared_completion_ids))
-            sampled_logprob_rows.append(sampled_logprobs)
-            rollout_logprobs.append(sum(sampled_logprobs))
-            eos_flags.append(bool(sample_output["eos_flag"]))
-            truncation_flags.append(bool(sample_output["truncation_flag"] or truncated))
-            prompt_group_indices.append(group_index)
-            sample_indices.append(sample_index)
-            if collect_sample_stats:
-                sampled_logit_rows.append(sampled_logits)
-                entropy_rows.append(entropies)
+        prompt_texts.append(row["prompt_text"])
+        original_prompt_texts.append(row["original_prompt_text"])
+        prompt_ids.append(list(row["prompt_ids"]))
+        prompt_lengths.append(len(row["prompt_ids"]))
+        reward_contexts.append(row["reward_context"])
+        completion_ids.append(prepared_completion_ids)
+        completion_lengths.append(len(prepared_completion_ids))
+        completion_texts.append(tokenizer.decode(prepared_completion_ids))
+        sampled_logprob_rows.append(sampled_logprobs)
+        rollout_logprobs.append(sum(sampled_logprobs))
+        eos_flags.append(bool(row["eos_flag"]))
+        truncation_flags.append(bool((not row["eos_flag"]) and len(prepared_completion_ids) >= max_completion_length or truncated))
+        prompt_group_indices.append(int(row["prompt_group_index"]))
+        sample_indices.append(int(row["sample_index"]))
+        if collect_sample_stats:
+            sampled_logit_rows.append(sampled_logits)
+            entropy_rows.append(entropies)
 
     max_completion_width = max(completion_lengths) if completion_lengths else 0
     padded_token_logprobs, _ = pad_sequences(
@@ -579,7 +722,7 @@ def collect_rollouts(
         aligned_old_token_logprobs = aligned_old_token_logprobs.astype(mx.float32)
     policy_eval = make_policy_eval_batch(
         full_sequences,
-        pad_id=int(getattr(tokenizer, "pad_token_id", 0) or 0),
+        pad_id=pad_id,
         mode="completion",
         prompt_lengths=prompt_lengths,
         completion_lengths=completion_lengths,
@@ -617,12 +760,10 @@ def collect_rollouts(
 
 def evaluate_rewards(rollout_batch: RolloutBatch, evaluator: Any) -> RewardBatch:
     adapter = _RewardEvaluatorAdapter(evaluator)
-    scalar_rewards: List[float] = []
-    named_components: List[Dict[str, float]] = []
-    diagnostics: List[Dict[str, Any]] = []
-
+    payloads: List[Dict[str, Any]] = []
     for index in range(len(rollout_batch.prompt_texts)):
-        payload = {
+        payloads.append(
+            {
             "prompt_text": rollout_batch.prompt_texts[index],
             "original_prompt_text": (
                 rollout_batch.original_prompt_texts[index]
@@ -644,7 +785,12 @@ def evaluate_rewards(rollout_batch: RolloutBatch, evaluator: Any) -> RewardBatch
                 else index
             ),
         }
-        reward, components, sample_diagnostics = adapter.evaluate(payload)
+        )
+
+    scalar_rewards: List[float] = []
+    named_components: List[Dict[str, float]] = []
+    diagnostics: List[Dict[str, Any]] = []
+    for reward, components, sample_diagnostics in adapter.evaluate_batch(payloads):
         scalar_rewards.append(reward)
         named_components.append(components or {})
         diagnostics.append(sample_diagnostics or {})
@@ -698,8 +844,9 @@ def compute_advantages(
 def score_rollout_references(
     reference_model: Any,
     rollout_batch: RolloutBatch,
-    batch_size: int = 8,
+    batch_size: Optional[int] = 8,
     temperature: float = 1.0,
+    token_budget: Optional[int] = None,
 ) -> RolloutBatch:
     if reference_model is None:
         return rollout_batch
@@ -708,6 +855,7 @@ def score_rollout_references(
         reference_model,
         rollout_batch.policy_eval,
         batch_size=batch_size,
+        token_budget=token_budget,
         mode="completion",
         temperature=temperature,
     )
@@ -725,23 +873,29 @@ def score_rollout_references(
 def predict_rollout_values(
     value_model: Any,
     rollout_batch: RolloutBatch,
-    batch_size: int = 8,
+    batch_size: Optional[int] = 8,
+    token_budget: Optional[int] = None,
 ) -> RolloutBatch:
     if value_model is None:
         return rollout_batch
 
     value_chunks = []
-    for start in range(0, rollout_batch.policy_eval.input_ids.shape[0], max(1, batch_size)):
-        end = start + max(1, batch_size)
+    for minibatch in assemble_minibatches(
+        rollout_batch.policy_eval,
+        minibatch_size=batch_size,
+        shuffle=False,
+        mode="completion",
+        token_budget=token_budget,
+    ):
         value_chunks.append(
             value_model.predict(
-                rollout_batch.policy_eval.input_ids[start:end],
-                sequence_lengths=rollout_batch.policy_eval.sequence_lengths[start:end],
-                prompt_lengths=rollout_batch.policy_eval.prompt_lengths[start:end]
-                if rollout_batch.policy_eval.prompt_lengths is not None
+                minibatch.input_ids,
+                sequence_lengths=minibatch.sequence_lengths,
+                prompt_lengths=minibatch.prompt_lengths
+                if minibatch.prompt_lengths is not None
                 else None,
-                completion_lengths=rollout_batch.policy_eval.completion_lengths[start:end]
-                if rollout_batch.policy_eval.completion_lengths is not None
+                completion_lengths=minibatch.completion_lengths
+                if minibatch.completion_lengths is not None
                 else None,
             )
         )
@@ -864,8 +1018,10 @@ def _slice_value(value: Any, indices: Sequence[int]) -> Any:
 
 def assemble_minibatches(
     batch: PolicyEvalBatch,
-    minibatch_size: int,
+    minibatch_size: Optional[int],
     shuffle: bool = False,
+    mode: str = "sequence",
+    token_budget: Optional[int] = None,
 ) -> Iterable[PolicyEvalBatch]:
     batch_size = batch.input_ids.shape[0]
     if batch_size == 0:
@@ -876,12 +1032,70 @@ def assemble_minibatches(
     else:
         order = list(range(batch_size))
 
+    effective_lengths = _policy_eval_effective_lengths(batch, mode)
+    row_budget = max(1, minibatch_size or batch_size)
+    token_budget = max(1, token_budget) if token_budget is not None else None
+
+    batches_of_indices: List[List[int]] = []
+    current_indices: List[int] = []
+    current_tokens = 0
+    for index in order:
+        row_tokens = effective_lengths[index]
+        exceeds_token_budget = token_budget is not None and current_indices and current_tokens + row_tokens > token_budget
+        exceeds_row_budget = current_indices and len(current_indices) >= row_budget
+        if exceeds_token_budget or exceeds_row_budget:
+            batches_of_indices.append(current_indices)
+            current_indices = []
+            current_tokens = 0
+        current_indices.append(index)
+        current_tokens += row_tokens
+    if current_indices:
+        batches_of_indices.append(current_indices)
+
     minibatches: List[PolicyEvalBatch] = []
-    for start in range(0, batch_size, minibatch_size):
-        indices = order[start:start + minibatch_size]
+    for indices in batches_of_indices:
         values = {
             field.name: _slice_value(getattr(batch, field.name), indices)
             for field in fields(batch)
         }
         minibatches.append(PolicyEvalBatch(**values))
     return minibatches
+
+
+def summarize_rollout_metrics(
+    rollout_batch: RolloutBatch,
+    policy_loss: Optional[float] = None,
+    value_loss: Optional[float] = None,
+    reward_loss: Optional[float] = None,
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    if rollout_batch.rewards is not None and rollout_batch.rewards.shape[0] > 0:
+        metrics["reward_mean"] = float(mx.mean(rollout_batch.rewards).item())
+        metrics["reward_std"] = float(mx.std(rollout_batch.rewards).item())
+    if rollout_batch.reference_logprobs is not None and rollout_batch.rollout_logprobs.shape[0] > 0:
+        kl_values = kl_against_reference(
+            rollout_batch.rollout_logprobs.astype(mx.float32),
+            rollout_batch.reference_logprobs.astype(mx.float32),
+        )
+        metrics["kl_to_reference_mean"] = float(mx.mean(kl_values).item())
+    if rollout_batch.token_entropies is not None and rollout_batch.completion_lengths.shape[0] > 0:
+        entropy_mask = length_mask(
+            rollout_batch.completion_lengths,
+            rollout_batch.token_entropies.shape[1],
+        ).astype(rollout_batch.token_entropies.dtype)
+        valid_tokens = float(mx.sum(entropy_mask).item())
+        if valid_tokens > 0:
+            metrics["entropy_mean"] = float(
+                (mx.sum(rollout_batch.token_entropies * entropy_mask) / valid_tokens).item()
+            )
+    if rollout_batch.completion_lengths.shape[0] > 0:
+        metrics["completion_length_mean"] = float(mx.mean(rollout_batch.completion_lengths.astype(mx.float32)).item())
+    if rollout_batch.truncation_flags is not None and rollout_batch.truncation_flags.shape[0] > 0:
+        metrics["truncation_rate"] = float(mx.mean(rollout_batch.truncation_flags.astype(mx.float32)).item())
+    if policy_loss is not None:
+        metrics["policy_loss"] = float(policy_loss)
+    if value_loss is not None:
+        metrics["value_loss"] = float(value_loss)
+    if reward_loss is not None:
+        metrics["reward_loss"] = float(reward_loss)
+    return metrics
