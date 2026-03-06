@@ -313,6 +313,54 @@ def test_assemble_minibatches_preserves_order_and_prompt_groups():
     assert minibatches[1].prompt_group_indices.tolist() == [10]
 
 
+def test_post_rollout_helpers_attach_reference_values_and_rloo_advantages():
+    from mlx_tune._rl_runtime import (
+        collect_rollouts,
+        compute_returns_and_advantages,
+        predict_rollout_values,
+        rank_grouped_rollouts,
+        score_rollout_references,
+    )
+
+    class ConstantValueModel:
+        def predict(self, input_ids, **kwargs):
+            del kwargs
+            return mx.array([0.5] * input_ids.shape[0], dtype=mx.float32)
+
+    tokenizer = TinyTokenizer()
+    policy = ScriptedModel({2: 5, 3: 1, "default": 1})
+    reference = ScriptedModel({2: 5, 3: 1, "default": 1})
+
+    rollout = collect_rollouts(
+        policy=policy,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {"sample_index": 0, "prompt": "ab", "prompt_ids": [3, 4], "reward_context": "x"},
+            {"sample_index": 1, "prompt": "cd", "prompt_ids": [5, 6], "reward_context": "y"},
+        ],
+        sampling_config={"num_generations": 2, "temperature": 0.0, "max_completion_length": 2},
+    )
+    rollout.rewards = mx.array([3.0, 1.0, 4.0, 2.0], dtype=mx.float32)
+
+    rollout = score_rollout_references(reference, rollout, batch_size=1)
+    rollout = predict_rollout_values(ConstantValueModel(), rollout, batch_size=2)
+    returns, advantages = compute_returns_and_advantages(
+        rollout.rewards,
+        prompt_group_indices=rollout.prompt_group_indices,
+        mode="rloo",
+    )
+    rollout.returns = returns
+    rollout.advantages = advantages
+    rankings = rank_grouped_rollouts(rollout)
+
+    assert rollout.reference_logprobs.shape == (4,)
+    assert rollout.value_predictions.tolist() == [0.5, 0.5, 0.5, 0.5]
+    assert returns.tolist() == [3.0, 1.0, 4.0, 2.0]
+    assert advantages.tolist() == [2.0, -2.0, 2.0, -2.0]
+    assert rankings[0]["best_position"] == 0
+    assert rankings[0]["worst_position"] == 1
+
+
 def test_length_normalization_and_kl_helpers_match_expected_math():
     from mlx_tune._rl_runtime import kl_against_reference, normalize_logprobs
 

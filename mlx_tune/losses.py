@@ -38,7 +38,11 @@ def _policy_eval_from_padded(
     prompt_lengths: Optional[mx.array] = None,
     completion_lengths: Optional[mx.array] = None,
     rollout_logprobs: Optional[mx.array] = None,
+    old_logprobs: Optional[mx.array] = None,
+    old_token_logprobs: Optional[mx.array] = None,
     reference_logprobs: Optional[mx.array] = None,
+    value_predictions: Optional[mx.array] = None,
+    returns: Optional[mx.array] = None,
     advantages: Optional[mx.array] = None,
     labels: Optional[mx.array] = None,
 ) -> PolicyEvalBatch:
@@ -55,7 +59,11 @@ def _policy_eval_from_padded(
             completion_lengths=completion_lengths,
         ),
         rollout_logprobs=rollout_logprobs,
+        old_logprobs=old_logprobs if old_logprobs is not None else rollout_logprobs,
+        old_token_logprobs=old_token_logprobs,
         reference_logprobs=reference_logprobs,
+        value_predictions=value_predictions,
+        returns=returns,
         advantages=advantages,
         labels=labels,
     )
@@ -374,6 +382,27 @@ def value_model_regression_loss(
     return value_regression_loss(predictions, targets, loss_type=loss_type), predictions
 
 
+def reward_model_regression_loss(
+    reward_model: Any,
+    input_ids: mx.array,
+    sequence_lengths: mx.array,
+    targets: mx.array,
+    prompt_lengths: Optional[mx.array] = None,
+    completion_lengths: Optional[mx.array] = None,
+    loss_type: str = "mse",
+) -> Tuple[mx.array, mx.array]:
+    """
+    Compute pointwise regression loss for a scalar reward model.
+    """
+    predictions = reward_model.score(
+        input_ids,
+        sequence_lengths=sequence_lengths,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+    )
+    return value_regression_loss(predictions, targets, loss_type=loss_type), predictions
+
+
 def scalar_loss_metrics(loss: mx.array, predictions: mx.array, targets: mx.array) -> Dict[str, float]:
     """
     Compute generic scalar regression metrics.
@@ -416,6 +445,50 @@ def sft_loss(
     return masked_ce.sum() / ntoks, ntoks
 
 
+def ppo_sequence_loss(
+    model: Any,
+    batch: PolicyEvalBatch,
+    beta: float = 0.0,
+    clip_epsilon: float = 0.2,
+    temperature: float = 1.0,
+    reference_model: Optional[Any] = None,
+) -> Tuple[mx.array, Dict[str, mx.array]]:
+    """
+    Compute a clipped PPO objective over full sampled completions.
+    """
+    scored_batch = score_policy(
+        model,
+        batch,
+        mode="completion",
+        reference_model=reference_model if batch.reference_logprobs is None else None,
+        temperature=temperature,
+    )
+    old_logprobs = batch.old_logprobs if batch.old_logprobs is not None else batch.rollout_logprobs
+    if old_logprobs is None:
+        raise ValueError("PPO loss requires stored old log probabilities.")
+    if batch.advantages is None:
+        raise ValueError("PPO loss requires advantages.")
+
+    ratios = mx.exp(scored_batch.summed_logprobs - old_logprobs)
+    clipped_ratios = mx.clip(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    unclipped_objective = ratios * batch.advantages
+    clipped_objective = clipped_ratios * batch.advantages
+    policy_objective = mx.minimum(unclipped_objective, clipped_objective)
+
+    kl_penalty = mx.zeros_like(policy_objective)
+    if scored_batch.reference_logprobs is not None:
+        kl_penalty = kl_against_reference(
+            scored_batch.summed_logprobs,
+            scored_batch.reference_logprobs,
+        )
+    loss = -mx.mean(policy_objective - beta * kl_penalty)
+    return loss, {
+        "policy_logprobs": scored_batch.summed_logprobs,
+        "ratios": ratios,
+        "kl_penalty": kl_penalty,
+    }
+
+
 def generate_with_log_probs(
     model: Any,
     tokenizer: Any,
@@ -451,47 +524,104 @@ def grpo_recompute_loss(
     beta: float = 0.04,
     clip_epsilon: float = 0.2,
     temperature: float = 1.0,
+    loss_type: str = "grpo",
+    max_completion_length: Optional[int] = None,
+    old_token_logprobs: Optional[mx.array] = None,
+    reference_logprobs: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """
-    Recompute GRPO loss on fixed sampled completions.
+    Recompute GRPO-family losses on fixed sampled completions.
     """
-    ratio_batch = score_policy(
-        model,
-        _policy_eval_from_padded(
-            input_ids=input_ids,
-            lengths=prompt_lengths + completion_lengths,
-            mode="completion",
-            prompt_lengths=prompt_lengths,
-            completion_lengths=completion_lengths,
-            rollout_logprobs=rollout_logprobs,
-            advantages=advantages,
-        ),
+    batch = _policy_eval_from_padded(
+        input_ids=input_ids,
+        lengths=prompt_lengths + completion_lengths,
         mode="completion",
-        reference_model=reference_model,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        old_logprobs=rollout_logprobs,
+        old_token_logprobs=old_token_logprobs,
+        reference_logprobs=reference_logprobs,
+        advantages=advantages,
+    )
+    scored_batch = score_policy(
+        model,
+        batch,
+        mode="completion",
+        reference_model=reference_model if reference_logprobs is None else None,
         temperature=temperature,
     )
-    kl_batch = score_policy(
-        model,
-        _policy_eval_from_padded(
-            input_ids=input_ids,
-            lengths=prompt_lengths + completion_lengths,
+
+    sequence_logprobs = scored_batch.summed_logprobs
+    normalized_current = normalize_logprobs(sequence_logprobs, completion_lengths, mode="mean")
+    kl_scored_batch = scored_batch
+    if beta != 0.0 and temperature != 1.0:
+        kl_scored_batch = score_policy(
+            model,
+            batch,
             mode="completion",
-            prompt_lengths=prompt_lengths,
-            completion_lengths=completion_lengths,
-        ),
-        mode="completion",
-        reference_model=reference_model,
-        temperature=1.0,
+            reference_model=reference_model if reference_logprobs is None else None,
+            temperature=1.0,
+        )
+    if kl_scored_batch.reference_logprobs is not None:
+        normalized_reference = normalize_logprobs(
+            kl_scored_batch.reference_logprobs,
+            completion_lengths,
+            mode="mean",
+        )
+        normalized_kl_current = normalize_logprobs(
+            kl_scored_batch.summed_logprobs,
+            completion_lengths,
+            mode="mean",
+        )
+        sequence_kl_penalty = kl_against_reference(normalized_kl_current, normalized_reference)
+    else:
+        sequence_kl_penalty = mx.zeros_like(advantages)
+
+    if loss_type == "gspo":
+        sequence_ratios = mx.exp(normalized_current - normalize_logprobs(rollout_logprobs, completion_lengths, mode="mean"))
+        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        policy_objective = mx.minimum(sequence_ratios * advantages, clipped_sequence_ratios * advantages)
+        loss = -mx.mean(policy_objective - beta * sequence_kl_penalty)
+        return loss, completion_lengths.sum()
+
+    if old_token_logprobs is None:
+        sequence_ratios = mx.exp(sequence_logprobs - rollout_logprobs)
+        clipped_sequence_ratios = mx.clip(sequence_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        policy_objective = mx.minimum(
+            sequence_ratios * advantages,
+            clipped_sequence_ratios * advantages,
+        )
+        loss = -mx.mean(policy_objective - beta * sequence_kl_penalty)
+        return loss, completion_lengths.sum()
+
+    mask = completion_token_mask(input_ids, prompt_lengths, completion_lengths).astype(mx.float32)
+    current_token_logprobs = scored_batch.token_logprobs
+    token_ratios = mx.exp(current_token_logprobs - old_token_logprobs)
+    clipped_token_ratios = mx.clip(token_ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    per_token_objective = mx.minimum(
+        token_ratios * advantages[:, None],
+        clipped_token_ratios * advantages[:, None],
     )
+    masked_objective = per_token_objective * mask
 
-    ratios = mx.exp(ratio_batch.summed_logprobs - rollout_logprobs)
-    clipped_ratios = mx.clip(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
-    unclipped_objective = ratios * advantages
-    clipped_objective = clipped_ratios * advantages
-    policy_objective = mx.minimum(unclipped_objective, clipped_objective)
-    kl_penalty = kl_against_reference(kl_batch.summed_logprobs, kl_batch.reference_logprobs)
-
-    loss = -mx.mean(policy_objective - beta * kl_penalty)
+    if loss_type == "grpo":
+        policy_objective = masked_objective.sum(axis=-1) / mx.maximum(mask.sum(axis=-1), 1.0)
+        loss = -mx.mean(policy_objective - beta * sequence_kl_penalty)
+    elif loss_type == "bnpo" or loss_type == "dapo":
+        normalizer = mx.maximum(mask.sum(), 1.0)
+        loss = -(
+            masked_objective.sum() / normalizer
+            - beta * mx.mean(sequence_kl_penalty)
+        )
+    elif loss_type == "dr_grpo":
+        denominator = float(max_completion_length or int(mx.max(completion_lengths).item()) or 1)
+        loss = -(
+            masked_objective.sum() / max(completion_lengths.shape[0] * denominator, 1.0)
+            - beta * mx.mean(sequence_kl_penalty)
+        )
+    else:
+        raise ValueError(f"Unsupported GRPO loss_type: {loss_type}")
     return loss, completion_lengths.sum()
 
 

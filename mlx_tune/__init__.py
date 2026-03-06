@@ -38,16 +38,24 @@ from mlx_tune.sft_trainer import SFTTrainer, SFTConfig, TrainingArguments
 
 # RL Trainers
 from mlx_tune.rl_trainers import (
+    RewardTrainer,
+    RewardConfig,
     DPOTrainer,
     DPOConfig,
     ORPOTrainer,
     ORPOConfig,
     GRPOTrainer,
     GRPOConfig,
+    PPOTrainer,
+    PPOConfig,
+    OnlineDPOTrainer,
+    OnlineDPOConfig,
     KTOTrainer,
     SimPOTrainer,
+    prepare_reward_dataset,
     prepare_preference_dataset,
     create_reward_function,
+    score_reward_model,
 )
 
 # Loss functions for custom training
@@ -65,12 +73,14 @@ from mlx_tune.losses import (
     compute_reference_logprobs,
     pairwise_reward_loss,
     reward_model_pairwise_loss,
+    reward_model_regression_loss,
     value_regression_loss,
     value_model_regression_loss,
     scalar_loss_metrics,
     pairwise_ranking_accuracy,
     precompute_preference_reference_logprobs,
     precompute_kto_reference_logprobs,
+    ppo_sequence_loss,
 )
 
 # Vision Language Models
@@ -135,6 +145,12 @@ __all__ = [
     "ORPOConfig",
     "GRPOTrainer",
     "GRPOConfig",
+    "RewardTrainer",
+    "RewardConfig",
+    "PPOTrainer",
+    "PPOConfig",
+    "OnlineDPOTrainer",
+    "OnlineDPOConfig",
     "KTOTrainer",
     "SimPOTrainer",
     # Vision Models
@@ -154,14 +170,17 @@ __all__ = [
     "compute_reference_logprobs",
     "pairwise_reward_loss",
     "reward_model_pairwise_loss",
+    "reward_model_regression_loss",
     "value_regression_loss",
     "value_model_regression_loss",
     "scalar_loss_metrics",
     "pairwise_ranking_accuracy",
     "precompute_preference_reference_logprobs",
     "precompute_kto_reference_logprobs",
+    "ppo_sequence_loss",
     # Utilities
     "prepare_dataset",
+    "prepare_reward_dataset",
     "prepare_preference_dataset",
     "format_chat_template",
     "create_training_data",
@@ -169,6 +188,7 @@ __all__ = [
     "export_to_gguf",
     "get_training_config",
     "create_reward_function",
+    "score_reward_model",
     "load_vlm_dataset",
     # Chat Templates and Dataset Formatting
     "detect_dataset_format",

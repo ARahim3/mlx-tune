@@ -185,6 +185,81 @@ def grpo_dataset():
 
 
 @pytest.mark.integration
+class TestRewardAndPPOIntegration:
+    def test_reward_trainer_and_scoring_helper_save_manifest_checkpoint(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import RewardConfig, RewardTrainer, build_reward_model, score_reward_model
+
+        reward_model = build_reward_model(make_model(50))
+        trainer = RewardTrainer(
+            model=reward_model,
+            train_dataset=[
+                {"prompt": "Q:", "response": "good", "score": 1.0},
+                {"prompt": "Q:", "response": "bad", "score": 0.0},
+            ],
+            tokenizer=tokenizer,
+            args=RewardConfig(
+                learning_rate=1e-2,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(tmp_path / "reward"),
+            ),
+        )
+
+        result = trainer.train()
+        scores = score_reward_model(
+            reward_model,
+            [{"prompt": "Q:", "response": "good"}],
+            batch_size=1,
+            tokenizer=tokenizer,
+        )
+
+        assert result["status"] == "success"
+        assert len(scores) == 1
+        assert (tmp_path / "reward" / "manifest.json").exists()
+        assert (tmp_path / "reward" / "reward_model" / "head.safetensors").exists()
+
+    def test_ppo_trainer_persists_policy_and_value_optimizers(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import PPOConfig, PPOTrainer, build_value_model
+
+        trainer = PPOTrainer(
+            model=make_model(51),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_fn=lambda response, context: float(len(response)),
+            value_model=build_value_model(make_model(52)),
+            args=PPOConfig(
+                learning_rate=1e-2,
+                value_learning_rate=2e-2,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=4,
+                output_dir=str(tmp_path / "ppo"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert trainer._last_rollout_batch.value_predictions is not None
+        assert trainer._last_rollout_batch.returns is not None
+        assert (tmp_path / "ppo" / "optimizers" / "policy" / "state.safetensors").exists()
+        assert (tmp_path / "ppo" / "optimizers" / "value" / "state.safetensors").exists()
+
+
+@pytest.mark.integration
 class TestDPOTrainerIntegration:
     def test_dpo_frozen_reference_stays_unchanged_across_policy_updates(
         self,
@@ -797,3 +872,46 @@ class TestOtherRLTrainers:
 
         assert orpo.train()["status"] == "success"
         assert simpo.train()["status"] == "success"
+
+    def test_online_dpo_uses_reward_model_preference_ordering(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import OnlineDPOConfig, OnlineDPOTrainer, build_reward_model
+
+        reward_model = build_reward_model(make_model(60))
+        reward_model.head.update(
+            {
+                "weight": mx.zeros_like(reward_model.head.weight),
+                "bias": mx.array([1.0], dtype=mx.float32),
+            },
+            strict=False,
+        )
+        mx.eval(reward_model.head.parameters())
+
+        trainer = OnlineDPOTrainer(
+            model=make_model(61),
+            train_dataset=[{"prompt": "Solve 1 + 1", "reward_context": "2"}],
+            tokenizer=tokenizer,
+            reward_model=reward_model,
+            reward_fn=lambda response, context: (_ for _ in ()).throw(RuntimeError("reward_fn should not run")),
+            args=OnlineDPOConfig(
+                learning_rate=1e-2,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "online_dpo"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert mx.allclose(
+            trainer._last_rollout_batch.rewards,
+            mx.ones_like(trainer._last_rollout_batch.rewards),
+        )

@@ -74,6 +74,16 @@ class TestDPOConfig:
         assert config.beta == 0.5
 
 
+class TestRewardConfig:
+    def test_rewardconfig_defaults(self):
+        from mlx_tune import RewardConfig
+
+        config = RewardConfig()
+
+        assert config.learning_rate == 5e-6
+        assert config.regression_loss_type == "mse"
+
+
 class TestGRPOConfig:
     """Test GRPOConfig class."""
 
@@ -84,6 +94,7 @@ class TestGRPOConfig:
         config = GRPOConfig()
 
         assert config.loss_type == "grpo"
+        assert config.advantage_mode == "group_zscore"
         assert config.num_generations == 4
         assert config.temperature == 0.7
         assert config.beta == 0.04
@@ -101,6 +112,24 @@ class TestGRPOConfig:
         assert config.num_generations == 8
 
 
+class TestPPOAndOnlineDPOConfig:
+    def test_ppoconfig_defaults(self):
+        from mlx_tune import PPOConfig
+
+        config = PPOConfig()
+
+        assert config.ppo_epochs == 2
+        assert config.value_learning_rate == config.learning_rate
+
+    def test_online_dpoconfig_defaults(self):
+        from mlx_tune import OnlineDPOConfig
+
+        config = OnlineDPOConfig()
+
+        assert config.num_generations == 4
+        assert config.beta == 0.1
+
+
 class TestTrainerInitialization:
     """Test trainer initialization (without actual model loading)."""
 
@@ -109,21 +138,30 @@ class TestTrainerInitialization:
         from mlx_tune import (
             SFTTrainer,
             SFTConfig,
+            RewardTrainer,
+            RewardConfig,
             DPOTrainer,
             DPOConfig,
             ORPOTrainer,
             ORPOConfig,
             GRPOTrainer,
             GRPOConfig,
+            PPOTrainer,
+            PPOConfig,
+            OnlineDPOTrainer,
+            OnlineDPOConfig,
             KTOTrainer,
             SimPOTrainer,
         )
 
         # Just verify imports work
         assert SFTTrainer is not None
+        assert RewardTrainer is not None
         assert DPOTrainer is not None
         assert ORPOTrainer is not None
         assert GRPOTrainer is not None
+        assert PPOTrainer is not None
+        assert OnlineDPOTrainer is not None
         assert KTOTrainer is not None
         assert SimPOTrainer is not None
 

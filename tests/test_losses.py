@@ -20,6 +20,12 @@ class TinyTokenizer:
     eos_token_id = 1
 
 
+class ConstantRewardModel:
+    def score(self, input_ids, **kwargs):
+        del input_ids, kwargs
+        return mx.array([1.0, 2.0], dtype=mx.float32)
+
+
 def test_compute_log_probs_with_lengths_shape():
     from mlx_tune.losses import compute_log_probs_with_lengths
 
@@ -214,3 +220,58 @@ def test_grpo_rollout_and_recompute_logprobs_match_with_temperature():
     )
 
     assert mx.allclose(recomputed, mx.array([rollout_token_logprobs.sum()]))
+
+
+def test_reward_model_regression_loss_returns_expected_predictions():
+    from mlx_tune.losses import reward_model_regression_loss
+
+    loss, predictions = reward_model_regression_loss(
+        ConstantRewardModel(),
+        input_ids=mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+        sequence_lengths=mx.array([2, 2], dtype=mx.int32),
+        targets=mx.array([1.0, 2.0], dtype=mx.float32),
+    )
+
+    assert float(loss.item()) == 0.0
+    assert predictions.tolist() == [1.0, 2.0]
+
+
+def test_grpo_loss_routes_produce_distinct_losses_from_same_rollout():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]], dtype=mx.int32)
+    prompt_lengths = mx.array([3, 2], dtype=mx.int32)
+    completion_lengths = mx.array([2, 3], dtype=mx.int32)
+    batch = make_policy_eval_batch(
+        input_ids.tolist(),
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths.tolist(),
+        completion_lengths=completion_lengths.tolist(),
+    )
+    scored = score_policy(policy, batch, mode="completion")
+    advantages = mx.array([1.0, -0.5], dtype=mx.float32)
+
+    losses = {
+        name: grpo_recompute_loss(
+            model=policy,
+            reference_model=reference,
+            input_ids=input_ids,
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            rollout_logprobs=scored.summed_logprobs,
+            old_token_logprobs=scored.token_logprobs * batch.token_mask.astype(mx.float32),
+            advantages=advantages,
+            loss_type=name,
+            max_completion_length=4,
+        )[0]
+        for name in ["grpo", "dapo", "dr_grpo", "gspo"]
+    }
+
+    unique_losses = {round(float(loss.item()), 6) for loss in losses.values()}
+    assert len(unique_losses) >= 3

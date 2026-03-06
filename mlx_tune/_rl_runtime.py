@@ -14,7 +14,11 @@ class PolicyEvalBatch:
     prompt_lengths: Optional[mx.array] = None
     completion_lengths: Optional[mx.array] = None
     rollout_logprobs: Optional[mx.array] = None
+    old_logprobs: Optional[mx.array] = None
+    old_token_logprobs: Optional[mx.array] = None
     reference_logprobs: Optional[mx.array] = None
+    value_predictions: Optional[mx.array] = None
+    returns: Optional[mx.array] = None
     advantages: Optional[mx.array] = None
     labels: Optional[mx.array] = None
     prompt_group_indices: Optional[mx.array] = None
@@ -42,7 +46,11 @@ class RolloutBatch:
     sample_indices: Optional[mx.array] = None
     sampled_token_logits: Optional[mx.array] = None
     token_entropies: Optional[mx.array] = None
+    old_logprobs: Optional[mx.array] = None
     rewards: Optional[mx.array] = None
+    reference_logprobs: Optional[mx.array] = None
+    value_predictions: Optional[mx.array] = None
+    returns: Optional[mx.array] = None
     advantages: Optional[mx.array] = None
 
 
@@ -131,7 +139,11 @@ def make_policy_eval_batch(
     prompt_lengths: Optional[Sequence[int]] = None,
     completion_lengths: Optional[Sequence[int]] = None,
     rollout_logprobs: Optional[mx.array] = None,
+    old_logprobs: Optional[mx.array] = None,
+    old_token_logprobs: Optional[mx.array] = None,
     reference_logprobs: Optional[mx.array] = None,
+    value_predictions: Optional[mx.array] = None,
+    returns: Optional[mx.array] = None,
     advantages: Optional[mx.array] = None,
     labels: Optional[mx.array] = None,
     prompt_group_indices: Optional[mx.array] = None,
@@ -154,7 +166,11 @@ def make_policy_eval_batch(
         completion_lengths=completion_lengths_array,
         token_mask=token_mask,
         rollout_logprobs=rollout_logprobs,
+        old_logprobs=old_logprobs if old_logprobs is not None else rollout_logprobs,
+        old_token_logprobs=old_token_logprobs,
         reference_logprobs=reference_logprobs,
+        value_predictions=value_predictions,
+        returns=returns,
         advantages=advantages,
         labels=labels,
         prompt_group_indices=prompt_group_indices,
@@ -310,7 +326,11 @@ def _concat_policy_eval_batches(chunks: Sequence[PolicyEvalBatch]) -> PolicyEval
         completion_lengths=concat_attr("completion_lengths"),
         token_mask=concat_attr("token_mask"),
         rollout_logprobs=concat_attr("rollout_logprobs"),
+        old_logprobs=concat_attr("old_logprobs"),
+        old_token_logprobs=concat_attr("old_token_logprobs"),
         reference_logprobs=concat_attr("reference_logprobs"),
+        value_predictions=concat_attr("value_predictions"),
+        returns=concat_attr("returns"),
         advantages=concat_attr("advantages"),
         labels=concat_attr("labels"),
         prompt_group_indices=concat_attr("prompt_group_indices"),
@@ -545,6 +565,18 @@ def collect_rollouts(
         prompt_sequence + completion_sequence
         for prompt_sequence, completion_sequence in zip(prompt_ids, completion_ids)
     ]
+    aligned_old_token_rows = [
+        [0.0] * max(prompt_length - 1, 0) + [float(value) for value in row]
+        for prompt_length, row in zip(prompt_lengths, sampled_logprob_rows)
+    ]
+    aligned_old_token_logprobs, _ = pad_sequences(
+        aligned_old_token_rows if aligned_old_token_rows else [[0.0]],
+        0,
+    )
+    if not aligned_old_token_rows:
+        aligned_old_token_logprobs = mx.zeros((0, 0), dtype=mx.float32)
+    else:
+        aligned_old_token_logprobs = aligned_old_token_logprobs.astype(mx.float32)
     policy_eval = make_policy_eval_batch(
         full_sequences,
         pad_id=int(getattr(tokenizer, "pad_token_id", 0) or 0),
@@ -552,6 +584,8 @@ def collect_rollouts(
         prompt_lengths=prompt_lengths,
         completion_lengths=completion_lengths,
         rollout_logprobs=mx.array(rollout_logprobs, dtype=mx.float32),
+        old_logprobs=mx.array(rollout_logprobs, dtype=mx.float32),
+        old_token_logprobs=aligned_old_token_logprobs,
         prompt_group_indices=mx.array(prompt_group_indices),
         sample_indices=mx.array(sample_indices),
     )
@@ -566,6 +600,7 @@ def collect_rollouts(
         reward_contexts=reward_contexts,
         sampled_token_logprobs=padded_token_logprobs,
         rollout_logprobs=mx.array(rollout_logprobs, dtype=mx.float32),
+        old_logprobs=mx.array(rollout_logprobs, dtype=mx.float32),
         eos_flags=mx.array(eos_flags),
         truncation_flags=mx.array(truncation_flags),
         prompt_group_indices=mx.array(prompt_group_indices),
@@ -658,6 +693,161 @@ def compute_advantages(
         for offset, position in enumerate(positions):
             advantages[position] = float(group_advantages[offset].item())
     return mx.array(advantages, dtype=mx.float32)
+
+
+def score_rollout_references(
+    reference_model: Any,
+    rollout_batch: RolloutBatch,
+    batch_size: int = 8,
+    temperature: float = 1.0,
+) -> RolloutBatch:
+    if reference_model is None:
+        return rollout_batch
+
+    scored = score_policy_in_chunks(
+        reference_model,
+        rollout_batch.policy_eval,
+        batch_size=batch_size,
+        mode="completion",
+        temperature=temperature,
+    )
+    reference_logprobs = mx.stop_gradient(scored.summed_logprobs.astype(mx.float32))
+    return replace(
+        rollout_batch,
+        reference_logprobs=reference_logprobs,
+        policy_eval=replace(
+            rollout_batch.policy_eval,
+            reference_logprobs=reference_logprobs,
+        ),
+    )
+
+
+def predict_rollout_values(
+    value_model: Any,
+    rollout_batch: RolloutBatch,
+    batch_size: int = 8,
+) -> RolloutBatch:
+    if value_model is None:
+        return rollout_batch
+
+    value_chunks = []
+    for start in range(0, rollout_batch.policy_eval.input_ids.shape[0], max(1, batch_size)):
+        end = start + max(1, batch_size)
+        value_chunks.append(
+            value_model.predict(
+                rollout_batch.policy_eval.input_ids[start:end],
+                sequence_lengths=rollout_batch.policy_eval.sequence_lengths[start:end],
+                prompt_lengths=rollout_batch.policy_eval.prompt_lengths[start:end]
+                if rollout_batch.policy_eval.prompt_lengths is not None
+                else None,
+                completion_lengths=rollout_batch.policy_eval.completion_lengths[start:end]
+                if rollout_batch.policy_eval.completion_lengths is not None
+                else None,
+            )
+        )
+    value_predictions = (
+        mx.concatenate(value_chunks, axis=0) if value_chunks else mx.zeros((0,), dtype=mx.float32)
+    )
+    value_predictions = mx.stop_gradient(value_predictions.astype(mx.float32))
+    return replace(
+        rollout_batch,
+        value_predictions=value_predictions,
+        policy_eval=replace(
+            rollout_batch.policy_eval,
+            value_predictions=value_predictions,
+        ),
+    )
+
+
+def compute_returns_and_advantages(
+    rewards: mx.array,
+    values: Optional[mx.array] = None,
+    prompt_group_indices: Optional[mx.array] = None,
+    mode: str = "gae",
+    gamma: float = 1.0,
+    gae_lambda: float = 1.0,
+    normalize: bool = False,
+) -> tuple[mx.array, mx.array]:
+    rewards = rewards.astype(mx.float32)
+    values = mx.zeros_like(rewards) if values is None else values.astype(mx.float32)
+
+    if mode == "gae":
+        deltas = rewards - values
+        advantages = deltas * gae_lambda + deltas * (1.0 - gae_lambda)
+        returns = advantages + values
+    elif mode == "group_zscore":
+        if prompt_group_indices is None:
+            raise ValueError("prompt_group_indices is required for grouped advantages.")
+        reward_batch = RewardBatch(
+            prompt_texts=[""] * rewards.shape[0],
+            completion_texts=[""] * rewards.shape[0],
+            reward_contexts=[None] * rewards.shape[0],
+            scalar_rewards=rewards,
+            prompt_group_indices=prompt_group_indices,
+        )
+        advantages = compute_advantages(reward_batch)
+        returns = rewards
+    elif mode == "rloo":
+        if prompt_group_indices is None:
+            raise ValueError("prompt_group_indices is required for RLOO advantages.")
+        reward_values = rewards.tolist()
+        advantages_list = [0.0] * len(reward_values)
+        grouped_positions: Dict[int, List[int]] = {}
+        for position, group_value in enumerate(prompt_group_indices.tolist()):
+            grouped_positions.setdefault(int(group_value), []).append(position)
+        for positions in grouped_positions.values():
+            if len(positions) <= 1:
+                continue
+            group_rewards = [reward_values[position] for position in positions]
+            total = sum(group_rewards)
+            denominator = float(len(positions) - 1)
+            for offset, position in enumerate(positions):
+                baseline = (total - group_rewards[offset]) / denominator
+                advantages_list[position] = group_rewards[offset] - baseline
+        advantages = mx.array(advantages_list, dtype=mx.float32)
+        returns = rewards
+    else:
+        raise ValueError(f"Unsupported returns/advantages mode: {mode}")
+
+    if normalize and advantages.shape[0] > 1:
+        advantages = (advantages - mx.mean(advantages)) / (mx.std(advantages) + 1e-8)
+
+    if gamma != 1.0:
+        returns = rewards + gamma * (returns - rewards)
+    return returns.astype(mx.float32), advantages.astype(mx.float32)
+
+
+def rank_grouped_rollouts(
+    rollout_batch: RolloutBatch,
+    score_tolerance: float = 1e-6,
+) -> List[Dict[str, Any]]:
+    if rollout_batch.rewards is None:
+        raise ValueError("Rollout rewards are required for grouped ranking.")
+
+    grouped_positions: Dict[int, List[int]] = {}
+    for position, group_value in enumerate(rollout_batch.prompt_group_indices.tolist()):
+        grouped_positions.setdefault(int(group_value), []).append(position)
+
+    reward_values = rollout_batch.rewards.tolist()
+    rankings: List[Dict[str, Any]] = []
+    for group_index, positions in grouped_positions.items():
+        ordered_positions = sorted(positions, key=lambda position: reward_values[position], reverse=True)
+        ordered_scores = [reward_values[position] for position in ordered_positions]
+        rankings.append(
+            {
+                "prompt_group_index": group_index,
+                "positions": positions,
+                "ordered_positions": ordered_positions,
+                "scores": ordered_scores,
+                "best_position": ordered_positions[0],
+                "worst_position": ordered_positions[-1],
+                "all_tied": (
+                    len(ordered_scores) <= 1
+                    or max(ordered_scores) - min(ordered_scores) <= score_tolerance
+                ),
+            }
+        )
+    return rankings
 
 
 def _slice_value(value: Any, indices: Sequence[int]) -> Any:
