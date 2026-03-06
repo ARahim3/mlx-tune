@@ -370,6 +370,36 @@ class TestGRPOTrainerIntegration:
         assert seen_contexts
         assert all(context == "4" for context in seen_contexts)
 
+    def test_grpo_phase1_accepts_documented_loss_type_aliases(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer
+
+        for loss_type in ["grpo", "dr_grpo", "dapo", "bnpo"]:
+            trainer = GRPOTrainer(
+                model=make_model(20),
+                train_dataset=grpo_dataset,
+                tokenizer=tokenizer,
+                reward_fn=lambda response, context: float(len(response)),
+                args=GRPOConfig(
+                    loss_type=loss_type,
+                    learning_rate=1e-2,
+                    beta=0.01,
+                    num_generations=2,
+                    max_completion_length=3,
+                    max_steps=1,
+                    logging_steps=1,
+                    save_steps=1,
+                    output_dir=str(tmp_path / loss_type),
+                ),
+            )
+            result = trainer.train()
+            assert result["status"] == "success"
+            assert trainer.phase1_loss_type == "phase1_shared_rollout_recompute"
+
     def test_grpo_resume_restores_rng_and_optimizer_state(
         self,
         tmp_path,

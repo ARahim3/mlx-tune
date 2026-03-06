@@ -18,12 +18,15 @@ import mlx.nn as nn
 def _token_log_probs(
     model: Any,
     input_ids: mx.array,
+    temperature: float = 1.0,
 ) -> mx.array:
     """Return token log probabilities aligned to ``input_ids[:, 1:]``."""
     inputs = input_ids[:, :-1]
     targets = input_ids[:, 1:]
 
     logits = model(inputs)
+    if temperature != 1.0:
+        logits = logits / temperature
     log_probs = nn.log_softmax(logits, axis=-1)
     return mx.take_along_axis(
         log_probs,
@@ -84,11 +87,12 @@ def compute_completion_log_probs(
     input_ids: mx.array,
     prompt_lengths: mx.array,
     completion_lengths: mx.array,
+    temperature: float = 1.0,
 ) -> mx.array:
     """
     Compute log probabilities over completion tokens only.
     """
-    token_log_probs = _token_log_probs(model, input_ids)
+    token_log_probs = _token_log_probs(model, input_ids, temperature=temperature)
     mask = completion_token_mask(input_ids, prompt_lengths, completion_lengths)
     return (token_log_probs * mask.astype(token_log_probs.dtype)).sum(axis=-1)
 
@@ -322,6 +326,7 @@ def grpo_recompute_loss(
     advantages: mx.array,
     beta: float = 0.04,
     clip_epsilon: float = 0.2,
+    temperature: float = 1.0,
 ) -> Tuple[mx.array, mx.array]:
     """
     Recompute GRPO loss on fixed sampled completions.
@@ -331,12 +336,14 @@ def grpo_recompute_loss(
         input_ids,
         prompt_lengths,
         completion_lengths,
+        temperature=temperature,
     )
     reference_logprobs = compute_completion_log_probs(
         reference_model,
         input_ids,
         prompt_lengths,
         completion_lengths,
+        temperature=temperature,
     )
     reference_logprobs = mx.stop_gradient(reference_logprobs)
 

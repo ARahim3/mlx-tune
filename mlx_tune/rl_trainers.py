@@ -46,6 +46,7 @@ STATE_FILE = "trainer_state.safetensors"
 METADATA_FILE = "trainer_state.json"
 REFERENCE_FILE = "reference_model.safetensors"
 REFERENCE_METADATA_FILE = "reference_metadata.json"
+GRPO_PHASE1_LOSS_TYPES = {"grpo", "dr_grpo", "dapo", "bnpo"}
 
 
 def _actual_model(model: Any) -> Any:
@@ -795,6 +796,7 @@ class GRPOTrainer(_RLTrainerBase):
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.config = args or GRPOConfig()
         self.loss_type = self.config.loss_type
+        self.phase1_loss_type = self._resolve_loss_type(self.loss_type)
         self.beta = self.config.beta
         self.num_generations = self.config.num_generations
         self.max_completion_length = self.config.max_completion_length
@@ -820,6 +822,20 @@ class GRPOTrainer(_RLTrainerBase):
 
         if self.reward_fn is None:
             self.reward_fn = lambda response, context: len(response.split()) / 100.0
+
+    def _resolve_loss_type(self, loss_type: str) -> str:
+        if loss_type not in GRPO_PHASE1_LOSS_TYPES:
+            raise ValueError(
+                f"Unsupported GRPO loss_type '{loss_type}'. "
+                f"Supported values: {sorted(GRPO_PHASE1_LOSS_TYPES)}"
+            )
+        if loss_type != "grpo":
+            warnings.warn(
+                f"GRPO loss_type='{loss_type}' is accepted in Phase 1 but currently "
+                "routes through the shared rollout/recompute objective.",
+                UserWarning,
+            )
+        return "phase1_shared_rollout_recompute"
 
     def _prepare_prompt_samples(self) -> None:
         self.prompt_samples = []
@@ -941,6 +957,8 @@ class GRPOTrainer(_RLTrainerBase):
 
         def loss_fn(model, batch):
             input_ids, prompt_lengths, completion_lengths, rollout_logprobs, advantages = batch
+            if self.phase1_loss_type != "phase1_shared_rollout_recompute":
+                raise ValueError(f"Unhandled GRPO Phase 1 loss routing: {self.phase1_loss_type}")
             loss, _ = grpo_recompute_loss(
                 model=model,
                 reference_model=reference_model,
@@ -950,6 +968,7 @@ class GRPOTrainer(_RLTrainerBase):
                 rollout_logprobs=rollout_logprobs,
                 advantages=advantages,
                 beta=self.beta,
+                temperature=self.temperature,
             )
             return loss
 

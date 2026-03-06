@@ -16,6 +16,10 @@ class TinyModel(nn.Module):
         return self.output(self.embedding(x))
 
 
+class TinyTokenizer:
+    eos_token_id = 1
+
+
 def test_compute_log_probs_with_lengths_shape():
     from mlx_tune.losses import compute_log_probs_with_lengths
 
@@ -141,3 +145,33 @@ def test_grpo_recompute_loss_is_finite_and_trainable():
     mx.eval(loss, ntoks)
     assert loss.shape == ()
     assert ntoks.item() == 5
+
+
+def test_grpo_rollout_and_recompute_logprobs_match_with_temperature():
+    from mlx_tune.losses import compute_completion_log_probs, generate_with_log_probs
+
+    model = TinyModel()
+    tokenizer = TinyTokenizer()
+    mx.eval(model.parameters())
+    mx.random.seed(21)
+
+    prompt_ids = mx.array([2, 7, 8])
+    generated_ids, rollout_token_logprobs = generate_with_log_probs(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_tokens=3,
+        temperature=0.7,
+    )
+    completion_ids = generated_ids[len(prompt_ids):].tolist()
+    input_ids = mx.array([prompt_ids.tolist() + completion_ids])
+
+    recomputed = compute_completion_log_probs(
+        model,
+        input_ids,
+        mx.array([len(prompt_ids)]),
+        mx.array([len(completion_ids)]),
+        temperature=0.7,
+    )
+
+    assert mx.allclose(recomputed, mx.array([rollout_token_logprobs.sum()]))
