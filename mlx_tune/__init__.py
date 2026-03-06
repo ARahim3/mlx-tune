@@ -129,6 +129,7 @@ from mlx_tune.chat_templates import (
     HFDatasetConfig,
     load_dataset_with_config,
 )
+from mlx_tune.trl_compat import PatchFastRL
 
 __all__ = [
     # Core
@@ -145,6 +146,7 @@ __all__ = [
     "RLCheckpointBundle",
     "prepare_rl_dataset",
     "resume_from_checkpoint",
+    "PatchFastRL",
     "__version__",
     # SFT Training
     "SFTTrainer",
