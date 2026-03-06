@@ -477,9 +477,18 @@ def ppo_sequence_loss(
 
     kl_penalty = mx.zeros_like(policy_objective)
     if scored_batch.reference_logprobs is not None:
+        kl_scored_batch = scored_batch
+        if temperature != 1.0:
+            kl_scored_batch = score_policy(
+                model,
+                batch,
+                mode="completion",
+                reference_model=reference_model if batch.reference_logprobs is None else None,
+                temperature=1.0,
+            )
         kl_penalty = kl_against_reference(
-            scored_batch.summed_logprobs,
-            scored_batch.reference_logprobs,
+            kl_scored_batch.summed_logprobs,
+            kl_scored_batch.reference_logprobs,
         )
     loss = -mx.mean(policy_objective - beta * kl_penalty)
     return loss, {

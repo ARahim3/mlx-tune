@@ -915,3 +915,38 @@ class TestOtherRLTrainers:
             trainer._last_rollout_batch.rewards,
             mx.ones_like(trainer._last_rollout_batch.rewards),
         )
+
+    def test_online_dpo_prefers_answer_context_over_prompt(
+        self,
+        tmp_path,
+        tokenizer,
+    ):
+        from mlx_tune import OnlineDPOConfig, OnlineDPOTrainer
+
+        seen_contexts = []
+
+        def reward_fn(response: str, context: str) -> float:
+            seen_contexts.append(context)
+            return float(len(response))
+
+        trainer = OnlineDPOTrainer(
+            model=make_model(62),
+            train_dataset=[{"prompt": "Solve 2 + 2", "answer": "4"}],
+            tokenizer=tokenizer,
+            reward_fn=reward_fn,
+            args=OnlineDPOConfig(
+                learning_rate=1e-2,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                num_generations=2,
+                max_completion_length=3,
+                output_dir=str(tmp_path / "online_dpo_answer_context"),
+            ),
+        )
+
+        result = trainer.train()
+
+        assert result["status"] == "success"
+        assert seen_contexts
+        assert all(context == "4" for context in seen_contexts)

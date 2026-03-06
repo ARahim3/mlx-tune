@@ -192,6 +192,49 @@ def test_grpo_recompute_kl_penalty_is_temperature_invariant_when_advantages_are_
     assert mx.allclose(loss_at_one, loss_at_point_seven)
 
 
+def test_ppo_kl_penalty_is_temperature_invariant_when_advantages_are_zero():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import ppo_sequence_loss
+
+    policy = TinyModel()
+    mx.eval(policy.parameters())
+
+    input_ids = [[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]]
+    prompt_lengths = [3, 2]
+    completion_lengths = [2, 3]
+    batch = make_policy_eval_batch(
+        input_ids,
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        old_logprobs=mx.array([0.0, 0.0], dtype=mx.float32),
+        advantages=mx.array([0.0, 0.0], dtype=mx.float32),
+    )
+    raw_scores = score_policy(policy, batch, mode="completion", temperature=1.0)
+    batch.reference_logprobs = raw_scores.summed_logprobs
+
+    loss_at_one, metrics_at_one = ppo_sequence_loss(
+        model=policy,
+        batch=batch,
+        beta=0.04,
+        temperature=1.0,
+    )
+    loss_at_point_seven, metrics_at_point_seven = ppo_sequence_loss(
+        model=policy,
+        batch=batch,
+        beta=0.04,
+        temperature=0.7,
+    )
+
+    assert mx.allclose(loss_at_one, loss_at_point_seven)
+    assert mx.allclose(metrics_at_one["kl_penalty"], mx.zeros_like(metrics_at_one["kl_penalty"]))
+    assert mx.allclose(
+        metrics_at_point_seven["kl_penalty"],
+        mx.zeros_like(metrics_at_point_seven["kl_penalty"]),
+    )
+
+
 def test_grpo_rollout_and_recompute_logprobs_match_with_temperature():
     from mlx_tune.losses import compute_completion_log_probs, generate_with_log_probs
 

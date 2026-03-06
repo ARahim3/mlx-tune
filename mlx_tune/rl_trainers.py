@@ -2157,7 +2157,10 @@ class OnlineDPOTrainer(_RLTrainerBase):
                     "sample_index": sample_index,
                     "prompt": prompt,
                     "prompt_ids": self.tokenizer.encode(prompt),
-                    "reward_context": sample.get("reward_context"),
+                    "reward_context": sample.get(
+                        "reward_context",
+                        sample.get("answer", sample.get("response")),
+                    ),
                 }
             )
         if not self.prompt_samples:
