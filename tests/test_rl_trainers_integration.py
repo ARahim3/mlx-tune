@@ -2,6 +2,7 @@
 Integration tests for RL trainers.
 """
 
+import json
 from pathlib import Path
 
 import mlx.core as mx
@@ -10,18 +11,27 @@ import pytest
 from mlx.utils import tree_flatten
 
 
-class SmallLanguageModel(nn.Module):
+class SmallBackbone(nn.Module):
     def __init__(self, vocab_size: int = 64, hidden_size: int = 32, num_layers: int = 2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, hidden_size)
         self.layers = [nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)]
-        self.output = nn.Linear(hidden_size, vocab_size)
 
     def __call__(self, x):
         h = self.embedding(x)
         for layer in self.layers:
             h = mx.maximum(layer(h), 0)
-        return self.output(h)
+        return h
+
+
+class SmallLanguageModel(nn.Module):
+    def __init__(self, vocab_size: int = 64, hidden_size: int = 32, num_layers: int = 2):
+        super().__init__()
+        self.model = SmallBackbone(vocab_size=vocab_size, hidden_size=hidden_size, num_layers=num_layers)
+        self.output = nn.Linear(hidden_size, vocab_size)
+
+    def __call__(self, x):
+        return self.output(self.model(x))
 
 
 class MockTokenizer:
@@ -59,6 +69,45 @@ class MockModelWrapper:
 
     def set_adapter_path(self, path: str):
         self._adapter_path = path
+
+
+def write_legacy_rl_checkpoint(trainer, checkpoint_dir: Path):
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir = checkpoint_dir / "adapters"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    adapter_weights = dict(tree_flatten(trainer.model.model.trainable_parameters()))
+    mx.save_safetensors(str(adapter_dir / "adapters.safetensors"), adapter_weights)
+
+    state_arrays = {
+        f"optimizer.{key}": value
+        for key, value in tree_flatten(trainer.optimizer.state)
+    }
+    state_arrays.update({f"rng.{idx}": state for idx, state in enumerate(mx.random.state)})
+    if hasattr(trainer, "_extra_state_arrays"):
+        state_arrays.update(trainer._extra_state_arrays())
+    mx.save_safetensors(str(checkpoint_dir / "trainer_state.safetensors"), state_arrays)
+
+    metadata = {
+        "algorithm": trainer.algorithm,
+        "config": trainer.config.to_dict() if hasattr(trainer.config, "to_dict") else dict(trainer.config),
+        "global_step": trainer.global_step,
+        "dataset_cursor": trainer.dataset_cursor,
+        "cache_metadata": trainer.cache_metadata,
+    }
+    (checkpoint_dir / "trainer_state.json").write_text(json.dumps(metadata, indent=2))
+
+    if trainer.reference_policy is not None:
+        reference_weights = dict(tree_flatten(trainer.reference_policy.model.model.parameters()))
+        mx.save_safetensors(str(checkpoint_dir / "reference_model.safetensors"), reference_weights)
+        (checkpoint_dir / "reference_metadata.json").write_text(
+            json.dumps(
+                {
+                    "source": trainer.reference_policy.source,
+                    "metadata": trainer.reference_policy.metadata,
+                },
+                indent=2,
+            )
+        )
 
 
 def make_model(seed: int) -> MockModelWrapper:
@@ -481,6 +530,113 @@ class TestGRPOTrainerIntegration:
         result = resumed.train(resume_from_checkpoint=str(output_dir))
         assert result["global_step"] == 2
 
+    def test_grpo_prefers_learned_reward_model_over_reward_fn(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer, build_reward_model
+
+        reward_model = build_reward_model(make_model(30))
+        reward_model.head.update(
+            {
+                "weight": mx.zeros_like(reward_model.head.weight),
+                "bias": mx.array([1.0], dtype=mx.float32),
+            },
+            strict=False,
+        )
+        mx.eval(reward_model.head.parameters())
+
+        trainer = GRPOTrainer(
+            model=make_model(31),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_model=reward_model,
+            reward_fn=lambda response, context: (_ for _ in ()).throw(RuntimeError("reward_fn should not run")),
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(tmp_path),
+            ),
+        )
+
+        result = trainer.train()
+        assert result["status"] == "success"
+        assert trainer._last_rollout_batch is not None
+        assert mx.allclose(
+            trainer._last_rollout_batch.rewards,
+            mx.ones_like(trainer._last_rollout_batch.rewards),
+        )
+
+    def test_grpo_manifest_checkpoint_persists_roles_and_metrics(
+        self,
+        tmp_path,
+        tokenizer,
+        grpo_dataset,
+    ):
+        from mlx_tune import GRPOConfig, GRPOTrainer, build_reward_model, build_value_model
+
+        output_dir = tmp_path / "grpo_manifest"
+        trainer = GRPOTrainer(
+            model=make_model(32),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            reward_model=build_reward_model(make_model(33)),
+            value_model=build_value_model(make_model(34)),
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=1,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(output_dir),
+            ),
+        )
+        trainer.train()
+
+        assert (output_dir / "manifest.json").exists()
+        assert (output_dir / "policy" / "role.json").exists()
+        assert (output_dir / "reference" / "weights.safetensors").exists()
+        assert (output_dir / "reward_model" / "head.safetensors").exists()
+        assert (output_dir / "value_model" / "head.safetensors").exists()
+        assert (output_dir / "optimizer" / "state.safetensors").exists()
+        assert (output_dir / "scheduler" / "state.json").exists()
+        assert (output_dir / "trainer" / "state.json").exists()
+        assert (output_dir / "trainer" / "rng.safetensors").exists()
+        assert (output_dir / "metrics" / "history.jsonl").exists()
+        assert trainer.metrics_history
+
+        resumed = GRPOTrainer(
+            model=make_model(35),
+            train_dataset=grpo_dataset,
+            tokenizer=tokenizer,
+            args=GRPOConfig(
+                learning_rate=1e-2,
+                beta=0.01,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=2,
+                logging_steps=1,
+                save_steps=1,
+                output_dir=str(output_dir),
+            ),
+        )
+        result = resumed.train(resume_from_checkpoint=str(output_dir))
+
+        assert result["global_step"] == 2
+        assert resumed.reward_model is not None
+        assert resumed.value_model is not None
+        assert len(resumed.metrics_history) >= len(trainer.metrics_history)
+        assert resumed.loaded_checkpoint_manifest is not None
+
 
 @pytest.mark.integration
 class TestKTOTrainerIntegration:
@@ -528,6 +684,47 @@ class TestKTOTrainerIntegration:
             reference_logprobs=live_policy_reference,
         )
         assert abs(cached_loss.item() - live_loss.item()) > 1e-6
+
+    def test_legacy_rl_checkpoint_loads_and_resaves_manifest_layout(
+        self,
+        tmp_path,
+        tokenizer,
+        kto_dataset,
+    ):
+        from mlx_tune import KTOTrainer
+
+        source_trainer = KTOTrainer(
+            model=make_model(40),
+            train_dataset=kto_dataset,
+            tokenizer=tokenizer,
+            learning_rate=2e-2,
+            max_steps=1,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(tmp_path / "source"),
+        )
+        source_trainer.train()
+
+        legacy_dir = tmp_path / "legacy_kto"
+        write_legacy_rl_checkpoint(source_trainer, legacy_dir)
+
+        resumed = KTOTrainer(
+            model=make_model(41),
+            train_dataset=kto_dataset,
+            tokenizer=tokenizer,
+            learning_rate=2e-2,
+            max_steps=2,
+            logging_steps=1,
+            save_steps=1,
+            output_dir=str(legacy_dir),
+        )
+        result = resumed.train(resume_from_checkpoint=str(legacy_dir))
+
+        assert result["global_step"] == 2
+        assert resumed.cache_metadata == source_trainer.cache_metadata
+        assert (legacy_dir / "manifest.json").exists()
+        assert (legacy_dir / "reference" / "weights.safetensors").exists()
+        assert (legacy_dir / "runtime" / "cache.safetensors").exists()
 
 
 @pytest.mark.integration

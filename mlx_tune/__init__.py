@@ -15,7 +15,17 @@ Supported Training Methods:
 
 __version__ = "0.4.0"  # Renamed to mlx-tune (formerly unsloth-mlx)
 
-from mlx_tune.model import FastLanguageModel, ReferencePolicy
+from mlx_tune.model import (
+    FastLanguageModel,
+    ReferencePolicy,
+    RLModelRoles,
+    RewardModel,
+    ValueModel,
+    build_reference_policy,
+    build_reward_model,
+    build_value_model,
+    create_rl_model_roles,
+)
 from mlx_tune.trainer import (
     prepare_dataset,
     format_chat_template,
@@ -53,6 +63,12 @@ from mlx_tune.losses import (
     grpo_loss,
     grpo_batch_loss,
     compute_reference_logprobs,
+    pairwise_reward_loss,
+    reward_model_pairwise_loss,
+    value_regression_loss,
+    value_model_regression_loss,
+    scalar_loss_metrics,
+    pairwise_ranking_accuracy,
     precompute_preference_reference_logprobs,
     precompute_kto_reference_logprobs,
 )
@@ -100,6 +116,13 @@ __all__ = [
     # Core
     "FastLanguageModel",
     "ReferencePolicy",
+    "RLModelRoles",
+    "RewardModel",
+    "ValueModel",
+    "build_reference_policy",
+    "build_reward_model",
+    "build_value_model",
+    "create_rl_model_roles",
     "__version__",
     # SFT Training
     "SFTTrainer",
@@ -129,6 +152,12 @@ __all__ = [
     "grpo_loss",
     "grpo_batch_loss",
     "compute_reference_logprobs",
+    "pairwise_reward_loss",
+    "reward_model_pairwise_loss",
+    "value_regression_loss",
+    "value_model_regression_loss",
+    "scalar_loss_metrics",
+    "pairwise_ranking_accuracy",
     "precompute_preference_reference_logprobs",
     "precompute_kto_reference_logprobs",
     # Utilities

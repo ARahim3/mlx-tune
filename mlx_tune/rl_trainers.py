@@ -46,12 +46,23 @@ from mlx_tune._rl_runtime import (
     score_policy_in_chunks,
 )
 from mlx_tune.model import ReferencePolicy
+from mlx_tune.model import (
+    RewardModel,
+    ValueModel,
+    build_reference_policy,
+    build_reward_model,
+    build_value_model,
+)
 
 
 STATE_FILE = "trainer_state.safetensors"
 METADATA_FILE = "trainer_state.json"
 REFERENCE_FILE = "reference_model.safetensors"
 REFERENCE_METADATA_FILE = "reference_metadata.json"
+MANIFEST_FILE = "manifest.json"
+CHECKPOINT_FORMAT_NAME = "mlx_tune_rl_checkpoint"
+CHECKPOINT_FORMAT_VERSION = 3
+MLX_TUNE_VERSION = "0.4.0"
 GRPO_PHASE1_LOSS_TYPES = {"grpo", "dr_grpo", "dapo", "bnpo"}
 
 
@@ -69,51 +80,14 @@ def _save_adapters_and_config(model: Any, adapter_path: Path) -> bool:
     Save trainable parameters and adapter config in mlx_lm-compatible layout.
     """
     try:
+        if hasattr(model, "save_adapter_snapshot"):
+            return bool(model.save_adapter_snapshot(str(adapter_path)))
+
         actual_model = _actual_model(model)
         adapter_path.mkdir(parents=True, exist_ok=True)
         adapter_file = adapter_path / "adapters.safetensors"
         adapter_weights = dict(tree_flatten(actual_model.trainable_parameters()))
         mx.save_safetensors(str(adapter_file), adapter_weights)
-
-        num_layers = None
-        if hasattr(actual_model, "layers"):
-            num_layers = len(actual_model.layers)
-        elif hasattr(actual_model, "model") and hasattr(actual_model.model, "layers"):
-            num_layers = len(actual_model.model.layers)
-
-        lora_config = {}
-        if hasattr(model, "lora_config") and model.lora_config:
-            lora_config = model.lora_config.copy()
-
-        r = lora_config.get("r", 16)
-        alpha = lora_config.get("lora_alpha", 16)
-        adapter_config = {
-            "fine_tune_type": "lora",
-            "num_layers": num_layers,
-            "lora_parameters": {
-                "rank": r,
-                "scale": alpha / r,
-                "dropout": lora_config.get("lora_dropout", 0.0),
-            },
-        }
-
-        target_modules = lora_config.get("target_modules", [])
-        if target_modules:
-            short_to_full = {
-                "q_proj": "self_attn.q_proj",
-                "k_proj": "self_attn.k_proj",
-                "v_proj": "self_attn.v_proj",
-                "o_proj": "self_attn.o_proj",
-                "gate_proj": "mlp.gate_proj",
-                "up_proj": "mlp.up_proj",
-                "down_proj": "mlp.down_proj",
-            }
-            adapter_config["lora_parameters"]["keys"] = [
-                short_to_full.get(module, module) for module in target_modules
-            ]
-
-        with open(adapter_path / "adapter_config.json", "w") as handle:
-            json.dump(adapter_config, handle, indent=2)
         return True
     except Exception as exc:
         print(f"  Warning: could not save adapters: {exc}")
@@ -165,6 +139,38 @@ def _pad_sequences(sequences: List[List[int]], pad_id: int) -> Tuple[mx.array, m
     return pad_sequences(sequences, pad_id)
 
 
+def _read_json(path: Path, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not path.exists():
+        return {} if default is None else default
+    with open(path) as handle:
+        return json.load(handle)
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    history: List[Dict[str, Any]] = []
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                history.append(json.loads(line))
+    return history
+
+
+def _save_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
 class _RLTrainerBase:
     algorithm = "rl"
 
@@ -174,6 +180,10 @@ class _RLTrainerBase:
         self.reference_policy: Optional[ReferencePolicy] = None
         self.cache_metadata: Dict[str, Any] = {}
         self.optimizer = None
+        self.reward_model: Optional[RewardModel] = getattr(self, "reward_model", None)
+        self.value_model: Optional[ValueModel] = getattr(self, "value_model", None)
+        self.metrics_history: List[Dict[str, Any]] = []
+        self.loaded_checkpoint_manifest: Optional[Dict[str, Any]] = None
 
     def _apply_lora_if_needed(self) -> None:
         if hasattr(self.model, "_apply_lora") and not getattr(self.model, "_lora_applied", False):
@@ -193,33 +203,92 @@ class _RLTrainerBase:
             self.dataset_cursor = (self.dataset_cursor + 1) % len(samples)
         return batch
 
-    def _state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
-        return (checkpoint_dir or self.output_dir) / STATE_FILE
+    def _checkpoint_dir(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return checkpoint_dir or self.output_dir
 
-    def _metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
-        return (checkpoint_dir or self.output_dir) / METADATA_FILE
+    def _manifest_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / MANIFEST_FILE
 
-    def _reference_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
-        return (checkpoint_dir or self.output_dir) / REFERENCE_FILE
+    def _role_dir(self, role_name: str, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / role_name
 
-    def _reference_metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
-        return (checkpoint_dir or self.output_dir) / REFERENCE_METADATA_FILE
+    def _optimizer_state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "optimizer" / "state.safetensors"
 
-    def _save_current_policy(self) -> None:
-        _save_adapters_and_config(self.model, self.adapter_path)
+    def _scheduler_state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "scheduler" / "state.json"
+
+    def _trainer_state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "trainer" / "state.json"
+
+    def _trainer_rng_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "trainer" / "rng.safetensors"
+
+    def _runtime_cache_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "runtime" / "cache.safetensors"
+
+    def _metrics_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / "metrics" / "history.jsonl"
+
+    def _legacy_state_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / STATE_FILE
+
+    def _legacy_metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / METADATA_FILE
+
+    def _legacy_reference_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / REFERENCE_FILE
+
+    def _legacy_reference_metadata_path(self, checkpoint_dir: Optional[Path] = None) -> Path:
+        return self._checkpoint_dir(checkpoint_dir) / REFERENCE_METADATA_FILE
+
+    def _has_manifest_checkpoint(self, checkpoint_dir: Path) -> bool:
+        return self._manifest_path(checkpoint_dir).exists()
+
+    def _has_legacy_checkpoint(self, checkpoint_dir: Path) -> bool:
+        return (
+            (checkpoint_dir / "adapters" / "adapters.safetensors").exists()
+            or self._legacy_state_path(checkpoint_dir).exists()
+            or self._legacy_reference_path(checkpoint_dir).exists()
+        )
+
+    def _save_current_policy(self, checkpoint_dir: Optional[Path] = None) -> None:
+        policy_dir = self._role_dir("policy", checkpoint_dir)
+        _save_adapters_and_config(self.model, policy_dir)
         if hasattr(self.model, "set_adapter_path"):
-            self.model.set_adapter_path(str(self.adapter_path))
+            self.model.set_adapter_path(str(policy_dir))
+        _write_json(
+            policy_dir / "role.json",
+            {
+                "role": "policy",
+                "weight_format": "adapters.safetensors",
+            },
+        )
 
-    def _save_reference_policy(self) -> None:
+    def _save_reference_policy(self, checkpoint_dir: Optional[Path] = None) -> None:
         if self.reference_policy is None:
             return
-        _save_full_model_state(self.reference_policy.model, self._reference_path())
+        reference_dir = self._role_dir("reference", checkpoint_dir)
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        _save_full_model_state(self.reference_policy.model, reference_dir / "weights.safetensors")
         metadata = {
             "source": self.reference_policy.source,
             "metadata": self.reference_policy.metadata,
         }
-        with open(self._reference_metadata_path(), "w") as handle:
-            json.dump(metadata, handle, indent=2)
+        _write_json(reference_dir / "metadata.json", metadata)
+        _write_json(
+            reference_dir / "role.json",
+            {
+                "role": "reference",
+                "weight_format": "weights.safetensors",
+            },
+        )
+
+    def _save_optional_scalar_role(self, role_name: str, role_model: Optional[Any], checkpoint_dir: Optional[Path] = None) -> None:
+        if role_model is None:
+            return
+        role_dir = self._role_dir(role_name, checkpoint_dir)
+        role_model.save_pretrained(str(role_dir))
 
     def _build_training_metadata(self) -> Dict[str, Any]:
         config = self.config.to_dict() if hasattr(self.config, "to_dict") else dict(self.config)
@@ -231,55 +300,198 @@ class _RLTrainerBase:
             "cache_metadata": self.cache_metadata,
         }
 
+    def _build_scheduler_state(self, optimizer: Any) -> Dict[str, Any]:
+        step_value = 0
+        if optimizer is not None and getattr(optimizer, "state", None):
+            step = optimizer.state.get("step", 0)
+            step_value = int(step.item()) if hasattr(step, "item") else int(step)
+        return {
+            "name": "cosine_decay",
+            "initial_learning_rate": self.learning_rate,
+            "total_steps": self.iters,
+            "step": step_value,
+        }
+
+    def _build_manifest(self) -> Dict[str, Any]:
+        reward_base = getattr(self.reward_model, "base_model", None)
+        value_base = getattr(self.value_model, "base_model", None)
+        roles_present = ["policy"]
+        role_weight_formats = {
+            "policy": "adapters.safetensors",
+        }
+        reference_provenance = None
+        if self.reference_policy is not None:
+            roles_present.append("reference")
+            role_weight_formats["reference"] = "weights.safetensors"
+            reference_provenance = {
+                "source": self.reference_policy.source,
+                "metadata": self.reference_policy.metadata,
+            }
+        if self.reward_model is not None:
+            roles_present.append("reward_model")
+            role_weight_formats["reward_model"] = {
+                "head": "head.safetensors",
+                "adapters": "adapters.safetensors"
+                if hasattr(reward_base, "has_adapters") and reward_base.has_adapters()
+                else None,
+            }
+        if self.value_model is not None:
+            roles_present.append("value_model")
+            role_weight_formats["value_model"] = {
+                "head": "head.safetensors",
+                "adapters": "adapters.safetensors"
+                if hasattr(value_base, "has_adapters") and value_base.has_adapters()
+                else None,
+            }
+        return {
+            "format_name": CHECKPOINT_FORMAT_NAME,
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "algorithm": self.algorithm,
+            "roles_present": roles_present,
+            "mlx_tune_version": MLX_TUNE_VERSION,
+            "role_weight_formats": role_weight_formats,
+            "trainer_state_locations": {
+                "optimizer": "optimizer/state.safetensors",
+                "scheduler": "scheduler/state.json",
+                "trainer": "trainer/state.json",
+                "rng": "trainer/rng.safetensors",
+                "runtime_cache": "runtime/cache.safetensors",
+            },
+            "metrics_path": "metrics/history.jsonl",
+            "reference_provenance": reference_provenance,
+        }
+
+    def _record_metric(self, **metrics: Any) -> None:
+        if not metrics:
+            return
+        row = {"step": self.global_step}
+        row.update(metrics)
+        self.metrics_history.append(row)
+
     def save_state(
         self,
         optimizer: Any,
         extra_arrays: Optional[Dict[str, mx.array]] = None,
     ) -> None:
-        self._save_current_policy()
-        self._save_reference_policy()
+        checkpoint_dir = self._checkpoint_dir()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        state_arrays = {}
-        state_arrays.update(_flatten_prefixed_tree("optimizer", optimizer.state))
-        state_arrays.update(_rng_state_to_dict())
+        self._save_current_policy(checkpoint_dir)
+        self._save_reference_policy(checkpoint_dir)
+        self._save_optional_scalar_role("reward_model", self.reward_model, checkpoint_dir)
+        self._save_optional_scalar_role("value_model", self.value_model, checkpoint_dir)
+
+        optimizer_path = self._optimizer_state_path(checkpoint_dir)
+        optimizer_path.parent.mkdir(parents=True, exist_ok=True)
+        mx.save_safetensors(str(optimizer_path), _flatten_prefixed_tree("optimizer", optimizer.state))
+
+        rng_path = self._trainer_rng_path(checkpoint_dir)
+        rng_path.parent.mkdir(parents=True, exist_ok=True)
+        mx.save_safetensors(str(rng_path), _rng_state_to_dict())
+
+        runtime_path = self._runtime_cache_path(checkpoint_dir)
         if extra_arrays:
-            state_arrays.update(extra_arrays)
-        mx.save_safetensors(str(self._state_path()), state_arrays)
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            mx.save_safetensors(str(runtime_path), extra_arrays)
 
-        with open(self._metadata_path(), "w") as handle:
-            json.dump(self._build_training_metadata(), handle, indent=2)
+        _write_json(self._trainer_state_path(checkpoint_dir), self._build_training_metadata())
+        _write_json(self._scheduler_state_path(checkpoint_dir), self._build_scheduler_state(optimizer))
+        _save_jsonl(self._metrics_path(checkpoint_dir), self.metrics_history)
+        _write_json(self._manifest_path(checkpoint_dir), self._build_manifest())
 
     def _ensure_reference_policy(self) -> None:
         if self.reference_policy is None:
             ref_model = getattr(self, "ref_model", None)
-            self.reference_policy = ReferencePolicy.from_model(self.model, ref_model=ref_model)
+            self.reference_policy = build_reference_policy(self.model, ref_model=ref_model, snapshot=True)
 
     def _load_reference_policy(self, checkpoint_dir: Path) -> None:
-        reference_path = self._reference_path(checkpoint_dir)
+        reference_path = self._role_dir("reference", checkpoint_dir) / "weights.safetensors"
         if reference_path.exists():
-            self.reference_policy = ReferencePolicy.from_model(self.model)
+            self.reference_policy = build_reference_policy(self.model, snapshot=True)
             _load_parameter_tree(self.reference_policy.model, reference_path, strict=False)
             _actual_model(self.reference_policy.model).freeze()
             mx.eval(_actual_model(self.reference_policy.model).parameters())
+            metadata = _read_json(self._role_dir("reference", checkpoint_dir) / "metadata.json")
+            if metadata:
+                self.reference_policy.source = metadata.get("source", self.reference_policy.source)
+                self.reference_policy.metadata = metadata.get("metadata", self.reference_policy.metadata)
         else:
             self._ensure_reference_policy()
 
-    def load_state(self, optimizer: Any, checkpoint_dir: Path) -> Dict[str, mx.array]:
-        checkpoint_dir = Path(checkpoint_dir)
+    def _load_optional_scalar_role(self, checkpoint_dir: Path, role_name: str) -> Optional[Any]:
+        role_dir = self._role_dir(role_name, checkpoint_dir)
+        if not role_dir.exists():
+            return None
+        with open(role_dir / "head_config.json") as handle:
+            config = json.load(handle)
+        if role_name == "reward_model":
+            if self.reward_model is None:
+                self.reward_model = build_reward_model(
+                    self.model,
+                    pooling=config.get("pooling", "last_token"),
+                    target=config.get("target", "completion"),
+                )
+            self.reward_model.load_pretrained(str(role_dir))
+            return self.reward_model
+        if role_name == "value_model":
+            if self.value_model is None:
+                self.value_model = build_value_model(
+                    self.model,
+                    pooling=config.get("pooling", "last_token"),
+                    target=config.get("target", "completion"),
+                )
+            self.value_model.load_pretrained(str(role_dir))
+            return self.value_model
+        return None
+
+    def _load_manifest_state(self, optimizer: Any, checkpoint_dir: Path) -> Dict[str, mx.array]:
+        manifest = _read_json(self._manifest_path(checkpoint_dir))
+        if not manifest:
+            raise FileNotFoundError(f"Checkpoint manifest not found under {checkpoint_dir}")
+        self.loaded_checkpoint_manifest = manifest
+
+        policy_adapter_file = self._role_dir("policy", checkpoint_dir) / "adapters.safetensors"
+        if policy_adapter_file.exists():
+            _load_parameter_tree(self.model, policy_adapter_file, strict=False)
+            if hasattr(self.model, "set_adapter_path"):
+                self.model.set_adapter_path(str(self._role_dir("policy", checkpoint_dir)))
+
+        optimizer_path = self._optimizer_state_path(checkpoint_dir)
+        if optimizer_path.exists():
+            optimizer_state = _extract_prefixed_tree("optimizer", mx.load(str(optimizer_path)))
+            if optimizer_state:
+                optimizer.state = optimizer_state
+
+        rng_path = self._trainer_rng_path(checkpoint_dir)
+        if rng_path.exists():
+            _restore_rng_state(mx.load(str(rng_path)))
+
+        metadata = _read_json(self._trainer_state_path(checkpoint_dir))
+        self.global_step = metadata.get("global_step", 0)
+        self.dataset_cursor = metadata.get("dataset_cursor", 0)
+        self.cache_metadata = metadata.get("cache_metadata", {})
+        self.metrics_history = _load_jsonl(self._metrics_path(checkpoint_dir))
+
+        self._load_reference_policy(checkpoint_dir)
+        self._load_optional_scalar_role(checkpoint_dir, "reward_model")
+        self._load_optional_scalar_role(checkpoint_dir, "value_model")
+
+        runtime_path = self._runtime_cache_path(checkpoint_dir)
+        return mx.load(str(runtime_path)) if runtime_path.exists() else {}
+
+    def _load_legacy_state(self, optimizer: Any, checkpoint_dir: Path) -> Dict[str, mx.array]:
         adapter_file = checkpoint_dir / "adapters" / "adapters.safetensors"
         if adapter_file.exists():
             _load_parameter_tree(self.model, adapter_file, strict=False)
             if hasattr(self.model, "set_adapter_path"):
                 self.model.set_adapter_path(str(checkpoint_dir / "adapters"))
 
-        state_path = self._state_path(checkpoint_dir)
-        metadata_path = self._metadata_path(checkpoint_dir)
+        state_path = self._legacy_state_path(checkpoint_dir)
+        metadata_path = self._legacy_metadata_path(checkpoint_dir)
         if not state_path.exists() or not metadata_path.exists():
             raise FileNotFoundError(f"Checkpoint state not found under {checkpoint_dir}")
 
-        with open(metadata_path) as handle:
-            metadata = json.load(handle)
-
+        metadata = _read_json(metadata_path)
         flat_state = mx.load(str(state_path))
         optimizer_state = _extract_prefixed_tree("optimizer", flat_state)
         if optimizer_state:
@@ -289,8 +501,27 @@ class _RLTrainerBase:
         self.global_step = metadata.get("global_step", 0)
         self.dataset_cursor = metadata.get("dataset_cursor", 0)
         self.cache_metadata = metadata.get("cache_metadata", {})
-        self._load_reference_policy(checkpoint_dir)
+        self.metrics_history = []
+
+        reference_path = self._legacy_reference_path(checkpoint_dir)
+        if reference_path.exists():
+            self.reference_policy = build_reference_policy(self.model, snapshot=True)
+            _load_parameter_tree(self.reference_policy.model, reference_path, strict=False)
+            reference_metadata = _read_json(self._legacy_reference_metadata_path(checkpoint_dir))
+            if reference_metadata:
+                self.reference_policy.source = reference_metadata.get("source", self.reference_policy.source)
+                self.reference_policy.metadata = reference_metadata.get("metadata", self.reference_policy.metadata)
+        else:
+            self._ensure_reference_policy()
         return flat_state
+
+    def load_state(self, optimizer: Any, checkpoint_dir: Path) -> Dict[str, mx.array]:
+        checkpoint_dir = Path(checkpoint_dir)
+        if self._has_manifest_checkpoint(checkpoint_dir):
+            return self._load_manifest_state(optimizer, checkpoint_dir)
+        if self._has_legacy_checkpoint(checkpoint_dir):
+            return self._load_legacy_state(optimizer, checkpoint_dir)
+        raise FileNotFoundError(f"Checkpoint state not found under {checkpoint_dir}")
 
 
 class DPOConfig:
@@ -378,6 +609,8 @@ class GRPOConfig:
         temperature: float = 0.7,
         max_completion_length: int = 512,
         reward_fn: Optional[Callable] = None,
+        reward_model: Optional[Any] = None,
+        value_model: Optional[Any] = None,
         output_dir: str = "./grpo_outputs",
         learning_rate: float = 1e-6,
         per_device_train_batch_size: int = 1,
@@ -396,6 +629,8 @@ class GRPOConfig:
         self.temperature = temperature
         self.max_completion_length = max_completion_length
         self.reward_fn = reward_fn
+        self.reward_model = reward_model
+        self.value_model = value_model
         self.output_dir = output_dir
         self.learning_rate = learning_rate
         self.per_device_train_batch_size = per_device_train_batch_size
@@ -413,7 +648,7 @@ class GRPOConfig:
         return {
             key: value
             for key, value in self.__dict__.items()
-            if not key.startswith("_") and key != "reward_fn"
+            if not key.startswith("_") and key not in {"reward_fn", "reward_model", "value_model"}
         }
 
 
@@ -425,6 +660,8 @@ class DPOTrainer(_RLTrainerBase):
         model: Any,
         train_dataset: Any,
         ref_model: Optional[Any] = None,
+        reward_model: Optional[Any] = None,
+        value_model: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
         args: Optional[DPOConfig] = None,
         use_native: bool = True,
@@ -432,6 +669,8 @@ class DPOTrainer(_RLTrainerBase):
     ):
         self.model = model
         self.ref_model = ref_model
+        self.reward_model = reward_model
+        self.value_model = value_model
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.use_native = use_native and HAS_NATIVE_TRAINING
@@ -454,7 +693,7 @@ class DPOTrainer(_RLTrainerBase):
             1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.adapter_path = self.output_dir / "adapters"
+        self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.train_samples: List[Dict[str, Any]] = []
         self._init_native_state()
@@ -595,6 +834,7 @@ class DPOTrainer(_RLTrainerBase):
             last_loss = loss.item()
             running_loss += last_loss
             self.global_step += 1
+            self._record_metric(loss=last_loss)
 
             if self.global_step % self.logging_steps == 0:
                 print(
@@ -678,7 +918,7 @@ class ORPOTrainer:
             1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.adapter_path = self.output_dir / "adapters"
+        self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
 
     def _tokenize_preference_pair(self, sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -783,7 +1023,9 @@ class GRPOTrainer(_RLTrainerBase):
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
         reward_fn: Optional[Callable] = None,
+        reward_model: Optional[Any] = None,
         ref_model: Optional[Any] = None,
+        value_model: Optional[Any] = None,
         args: Optional[GRPOConfig] = None,
         use_native: bool = True,
         **kwargs,
@@ -792,6 +1034,8 @@ class GRPOTrainer(_RLTrainerBase):
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.ref_model = ref_model
+        self.reward_model = reward_model or getattr(args, "reward_model", None)
+        self.value_model = value_model or getattr(args, "value_model", None)
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.config = args or GRPOConfig()
         self.loss_type = self.config.loss_type
@@ -799,7 +1043,7 @@ class GRPOTrainer(_RLTrainerBase):
         self.beta = self.config.beta
         self.num_generations = self.config.num_generations
         self.max_completion_length = self.config.max_completion_length
-        self.reward_fn = reward_fn or self.config.reward_fn
+        self.reward_fn = reward_fn if reward_fn is not None else self.config.reward_fn
         self.output_dir = Path(self.config.output_dir)
         self.learning_rate = self.config.learning_rate
         self.batch_size = self.config.per_device_train_batch_size
@@ -813,13 +1057,13 @@ class GRPOTrainer(_RLTrainerBase):
             1, (dataset_size // max(1, self.batch_size)) * self.config.num_train_epochs
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.adapter_path = self.output_dir / "adapters"
+        self.adapter_path = self.output_dir / "policy"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
         self.prompt_samples: List[Dict[str, Any]] = []
         self._last_rollout_batch: Optional[RolloutBatch] = None
         self._init_native_state()
 
-        if self.reward_fn is None:
+        if self.reward_model is None and self.reward_fn is None:
             self.reward_fn = lambda response, context: len(response.split()) / 100.0
 
     def _resolve_loss_type(self, loss_type: str) -> str:
@@ -855,7 +1099,18 @@ class GRPOTrainer(_RLTrainerBase):
         if not self.prompt_samples:
             raise ValueError("GRPOTrainer requires prompt or question fields.")
 
+    def _resolve_reward_evaluator(self) -> Any:
+        if self.reward_model is not None:
+            return self.reward_model
+        if self.reward_fn is not None:
+            return self.reward_fn
+        config_reward_fn = getattr(self.config, "reward_fn", None)
+        if config_reward_fn is not None:
+            return config_reward_fn
+        return lambda response, context: len(response.split()) / 100.0
+
     def _collect_rollout_batch(self, prompt_samples: List[Dict[str, Any]]) -> RolloutBatch:
+        reward_evaluator = self._resolve_reward_evaluator()
         rollout_batch = collect_rollouts(
             _actual_model(self.model),
             self.tokenizer,
@@ -866,10 +1121,10 @@ class GRPOTrainer(_RLTrainerBase):
                 "max_completion_length": self.max_completion_length,
                 "max_seq_length": self.max_seq_length,
             },
-            reward_evaluator=None,
+            reward_evaluator=reward_evaluator,
             collect_sample_stats=False,
         )
-        reward_batch = evaluate_rewards(rollout_batch, self.reward_fn)
+        reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
         advantages = compute_advantages(reward_batch)
         rollout_batch.rewards = reward_batch.scalar_rewards
         rollout_batch.advantages = advantages
@@ -936,6 +1191,8 @@ class GRPOTrainer(_RLTrainerBase):
             last_loss = step_loss / max(1, len(minibatches))
             running_loss += last_loss
             self.global_step += 1
+            mean_reward = float(mx.mean(rollout_batch.rewards).item()) if rollout_batch.rewards is not None else None
+            self._record_metric(loss=last_loss, reward_mean=mean_reward)
 
             if self.global_step % self.logging_steps == 0:
                 print(
@@ -999,6 +1256,8 @@ class KTOTrainer(_RLTrainerBase):
         tokenizer: Optional[Any] = None,
         beta: float = 0.1,
         ref_model: Optional[Any] = None,
+        reward_model: Optional[Any] = None,
+        value_model: Optional[Any] = None,
         use_native: bool = True,
         **kwargs,
     ):
@@ -1007,6 +1266,8 @@ class KTOTrainer(_RLTrainerBase):
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.beta = beta
         self.ref_model = ref_model
+        self.reward_model = reward_model
+        self.value_model = value_model
         self.use_native = use_native and HAS_NATIVE_TRAINING
         self.output_dir = Path(kwargs.get("output_dir", "./kto_outputs"))
         self.learning_rate = kwargs.get("learning_rate", 5e-7)
@@ -1143,6 +1404,7 @@ class KTOTrainer(_RLTrainerBase):
             last_loss = loss.item()
             running_loss += last_loss
             self.global_step += 1
+            self._record_metric(loss=last_loss)
 
             if self.global_step % self.logging_steps == 0:
                 print(

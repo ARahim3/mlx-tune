@@ -9,7 +9,7 @@ Provides native MLX losses and reference-logprob helpers for:
 - SimPO (Simple Preference Optimization)
 """
 
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -293,6 +293,108 @@ def simpo_loss(
 
     logits = beta * (r_chosen - r_rejected - gamma)
     return -mx.mean(nn.log_sigmoid(logits)), chosen_lengths.sum() + rejected_lengths.sum()
+
+
+def pairwise_reward_loss(
+    chosen_scores: mx.array,
+    rejected_scores: mx.array,
+    margin: float = 0.0,
+) -> mx.array:
+    """
+    Logistic pairwise preference loss over scalar reward scores.
+    """
+    return -mx.mean(nn.log_sigmoid(chosen_scores - rejected_scores - margin))
+
+
+def reward_model_pairwise_loss(
+    reward_model: Any,
+    chosen_input_ids: mx.array,
+    rejected_input_ids: mx.array,
+    chosen_sequence_lengths: mx.array,
+    rejected_sequence_lengths: mx.array,
+    chosen_prompt_lengths: Optional[mx.array] = None,
+    rejected_prompt_lengths: Optional[mx.array] = None,
+    chosen_completion_lengths: Optional[mx.array] = None,
+    rejected_completion_lengths: Optional[mx.array] = None,
+    margin: float = 0.0,
+) -> Tuple[mx.array, Dict[str, mx.array]]:
+    """
+    Compute pairwise reward-model loss for chosen/rejected sequences.
+    """
+    chosen_scores, rejected_scores = reward_model.score_pairs(
+        chosen_input_ids=chosen_input_ids,
+        rejected_input_ids=rejected_input_ids,
+        chosen_sequence_lengths=chosen_sequence_lengths,
+        rejected_sequence_lengths=rejected_sequence_lengths,
+        chosen_prompt_lengths=chosen_prompt_lengths,
+        rejected_prompt_lengths=rejected_prompt_lengths,
+        chosen_completion_lengths=chosen_completion_lengths,
+        rejected_completion_lengths=rejected_completion_lengths,
+    )
+    loss = pairwise_reward_loss(chosen_scores, rejected_scores, margin=margin)
+    return loss, {
+        "chosen_scores": chosen_scores,
+        "rejected_scores": rejected_scores,
+    }
+
+
+def value_regression_loss(
+    predictions: mx.array,
+    targets: mx.array,
+    loss_type: str = "mse",
+) -> mx.array:
+    """
+    Compute a pointwise scalar regression loss.
+    """
+    if loss_type == "mse":
+        return mx.mean((predictions - targets) ** 2)
+    if loss_type == "mae":
+        return mx.mean(mx.abs(predictions - targets))
+    raise ValueError(f"Unsupported scalar regression loss: {loss_type}")
+
+
+def value_model_regression_loss(
+    value_model: Any,
+    input_ids: mx.array,
+    sequence_lengths: mx.array,
+    targets: mx.array,
+    prompt_lengths: Optional[mx.array] = None,
+    completion_lengths: Optional[mx.array] = None,
+    loss_type: str = "mse",
+) -> Tuple[mx.array, mx.array]:
+    """
+    Compute pointwise regression loss for a scalar value model.
+    """
+    predictions = value_model.predict(
+        input_ids,
+        sequence_lengths=sequence_lengths,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+    )
+    return value_regression_loss(predictions, targets, loss_type=loss_type), predictions
+
+
+def scalar_loss_metrics(loss: mx.array, predictions: mx.array, targets: mx.array) -> Dict[str, float]:
+    """
+    Compute generic scalar regression metrics.
+    """
+    mae = mx.mean(mx.abs(predictions - targets))
+    mse = mx.mean((predictions - targets) ** 2)
+    return {
+        "loss": float(loss.item()),
+        "mae": float(mae.item()),
+        "mse": float(mse.item()),
+    }
+
+
+def pairwise_ranking_accuracy(
+    chosen_scores: mx.array,
+    rejected_scores: mx.array,
+) -> float:
+    """
+    Compute pairwise ranking accuracy for scalar preference scores.
+    """
+    return float(mx.mean((chosen_scores > rejected_scores).astype(mx.float32)).item())
 
 
 def sft_loss(
