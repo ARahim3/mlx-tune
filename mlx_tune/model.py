@@ -941,14 +941,22 @@ class MLXModelWrapper:
             **kwargs
         )
 
-    def __call__(self, *args, **kwargs):
+    def forward_with_cache(self, *args, cache=None, **kwargs):
+        """
+        Forward pass with optional cache support for autoregressive decoding.
+        """
+        if cache is None:
+            return self.model(*args, **kwargs)
+        return self.model(*args, cache=cache, **kwargs)
+
+    def __call__(self, *args, cache=None, **kwargs):
         """
         Forward pass through the model.
 
         Note: This is a simplified interface. For training, use MLX's
         training utilities directly.
         """
-        return self.model(*args, **kwargs)
+        return self.forward_with_cache(*args, cache=cache, **kwargs)
 
     def __getattr__(self, name):
         """

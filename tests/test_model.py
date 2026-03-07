@@ -222,6 +222,34 @@ class TestMLXModelWrapper:
         assert model.inference_mode is True
         assert model.use_cache is True
 
+    def test_wrapper_forwards_cache_argument(self):
+        """Test that the wrapper exposes and forwards cache for RL decoding."""
+        from mlx_tune.model import MLXModelWrapper
+
+        class MockCacheModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, x, cache=None):
+                self.calls.append((x, cache))
+                return ("logits", {"seen": True}) if cache is not None else "logits"
+
+        wrapped = MLXModelWrapper(
+            model=MockCacheModel(),
+            tokenizer=None,
+            max_seq_length=128,
+            model_name="mock",
+        )
+
+        assert wrapped("tokens") == "logits"
+        assert wrapped("tokens", cache={"kv": 1}) == ("logits", {"seen": True})
+        assert wrapped.forward_with_cache("tokens", cache={"kv": 2}) == ("logits", {"seen": True})
+        assert wrapped.model.calls == [
+            ("tokens", None),
+            ("tokens", {"kv": 1}),
+            ("tokens", {"kv": 2}),
+        ]
+
 
 class TestGGUFExportFix:
     """Test cases for GGUF export fix (GitHub issue #3).
