@@ -139,6 +139,30 @@ def rollout_sequence_tensors(rollout_batch, index: int):
     )
 
 
+def test_format_metric_summary_includes_rollout_length_and_stop_stats():
+    from mlx_tune import GRPOTrainer
+
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    row = {
+        "step": 3,
+        "train/policy_loss": 0.25,
+        "train/reward_mean": 1.0,
+        "train/completion_length_mean": 12.0,
+        "train/completion_length_max": 32.0,
+        "train/eos_rate": 0.75,
+        "train/truncation_rate": 0.25,
+        "train/kl_to_reference_mean": 0.1,
+    }
+
+    summary = trainer._format_metric_summary(row)
+
+    assert summary == (
+        "step=3 | policy_loss=0.2500 | reward_mean=1.0000 | "
+        "completion_length_mean=12.0000 | completion_length_max=32.0000 | "
+        "eos_rate=0.7500 | truncation_rate=0.2500 | kl_to_reference_mean=0.1000"
+    )
+
+
 @pytest.fixture
 def tokenizer():
     return MockTokenizer()

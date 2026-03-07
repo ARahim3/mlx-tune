@@ -124,6 +124,51 @@ def cap_prompt_and_completion_lengths(
     return capped_prompt_ids, capped_completion_ids, truncated_completion
 
 
+def _resolve_terminal_token_ids(tokenizer: Any) -> set[int]:
+    terminal_ids: set[int] = set()
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        try:
+            terminal_ids.add(int(eos_token_id))
+        except (TypeError, ValueError):
+            pass
+
+    stop_token = getattr(tokenizer, "_unsloth_stop_token", None)
+    if not stop_token:
+        return terminal_ids
+
+    candidate_ids: list[Any] = []
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        try:
+            candidate_ids.append(tokenizer.convert_tokens_to_ids(stop_token))
+        except Exception:
+            pass
+    if hasattr(tokenizer, "get_vocab"):
+        try:
+            vocab = tokenizer.get_vocab()
+            if stop_token in vocab:
+                candidate_ids.append(vocab[stop_token])
+        except Exception:
+            pass
+    if hasattr(tokenizer, "encode"):
+        try:
+            encoded = tokenizer.encode(stop_token, add_special_tokens=False)
+            if len(encoded) == 1:
+                candidate_ids.append(encoded[0])
+        except Exception:
+            pass
+
+    for token_id in candidate_ids:
+        if token_id is None:
+            continue
+        try:
+            terminal_ids.add(int(token_id))
+        except (TypeError, ValueError):
+            continue
+    return terminal_ids
+
+
 def length_mask(lengths: mx.array, width: int) -> mx.array:
     positions = mx.arange(width)[None, :]
     return positions < lengths[:, None]
@@ -405,6 +450,7 @@ def sample_completion(
     sampled_logits: List[float] = []
     token_entropies: List[float] = []
     saw_eos = False
+    terminal_token_ids = _resolve_terminal_token_ids(tokenizer)
     x = mx.array([generated_ids])
 
     for _ in range(max_tokens):
@@ -430,7 +476,7 @@ def sample_completion(
 
         generated_ids.append(next_token_id)
         x = mx.array([generated_ids])
-        if hasattr(tokenizer, "eos_token_id") and next_token_id == tokenizer.eos_token_id:
+        if next_token_id in terminal_token_ids:
             saw_eos = True
             break
 
@@ -580,6 +626,7 @@ def collect_rollouts(
     generation_batch_size = int(sampling_config.get("generation_batch_size") or 0)
     generation_batch_size = max(1, generation_batch_size or (len(prompt_samples) * max(1, num_generations)))
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    terminal_token_ids = _resolve_terminal_token_ids(tokenizer)
 
     expanded_samples: List[Dict[str, Any]] = []
     for group_index, sample in enumerate(prompt_samples):
@@ -648,7 +695,7 @@ def collect_rollouts(
                 if collect_sample_stats:
                     row["sampled_logits"].append(float(scaled[row_index, token_id].item()))
                     row["token_entropies"].append(float(entropies[row_index].item()))
-                if hasattr(tokenizer, "eos_token_id") and token_id == tokenizer.eos_token_id:
+                if token_id in terminal_token_ids:
                     row["eos_flag"] = True
                     row["done"] = True
                 elif len(row["generated_ids"]) - len(row["prompt_ids"]) >= row["max_completion_tokens"]:
@@ -1140,6 +1187,9 @@ def summarize_rollout_metrics(
             )
     if rollout_batch.completion_lengths.shape[0] > 0:
         metrics["completion_length_mean"] = float(mx.mean(rollout_batch.completion_lengths.astype(mx.float32)).item())
+        metrics["completion_length_max"] = float(mx.max(rollout_batch.completion_lengths.astype(mx.float32)).item())
+    if rollout_batch.eos_flags is not None and rollout_batch.eos_flags.shape[0] > 0:
+        metrics["eos_rate"] = float(mx.mean(rollout_batch.eos_flags.astype(mx.float32)).item())
     if rollout_batch.truncation_flags is not None and rollout_batch.truncation_flags.shape[0] > 0:
         metrics["truncation_rate"] = float(mx.mean(rollout_batch.truncation_flags.astype(mx.float32)).item())
     if policy_loss is not None:

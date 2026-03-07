@@ -32,6 +32,8 @@ class TinyTokenizer:
     bos_token_id = 2
 
     def encode(self, text: str, add_special_tokens: bool = True):
+        if text == "<|im_end|>":
+            return [9]
         ids = [((ord(char) % 10) + 3) for char in text]
         if add_special_tokens:
             ids = [self.bos_token_id] + ids + [self.eos_token_id]
@@ -41,6 +43,14 @@ class TinyTokenizer:
         if skip_special_tokens:
             ids = [token for token in ids if token not in (self.pad_token_id, self.eos_token_id, self.bos_token_id)]
         return "".join(chr(65 + (token % 26)) for token in ids)
+
+    def convert_tokens_to_ids(self, token: str):
+        if token == "<|im_end|>":
+            return 9
+        return None
+
+    def get_vocab(self):
+        return {"<|im_end|>": 9}
 
 
 def test_collect_rollouts_returns_metadata_and_truncates_prompt_left():
@@ -148,6 +158,46 @@ def test_collect_rollouts_respects_max_seq_length_during_generation():
     assert rollout.completion_lengths.tolist() == [2]
     assert rollout.policy_eval.input_ids.shape == (1, 3)
     assert rollout.truncation_flags.tolist() == [True]
+
+
+def test_collect_rollouts_treats_unsloth_stop_token_as_terminal():
+    from mlx_tune._rl_runtime import collect_rollouts, sample_completion
+
+    tokenizer = TinyTokenizer()
+    tokenizer._unsloth_stop_token = "<|im_end|>"
+    model = ScriptedModel({2: 9, 3: 7, 4: 7, "default": 7})
+
+    sampled = sample_completion(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_ids=[3, 4],
+        max_tokens=4,
+        temperature=0.0,
+    )
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "ab",
+                "prompt_ids": [3, 4],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 1,
+            "temperature": 0.0,
+            "max_completion_length": 4,
+        },
+    )
+
+    assert sampled["completion_ids"] == [9]
+    assert sampled["eos_flag"] is True
+    assert sampled["truncation_flag"] is False
+    assert rollout.completion_ids == [[9]]
+    assert rollout.eos_flags.tolist() == [True]
+    assert rollout.truncation_flags.tolist() == [False]
 
 
 def test_score_policy_matches_public_logprob_helpers():
@@ -547,3 +597,29 @@ def test_token_budget_chunking_matches_unchunked_policy_and_value_scoring():
     assert mx.allclose(full_scores.summed_logprobs, chunked_scores.summed_logprobs)
     assert mx.allclose(full_scores.token_logprobs, chunked_scores.token_logprobs)
     assert mx.allclose(full_values, chunked_values)
+
+
+def test_summarize_rollout_metrics_includes_completion_and_stop_stats():
+    from mlx_tune._rl_runtime import collect_rollouts, summarize_rollout_metrics
+
+    tokenizer = TinyTokenizer()
+    tokenizer._unsloth_stop_token = "<|im_end|>"
+    rollout = collect_rollouts(
+        policy=ScriptedModel({2: 9, 3: 7, 4: 7, "default": 7}),
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {"sample_index": 0, "prompt": "ab", "prompt_ids": [3, 4], "reward_context": "x"},
+            {"sample_index": 1, "prompt": "cd", "prompt_ids": [5, 6], "reward_context": "y"},
+        ],
+        sampling_config={"num_generations": 1, "temperature": 0.0, "max_completion_length": 4},
+    )
+    rollout.rewards = mx.array([1.0, 0.0], dtype=mx.float32)
+
+    metrics = summarize_rollout_metrics(rollout, policy_loss=0.5)
+
+    assert metrics["completion_length_mean"] == 1.0
+    assert metrics["completion_length_max"] == 1.0
+    assert metrics["eos_rate"] == 1.0
+    assert metrics["truncation_rate"] == 0.0
+    assert metrics["reward_mean"] == 0.5
+    assert metrics["policy_loss"] == 0.5

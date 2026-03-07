@@ -344,6 +344,11 @@ class _RLTrainerBase:
             "value_loss",
             "reward_loss",
             "reward_mean",
+            "completion_length_mean",
+            "completion_length_max",
+            "eos_rate",
+            "truncation_rate",
+            "kl_to_reference_mean",
             "preference_win_rate",
         ]
         parts = [f"step={row['step']}"]
