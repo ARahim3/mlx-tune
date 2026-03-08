@@ -586,17 +586,25 @@ def _batched_last_token_logits(
         )
     )
     if use_cache:
-        inputs = mx.array(input_rows if cache_state is None else [[row[-1]] for row in input_rows])
+        prefill = cache_state is None
+        if prefill:
+            try:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                cache_state = make_prompt_cache(getattr(policy, "model", policy))
+            except Exception:
+                cache_state = None
+        inputs = mx.array(input_rows if prefill else [[row[-1]] for row in input_rows])
         try:
             if hasattr(policy, "forward_with_cache"):
                 outputs = policy.forward_with_cache(inputs, cache=cache_state)
-                if isinstance(outputs, tuple) and len(outputs) == 2:
-                    logits, next_cache = outputs
-                    return logits[:, -1, :], next_cache
-            outputs = policy(inputs, cache=cache_state)
+            else:
+                outputs = policy(inputs, cache=cache_state)
             if isinstance(outputs, tuple) and len(outputs) == 2:
                 logits, next_cache = outputs
                 return logits[:, -1, :], next_cache
+            if hasattr(outputs, "shape"):
+                return outputs[:, -1, :], cache_state
         except Exception:
             cache_state = False
 

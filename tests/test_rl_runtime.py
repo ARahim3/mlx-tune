@@ -26,6 +26,28 @@ class ScriptedModel(nn.Module):
         return logits
 
 
+class CacheOnlyScriptedModel(nn.Module):
+    def __init__(self, next_tokens, vocab_size: int = 16):
+        super().__init__()
+        self.next_tokens = dict(next_tokens)
+        self.vocab_size = vocab_size
+        self.calls = []
+
+    def make_cache(self):
+        return [{"steps": 0}]
+
+    def __call__(self, x, cache=None):
+        if cache is None:
+            raise ValueError("cache is required")
+        batch, seq_len = x.shape
+        cache[0]["steps"] += 1
+        self.calls.append((seq_len, cache[0]["steps"]))
+        logits = mx.full((batch, seq_len, self.vocab_size), -100.0)
+        token_id = self.next_tokens.get(cache[0]["steps"], self.next_tokens.get("default", 0))
+        logits[:, -1, token_id] = 100.0
+        return logits
+
+
 class TinyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
@@ -198,6 +220,36 @@ def test_collect_rollouts_treats_unsloth_stop_token_as_terminal():
     assert rollout.completion_ids == [[9]]
     assert rollout.eos_flags.tolist() == [True]
     assert rollout.truncation_flags.tolist() == [False]
+
+
+def test_collect_rollouts_initializes_and_reuses_prompt_cache_for_logits_only_models():
+    from mlx_tune._rl_runtime import collect_rollouts
+
+    tokenizer = TinyTokenizer()
+    model = CacheOnlyScriptedModel({1: 5, 2: 1, "default": 1})
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "ab",
+                "prompt_ids": [3, 4],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 2,
+            "temperature": 0.0,
+            "max_completion_length": 4,
+            "generation_batch_size": 2,
+        },
+    )
+
+    assert rollout.completion_ids == [[5, 1], [5, 1]]
+    assert rollout.eos_flags.tolist() == [True, True]
+    assert model.calls == [(2, 1), (1, 2)]
 
 
 def test_score_policy_matches_public_logprob_helpers():
