@@ -1,3 +1,5 @@
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -879,3 +881,37 @@ def test_summarize_rollout_metrics_includes_completion_and_stop_stats():
     assert metrics["truncation_rate"] == 0.0
     assert metrics["reward_mean"] == 0.5
     assert metrics["policy_loss"] == 0.5
+
+
+def test_summarize_rollout_metrics_normalizes_kl_by_completion_length():
+    from mlx_tune._rl_runtime import RolloutBatch, summarize_rollout_metrics
+
+    rollout = RolloutBatch(
+        prompt_ids=[[1, 2], [3, 4]],
+        completion_ids=[[5], [6]],
+        prompt_texts=["p1", "p2"],
+        original_prompt_texts=None,
+        completion_texts=["c1", "c2"],
+        reward_contexts=["x", "y"],
+        prompt_lengths=mx.array([2, 2], dtype=mx.int32),
+        completion_lengths=mx.array([10, 1000], dtype=mx.int32),
+        sampled_token_logprobs=mx.zeros((2, 1), dtype=mx.float32),
+        rollout_logprobs=mx.array([0.0, 0.0], dtype=mx.float32),
+        eos_flags=mx.array([True, True]),
+        truncation_flags=mx.array([False, False]),
+        prompt_group_indices=mx.array([0, 1], dtype=mx.int32),
+        policy_eval=None,
+        sample_indices=None,
+        sampled_token_logits=None,
+        token_entropies=None,
+        old_logprobs=None,
+        rewards=mx.array([1.0, 0.0], dtype=mx.float32),
+        reference_logprobs=mx.array([-10.0, -1000.0], dtype=mx.float32),
+        returns=None,
+        advantages=None,
+    )
+
+    metrics = summarize_rollout_metrics(rollout)
+
+    assert abs(metrics["logprob_delta_per_token_mean"] - 1.0) < 1e-6
+    assert abs(metrics["kl_to_reference_mean"] - (math.e - 2.0)) < 1e-5

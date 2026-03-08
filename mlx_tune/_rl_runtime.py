@@ -1194,9 +1194,19 @@ def summarize_rollout_metrics(
         )
         metrics["logprob_delta_mean"] = float(mx.mean(log_ratio).item())
         metrics["logprob_delta_per_token_mean"] = float(mx.mean(log_ratio / completion_lengths).item())
-        kl_values = kl_against_reference(
+        normalized_policy = normalize_logprobs(
             rollout_batch.rollout_logprobs.astype(mx.float32),
+            completion_lengths,
+            mode="mean",
+        )
+        normalized_reference = normalize_logprobs(
             rollout_batch.reference_logprobs.astype(mx.float32),
+            completion_lengths,
+            mode="mean",
+        )
+        kl_values = kl_against_reference(
+            normalized_policy,
+            normalized_reference,
         )
         kl_mean = float(mx.mean(kl_values).item())
         if kl_mean != float("inf"):
