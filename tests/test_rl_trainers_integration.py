@@ -152,6 +152,12 @@ def test_format_metric_summary_includes_rollout_length_and_stop_stats():
         "train/eos_rate": 0.75,
         "train/truncation_rate": 0.25,
         "train/kl_to_reference_mean": 0.1,
+        "train/rollout_generate_wall": 4.5,
+        "train/reward_eval_wall": 0.2,
+        "train/reference_score_wall": 11.0,
+        "train/returns_wall": 0.01,
+        "train/policy_update_wall": 24.0,
+        "train/policy_update_steps": 3.0,
     }
 
     summary = trainer._format_metric_summary(row)
@@ -159,7 +165,10 @@ def test_format_metric_summary_includes_rollout_length_and_stop_stats():
     assert summary == (
         "step=3 | policy_loss=0.2500 | reward_mean=1.0000 | "
         "completion_length_mean=12.0000 | completion_length_max=32.0000 | "
-        "eos_rate=0.7500 | truncation_rate=0.2500 | kl_to_reference_mean=0.1000"
+        "eos_rate=0.7500 | truncation_rate=0.2500 | kl_to_reference_mean=0.1000 | "
+        "rollout_generate_wall=4.5000 | reward_eval_wall=0.2000 | "
+        "reference_score_wall=11.0000 | returns_wall=0.0100 | "
+        "policy_update_wall=24.0000 | policy_update_steps=3.0000"
     )
 
 

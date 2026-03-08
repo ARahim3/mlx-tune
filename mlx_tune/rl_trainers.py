@@ -15,6 +15,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import subprocess
+import time
 import warnings
 
 import mlx.core as mx
@@ -349,6 +350,12 @@ class _RLTrainerBase:
             "eos_rate",
             "truncation_rate",
             "kl_to_reference_mean",
+            "rollout_generate_wall",
+            "reward_eval_wall",
+            "reference_score_wall",
+            "returns_wall",
+            "policy_update_wall",
+            "policy_update_steps",
             "preference_win_rate",
         ]
         parts = [f"step={row['step']}"]
@@ -2627,6 +2634,7 @@ class GRPOTrainer(_RLTrainerBase):
         self.prompt_dataset_cursor = 0
         self.rollout_dataset_cursor = 0
         self._last_rollout_batch: Optional[RolloutBatch] = None
+        self._last_rollout_phase_metrics: Dict[str, float] = {}
         self._init_native_state()
 
         if self.reward_model is None and self.reward_fn is None:
@@ -2773,8 +2781,13 @@ class GRPOTrainer(_RLTrainerBase):
     ) -> RolloutBatch:
         generations = self.num_generations if num_generations is None else num_generations
         reward_evaluator = self._resolve_reward_evaluator()
+        rollout_generate_started_at = time.perf_counter()
+        reward_eval_wall = 0.0
+        reference_score_wall = 0.0
+        returns_wall = 0.0
         if prompt_samples and "completion" in prompt_samples[0]:
             rollout_batch = self._collect_fixed_rollout_batch(prompt_samples, cache_key=cache_key)
+            rollout_generate_wall = time.perf_counter() - rollout_generate_started_at
         else:
             rollout_batch = collect_rollouts(
                 _actual_model(self.model),
@@ -2790,16 +2803,23 @@ class GRPOTrainer(_RLTrainerBase):
                 reward_evaluator=None,
                 collect_sample_stats=self.entropy_bonus != 0.0,
             )
+            rollout_generate_wall = time.perf_counter() - rollout_generate_started_at
             if self.reward_source == "offline":
                 raise ValueError("reward_source='offline' requires rollout samples with completion/reward fields.")
+            reward_eval_started_at = time.perf_counter()
             reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+            reward_eval_wall += time.perf_counter() - reward_eval_started_at
             rollout_batch.rewards = reward_batch.scalar_rewards
         if prompt_samples and "completion" in prompt_samples[0]:
             if self.reward_source == "online":
+                reward_eval_started_at = time.perf_counter()
                 reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                reward_eval_wall += time.perf_counter() - reward_eval_started_at
                 rollout_batch.rewards = reward_batch.scalar_rewards
             elif self.reward_source == "hybrid":
+                reward_eval_started_at = time.perf_counter()
                 reward_batch = evaluate_rewards(rollout_batch, reward_evaluator)
+                reward_eval_wall += time.perf_counter() - reward_eval_started_at
                 rollout_batch.rewards = rollout_batch.rewards + reward_batch.scalar_rewards
         if rollout_batch.rewards is None:
             rollout_batch.rewards = mx.zeros((len(rollout_batch.prompt_ids),), dtype=mx.float32)
@@ -2812,26 +2832,36 @@ class GRPOTrainer(_RLTrainerBase):
                 rollout_batch.prompt_group_indices,
                 self.reward_normalization,
             )
+        reference_score_started_at = time.perf_counter()
         rollout_batch = score_rollout_references(
             _actual_model(self.reference_policy.model) if self.reference_policy is not None else None,
             rollout_batch,
             batch_size=_rollout_score_batch_size(self, num_generations=generations),
             token_budget=self.score_chunk_size,
         )
+        reference_score_wall = time.perf_counter() - reference_score_started_at
         if self.mask_truncated_completions:
             rollout_batch = _apply_truncation_mask_to_rollout(rollout_batch)
         returns_mode = "rloo" if self.advantage_mode == "rloo" else "group_zscore"
         if returns_mode == "group_zscore" and self.scale_rewards is False:
             returns_mode = "group_center"
+        returns_started_at = time.perf_counter()
         returns, advantages = compute_returns_and_advantages(
             rewards=rollout_batch.rewards,
             prompt_group_indices=rollout_batch.prompt_group_indices,
             mode=returns_mode,
         )
+        returns_wall = time.perf_counter() - returns_started_at
         rollout_batch.returns = returns
         rollout_batch.advantages = advantages
         rollout_batch.policy_eval.returns = returns
         rollout_batch.policy_eval.advantages = advantages
+        self._last_rollout_phase_metrics = {
+            "rollout_generate_wall": float(rollout_generate_wall),
+            "reward_eval_wall": float(reward_eval_wall),
+            "reference_score_wall": float(reference_score_wall),
+            "returns_wall": float(returns_wall),
+        }
         return rollout_batch
 
     def _evaluate_rollout_metrics(self) -> Dict[str, Any]:
@@ -2993,6 +3023,7 @@ class GRPOTrainer(_RLTrainerBase):
             effective_beta = self._effective_kl_beta(rollout_batch)
             step_loss = 0.0
             step_updates = 0
+            policy_update_started_at = time.perf_counter()
             for _ in range(max(1, self.minibatch_reuse_steps)):
                 minibatches = assemble_minibatches(
                     rollout_batch.policy_eval,
@@ -3007,13 +3038,19 @@ class GRPOTrainer(_RLTrainerBase):
                     mx.eval(actual_model.parameters(), optimizer.state)
                     step_loss += loss.item()
                     step_updates += 1
+            policy_update_wall = time.perf_counter() - policy_update_started_at
 
             last_loss = step_loss / max(1, step_updates)
             running_loss += last_loss
             self.global_step += 1
             train_row = self._record_metrics(
                 "train",
-                summarize_rollout_metrics(rollout_batch, policy_loss=last_loss),
+                {
+                    **summarize_rollout_metrics(rollout_batch, policy_loss=last_loss),
+                    **self._last_rollout_phase_metrics,
+                    "policy_update_wall": float(policy_update_wall),
+                    "policy_update_steps": float(step_updates),
+                },
             )
 
             if self.global_step % self.logging_steps == 0:
