@@ -182,6 +182,40 @@ def test_collect_rollouts_can_capture_sample_stats_and_truncation():
     assert rollout.token_entropies.shape == (1, 2)
 
 
+def test_collect_rollouts_sampled_logprobs_match_rescored_completion_logprobs():
+    from mlx_tune._rl_runtime import collect_rollouts, score_policy
+
+    tokenizer = TinyTokenizer()
+    mx.random.seed(0)
+    model = TinyModel()
+    mx.eval(model.parameters())
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "abc",
+                "prompt_ids": [tokenizer.bos_token_id, 3, 4, 5],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 4,
+            "temperature": 1.0,
+            "max_completion_length": 5,
+            "max_seq_length": 16,
+        },
+    )
+
+    rescored = score_policy(model, rollout.policy_eval, mode="completion", temperature=1.0)
+    masked_rescored = rescored.token_logprobs * rollout.policy_eval.token_mask.astype(mx.float32)
+
+    assert mx.allclose(rollout.rollout_logprobs, rescored.summed_logprobs, atol=1e-5)
+    assert mx.allclose(rollout.policy_eval.old_token_logprobs, masked_rescored, atol=1e-5)
+
+
 def test_collect_rollouts_respects_max_seq_length_during_generation():
     from mlx_tune._rl_runtime import collect_rollouts
 

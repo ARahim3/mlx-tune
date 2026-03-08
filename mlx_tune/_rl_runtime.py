@@ -701,10 +701,7 @@ def collect_rollouts(
                 log_probs = nn.log_softmax(scaled, axis=-1)
                 probs = mx.softmax(scaled, axis=-1)
                 entropies = -mx.sum(probs * log_probs, axis=-1)
-                next_tokens = []
-                for row_index in range(logits.shape[0]):
-                    sampled = mx.random.categorical(log_probs[row_index:row_index + 1])
-                    next_tokens.append(int(sampled.item()))
+                next_tokens = [int(value) for value in mx.random.categorical(log_probs).tolist()]
             else:
                 scaled = logits
                 log_probs = nn.log_softmax(logits, axis=-1)
