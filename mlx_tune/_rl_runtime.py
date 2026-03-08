@@ -629,7 +629,10 @@ def collect_rollouts(
     temperature = float(sampling_config.get("temperature", 0.7))
     max_prompt_length = None
     if max_seq_length is not None:
-        max_prompt_length = max(1, int(max_seq_length) - max_completion_length)
+        # Preserve as much prompt context as possible and spend only the
+        # remaining budget on completion tokens. Reserving the full requested
+        # completion cap up front can collapse the prompt to an unusable suffix.
+        max_prompt_length = max(0, int(max_seq_length) - 1)
 
     generation_batch_size = int(sampling_config.get("generation_batch_size") or 0)
     generation_batch_size = max(1, generation_batch_size or (len(prompt_samples) * max(1, num_generations)))

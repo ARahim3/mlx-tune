@@ -131,18 +131,18 @@ def test_collect_rollouts_returns_metadata_and_truncates_prompt_left():
         },
     )
 
-    assert rollout.prompt_ids == [[7, 8], [7, 8]]
-    assert rollout.prompt_lengths.tolist() == [2, 2]
-    assert rollout.prompt_texts == [tokenizer.decode([7, 8]), tokenizer.decode([7, 8])]
+    assert rollout.prompt_ids == [[4, 5, 6, 7, 8], [4, 5, 6, 7, 8]]
+    assert rollout.prompt_lengths.tolist() == [5, 5]
+    assert rollout.prompt_texts == [tokenizer.decode([4, 5, 6, 7, 8]), tokenizer.decode([4, 5, 6, 7, 8])]
     assert rollout.original_prompt_texts == ["abcdef", "abcdef"]
-    assert rollout.completion_ids == [[5, 1], [5, 1]]
-    assert rollout.completion_lengths.tolist() == [2, 2]
-    assert rollout.sampled_token_logprobs.shape == (2, 2)
+    assert rollout.completion_ids == [[1], [1]]
+    assert rollout.completion_lengths.tolist() == [1, 1]
+    assert rollout.sampled_token_logprobs.shape == (2, 1)
     assert rollout.eos_flags.tolist() == [True, True]
     assert rollout.truncation_flags.tolist() == [False, False]
     assert rollout.prompt_group_indices.tolist() == [0, 0]
     assert rollout.sample_indices.tolist() == [7, 7]
-    assert rollout.policy_eval.input_ids.shape == (2, 4)
+    assert rollout.policy_eval.input_ids.shape == (2, 6)
     assert mx.allclose(
         rollout.rollout_logprobs,
         rollout.sampled_token_logprobs.sum(axis=-1),
@@ -207,9 +207,42 @@ def test_collect_rollouts_respects_max_seq_length_during_generation():
         },
     )
 
-    assert rollout.prompt_lengths.tolist() == [1]
-    assert rollout.completion_lengths.tolist() == [2]
+    assert rollout.prompt_lengths.tolist() == [2]
+    assert rollout.completion_lengths.tolist() == [1]
     assert rollout.policy_eval.input_ids.shape == (1, 3)
+    assert rollout.truncation_flags.tolist() == [True]
+
+
+def test_collect_rollouts_reduces_completion_budget_before_collapsing_prompt():
+    from mlx_tune._rl_runtime import collect_rollouts
+
+    tokenizer = TinyTokenizer()
+    model = ScriptedModel({6: 5, 7: 6, "default": 6})
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "abcdef",
+                "prompt_ids": [3, 4, 5, 6, 7, 8],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 1,
+            "temperature": 0.0,
+            "max_completion_length": 6,
+            "max_seq_length": 6,
+        },
+    )
+
+    assert rollout.prompt_ids == [[4, 5, 6, 7, 8]]
+    assert rollout.prompt_lengths.tolist() == [5]
+    assert rollout.completion_ids == [[6]]
+    assert rollout.completion_lengths.tolist() == [1]
+    assert rollout.policy_eval.input_ids.shape == (1, 6)
     assert rollout.truncation_flags.tolist() == [True]
 
 
@@ -471,8 +504,8 @@ def test_reward_payload_exposes_effective_and_original_prompt_when_truncated():
         lambda payload: captured.append(payload) or float(payload["completion_length"]),
     )
 
-    assert captured[0]["prompt_ids"] == [7, 8]
-    assert captured[0]["prompt_text"] == tokenizer.decode([7, 8])
+    assert captured[0]["prompt_ids"] == [6, 7, 8]
+    assert captured[0]["prompt_text"] == tokenizer.decode([6, 7, 8])
     assert captured[0]["original_prompt_text"] == "abcdef"
 
 
