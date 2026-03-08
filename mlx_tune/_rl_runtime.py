@@ -669,10 +669,22 @@ def collect_rollouts(
     for start in range(0, len(expanded_samples), generation_batch_size):
         chunk = expanded_samples[start:start + generation_batch_size]
         cache_state: Any = None
+        cache_batch_size: int | None = None
         for _ in range(max_completion_length):
             active_rows = [row for row in chunk if not row["done"]]
             if not active_rows:
                 break
+
+            active_batch_size = len(active_rows)
+            if (
+                cache_state not in (None, False)
+                and cache_batch_size is not None
+                and active_batch_size != cache_batch_size
+            ):
+                # MLX-LM prompt caches are batch-shaped. If some rollouts finish
+                # early, rebuild the cache for the smaller active batch instead
+                # of falling back to uncached full-prefix recompute.
+                cache_state = None
 
             logits, cache_state = _batched_last_token_logits(
                 policy,
@@ -680,6 +692,7 @@ def collect_rollouts(
                 pad_id=pad_id,
                 cache_state=cache_state,
             )
+            cache_batch_size = active_batch_size if cache_state is not False else None
             if temperature > 0:
                 scaled = logits / temperature
                 log_probs = nn.log_softmax(scaled, axis=-1)
