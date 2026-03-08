@@ -79,6 +79,41 @@ class BatchSizedCacheScriptedModel(nn.Module):
         return logits
 
 
+class BatchSensitiveCacheModel(nn.Module):
+    def __init__(self, vocab_size: int = 16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.cache_calls = []
+
+    def make_cache(self):
+        return [{"steps": 0}]
+
+    def _token_for_sequence(self, row):
+        last_token = int(row[-1]) if len(row) else 0
+        if last_token == 5:
+            return 1
+        return 5
+
+    def __call__(self, x, cache=None):
+        batch, seq_len = x.shape
+        logits = mx.full((batch, seq_len, self.vocab_size), -100.0)
+        if cache is None:
+            for row_index in range(batch):
+                row = x[row_index].tolist()
+                for position in range(seq_len):
+                    logits[row_index, position, self._token_for_sequence(row[: position + 1])] = 100.0
+            return logits
+
+        cache[0]["steps"] += 1
+        self.cache_calls.append((batch, seq_len, cache[0]["steps"]))
+        for row_index in range(batch):
+            token_id = self._token_for_sequence(x[row_index].tolist())
+            if batch > 1 and seq_len == 1:
+                token_id = 7
+            logits[row_index, -1, token_id] = 100.0
+        return logits
+
+
 class TinyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
@@ -347,7 +382,7 @@ def test_collect_rollouts_initializes_and_reuses_prompt_cache_for_logits_only_mo
 
     assert rollout.completion_ids == [[5, 1], [5, 1]]
     assert rollout.eos_flags.tolist() == [True, True]
-    assert model.calls == [(2, 1), (1, 2)]
+    assert model.calls == [(2, 1), (2, 1), (1, 2), (1, 2)]
 
 
 def test_collect_rollouts_rebuilds_prompt_cache_when_active_batch_shrinks():
@@ -381,10 +416,44 @@ def test_collect_rollouts_rebuilds_prompt_cache_when_active_batch_shrinks():
         },
     )
 
-    assert rollout.completion_ids == [[1], [5, 1]]
+    assert rollout.completion_ids == [[1], [1]]
     assert rollout.eos_flags.tolist() == [True, True]
     assert rollout.truncation_flags.tolist() == [False, False]
-    assert model.calls == [(2, 2, 1), (1, 3, 1)]
+    assert model.calls == [(1, 2, 1), (1, 2, 1)]
+
+
+def test_collect_rollouts_uses_per_row_cache_to_preserve_rescored_logprobs():
+    from mlx_tune._rl_runtime import collect_rollouts, score_policy
+
+    tokenizer = TinyTokenizer()
+    model = BatchSensitiveCacheModel()
+
+    rollout = collect_rollouts(
+        policy=model,
+        tokenizer=tokenizer,
+        prompt_samples=[
+            {
+                "sample_index": 0,
+                "prompt": "ab",
+                "prompt_ids": [3, 4],
+                "reward_context": "ctx",
+            }
+        ],
+        sampling_config={
+            "num_generations": 2,
+            "temperature": 0.0,
+            "max_completion_length": 3,
+            "generation_batch_size": 2,
+        },
+    )
+
+    rescored = score_policy(model, rollout.policy_eval, mode="completion", temperature=1.0)
+    masked_rescored = rescored.token_logprobs * rollout.policy_eval.token_mask.astype(mx.float32)
+
+    assert rollout.completion_ids == [[5, 1], [5, 1]]
+    assert all(batch == 1 for batch, _, _ in model.cache_calls)
+    assert mx.allclose(rollout.rollout_logprobs, rescored.summed_logprobs, atol=1e-5)
+    assert mx.allclose(rollout.policy_eval.old_token_logprobs, masked_rescored, atol=1e-5)
 
 
 def test_score_policy_matches_public_logprob_helpers():

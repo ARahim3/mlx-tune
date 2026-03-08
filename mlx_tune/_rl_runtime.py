@@ -579,12 +579,17 @@ def _batched_last_token_logits(
         call_signature = None
     use_cache = (
         cache_state is not False
+        and len(input_rows) == 1
         and len(set(lengths)) == 1
         and (
             hasattr(policy, "forward_with_cache")
             or (call_signature is not None and "cache" in call_signature.parameters)
         )
     )
+    # Batched KV-cache decoding can preserve token choices while still
+    # producing incorrect per-token logprobs on real Qwen-family models.
+    # GRPO relies on those sampled logprobs matching a fresh rescore of the
+    # same completion, so shared cache reuse is limited to single-row decoding.
     if use_cache:
         prefill = cache_state is None
         if prefill:
@@ -666,36 +671,27 @@ def collect_rollouts(
                     "done": generation_budget == 0,
                     "max_completion_tokens": generation_budget,
                     "hit_length_limit": generation_budget == 0,
+                    "cache_state": None,
                 }
             )
 
     for start in range(0, len(expanded_samples), generation_batch_size):
         chunk = expanded_samples[start:start + generation_batch_size]
-        cache_state: Any = None
-        cache_batch_size: int | None = None
         for _ in range(max_completion_length):
             active_rows = [row for row in chunk if not row["done"]]
             if not active_rows:
                 break
 
-            active_batch_size = len(active_rows)
-            if (
-                cache_state not in (None, False)
-                and cache_batch_size is not None
-                and active_batch_size != cache_batch_size
-            ):
-                # MLX-LM prompt caches are batch-shaped. If some rollouts finish
-                # early, rebuild the cache for the smaller active batch instead
-                # of falling back to uncached full-prefix recompute.
-                cache_state = None
-
-            logits, cache_state = _batched_last_token_logits(
-                policy,
-                [row["generated_ids"] for row in active_rows],
-                pad_id=pad_id,
-                cache_state=cache_state,
-            )
-            cache_batch_size = active_batch_size if cache_state is not False else None
+            row_logits = []
+            for row in active_rows:
+                logits, row["cache_state"] = _batched_last_token_logits(
+                    policy,
+                    [row["generated_ids"]],
+                    pad_id=pad_id,
+                    cache_state=row.get("cache_state"),
+                )
+                row_logits.append(logits)
+            logits = mx.concatenate(row_logits, axis=0) if row_logits else mx.zeros((0, 0), dtype=mx.float32)
             if temperature > 0:
                 scaled = logits / temperature
                 log_probs = nn.log_softmax(scaled, axis=-1)
