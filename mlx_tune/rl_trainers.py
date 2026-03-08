@@ -345,6 +345,8 @@ class _RLTrainerBase:
             "value_loss",
             "reward_loss",
             "reward_mean",
+            "logprob_delta_per_token_mean",
+            "logprob_delta_mean",
             "completion_length_mean",
             "completion_length_max",
             "eos_rate",

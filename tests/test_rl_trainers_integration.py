@@ -147,6 +147,8 @@ def test_format_metric_summary_includes_rollout_length_and_stop_stats():
         "step": 3,
         "train/policy_loss": 0.25,
         "train/reward_mean": 1.0,
+        "train/logprob_delta_per_token_mean": 0.0125,
+        "train/logprob_delta_mean": 0.75,
         "train/completion_length_mean": 12.0,
         "train/completion_length_max": 32.0,
         "train/eos_rate": 0.75,
@@ -164,6 +166,7 @@ def test_format_metric_summary_includes_rollout_length_and_stop_stats():
 
     assert summary == (
         "step=3 | policy_loss=0.2500 | reward_mean=1.0000 | "
+        "logprob_delta_per_token_mean=0.0125 | logprob_delta_mean=0.7500 | "
         "completion_length_mean=12.0000 | completion_length_max=32.0000 | "
         "eos_rate=0.7500 | truncation_rate=0.2500 | kl_to_reference_mean=0.1000 | "
         "rollout_generate_wall=4.5000 | reward_eval_wall=0.2000 | "
@@ -1409,7 +1412,19 @@ def test_on_policy_trainers_with_same_seed_are_reproducible(tmp_path, tokenizer,
     trainer_a.train()
     trainer_b.train()
 
-    assert trainer_a.metrics_history == trainer_b.metrics_history
+    def _strip_timing(metrics_history):
+        cleaned = []
+        for row in metrics_history:
+            cleaned.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if not key.endswith("_wall")
+                }
+            )
+        return cleaned
+
+    assert _strip_timing(trainer_a.metrics_history) == _strip_timing(trainer_b.metrics_history)
     assert trainer_a._last_rollout_batch is not None
     assert trainer_b._last_rollout_batch is not None
     assert trainer_a._last_rollout_batch.completion_ids == trainer_b._last_rollout_batch.completion_ids

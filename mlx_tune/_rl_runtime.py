@@ -1194,11 +1194,20 @@ def summarize_rollout_metrics(
         metrics["reward_mean"] = float(mx.mean(rollout_batch.rewards).item())
         metrics["reward_std"] = float(mx.std(rollout_batch.rewards).item())
     if rollout_batch.reference_logprobs is not None and rollout_batch.rollout_logprobs.shape[0] > 0:
+        completion_lengths = mx.maximum(rollout_batch.completion_lengths.astype(mx.float32), 1.0)
+        log_ratio = (
+            rollout_batch.rollout_logprobs.astype(mx.float32)
+            - rollout_batch.reference_logprobs.astype(mx.float32)
+        )
+        metrics["logprob_delta_mean"] = float(mx.mean(log_ratio).item())
+        metrics["logprob_delta_per_token_mean"] = float(mx.mean(log_ratio / completion_lengths).item())
         kl_values = kl_against_reference(
             rollout_batch.rollout_logprobs.astype(mx.float32),
             rollout_batch.reference_logprobs.astype(mx.float32),
         )
-        metrics["kl_to_reference_mean"] = float(mx.mean(kl_values).item())
+        kl_mean = float(mx.mean(kl_values).item())
+        if kl_mean != float("inf"):
+            metrics["kl_to_reference_mean"] = kl_mean
     if rollout_batch.token_entropies is not None and rollout_batch.completion_lengths.shape[0] > 0:
         entropy_mask = length_mask(
             rollout_batch.completion_lengths,
