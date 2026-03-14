@@ -15,7 +15,15 @@ Supported Training Methods:
 
 __version__ = "0.4.2"  # VLM training fixes: response-only loss, gradient accumulation, inference
 
-from mlx_tune.model import FastLanguageModel
+from mlx_tune.model import (
+    FastLanguageModel,
+    ReferencePolicy,
+    RLModelRoles,
+    RewardModel,
+    ValueModel,
+    build_value_model,
+    create_rl_model_roles,
+)
 from mlx_tune.trainer import (
     prepare_dataset,
     format_chat_template,
@@ -25,25 +33,44 @@ from mlx_tune.trainer import (
     get_training_config,
 )
 from mlx_tune.sft_trainer import SFTTrainer, SFTConfig, TrainingArguments
+from mlx_tune.rl_api import (
+    RLCheckpointBundle,
+    PreparedRLDataset,
+    prepare_rl_dataset,
+    build_reference_policy,
+    build_reward_model,
+    create_reward_function,
+    resume_from_checkpoint,
+)
 
 # RL Trainers
 from mlx_tune.rl_trainers import (
+    RewardTrainer,
+    RewardConfig,
     DPOTrainer,
     DPOConfig,
     ORPOTrainer,
     ORPOConfig,
     GRPOTrainer,
     GRPOConfig,
+    PPOTrainer,
+    PPOConfig,
+    OnlineDPOTrainer,
+    OnlineDPOConfig,
+    KTOConfig,
+    SimPOConfig,
     KTOTrainer,
     SimPOTrainer,
+    prepare_reward_dataset,
     prepare_preference_dataset,
-    create_reward_function,
+    score_reward_model,
 )
 
 # Loss functions for custom training
 from mlx_tune.losses import (
     compute_log_probs,
     compute_log_probs_with_lengths,
+    compute_completion_log_probs,
     dpo_loss,
     orpo_loss,
     kto_loss,
@@ -52,6 +79,16 @@ from mlx_tune.losses import (
     grpo_loss,
     grpo_batch_loss,
     compute_reference_logprobs,
+    pairwise_reward_loss,
+    reward_model_pairwise_loss,
+    reward_model_regression_loss,
+    value_regression_loss,
+    value_model_regression_loss,
+    scalar_loss_metrics,
+    pairwise_ranking_accuracy,
+    precompute_preference_reference_logprobs,
+    precompute_kto_reference_logprobs,
+    ppo_sequence_loss,
 )
 
 # Vision Language Models
@@ -95,10 +132,24 @@ from mlx_tune.chat_templates import (
     HFDatasetConfig,
     load_dataset_with_config,
 )
+from mlx_tune.trl_compat import PatchFastRL
 
 __all__ = [
     # Core
     "FastLanguageModel",
+    "ReferencePolicy",
+    "RLModelRoles",
+    "RewardModel",
+    "ValueModel",
+    "build_reference_policy",
+    "build_reward_model",
+    "build_value_model",
+    "create_rl_model_roles",
+    "PreparedRLDataset",
+    "RLCheckpointBundle",
+    "prepare_rl_dataset",
+    "resume_from_checkpoint",
+    "PatchFastRL",
     "__version__",
     # SFT Training
     "SFTTrainer",
@@ -111,6 +162,14 @@ __all__ = [
     "ORPOConfig",
     "GRPOTrainer",
     "GRPOConfig",
+    "RewardTrainer",
+    "RewardConfig",
+    "PPOTrainer",
+    "PPOConfig",
+    "OnlineDPOTrainer",
+    "OnlineDPOConfig",
+    "KTOConfig",
+    "SimPOConfig",
     "KTOTrainer",
     "SimPOTrainer",
     # Vision Models
@@ -122,6 +181,7 @@ __all__ = [
     # Loss Functions
     "compute_log_probs",
     "compute_log_probs_with_lengths",
+    "compute_completion_log_probs",
     "dpo_loss",
     "orpo_loss",
     "kto_loss",
@@ -130,8 +190,19 @@ __all__ = [
     "grpo_loss",
     "grpo_batch_loss",
     "compute_reference_logprobs",
+    "pairwise_reward_loss",
+    "reward_model_pairwise_loss",
+    "reward_model_regression_loss",
+    "value_regression_loss",
+    "value_model_regression_loss",
+    "scalar_loss_metrics",
+    "pairwise_ranking_accuracy",
+    "precompute_preference_reference_logprobs",
+    "precompute_kto_reference_logprobs",
+    "ppo_sequence_loss",
     # Utilities
     "prepare_dataset",
+    "prepare_reward_dataset",
     "prepare_preference_dataset",
     "format_chat_template",
     "create_training_data",
@@ -139,6 +210,7 @@ __all__ = [
     "export_to_gguf",
     "get_training_config",
     "create_reward_function",
+    "score_reward_model",
     "load_vlm_dataset",
     # Chat Templates and Dataset Formatting
     "detect_dataset_format",

@@ -1,220 +1,377 @@
 """
-Unit tests for loss functions in mlx_tune.losses
+Unit tests for mlx_tune.losses.
 """
 
-import pytest
 import mlx.core as mx
 import mlx.nn as nn
 
 
-class TestComputeLogProbs:
-    """Test log probability computation."""
+class TinyModel(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.output = nn.Linear(hidden_size, vocab_size)
 
-    def test_compute_log_probs_shape(self):
-        """Test output shape of compute_log_probs."""
-        from mlx_tune.losses import compute_log_probs_with_lengths
-
-        # Create a simple mock model
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        # Test input
-        batch_size = 2
-        seq_len = 10
-        input_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        lengths = mx.array([8, 6])
-
-        log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
-
-        assert log_probs.shape == (batch_size,), f"Expected shape {(batch_size,)}, got {log_probs.shape}"
-
-    def test_compute_log_probs_values(self):
-        """Test that log probs are negative (as expected for probabilities)."""
-        from mlx_tune.losses import compute_log_probs_with_lengths
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        input_ids = mx.random.randint(0, 100, (2, 10))
-        lengths = mx.array([8, 6])
-
-        log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
-        mx.eval(log_probs)
-
-        # Log probabilities should be negative (or zero at maximum)
-        assert mx.all(log_probs <= 0), "Log probabilities should be non-positive"
+    def __call__(self, x):
+        return self.output(self.embedding(x))
 
 
-class TestDPOLoss:
-    """Test DPO loss computation."""
-
-    def test_dpo_loss_shape(self):
-        """Test DPO loss returns scalar."""
-        from mlx_tune.losses import dpo_loss
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        batch_size = 2
-        seq_len = 10
-        chosen_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        rejected_ids = mx.random.randint(0, 100, (batch_size, seq_len))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = dpo_loss(
-            model, chosen_ids, rejected_ids,
-            chosen_lengths, rejected_lengths,
-            beta=0.1
-        )
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
-        assert ntoks.shape == (), f"ntoks should be scalar, got shape {ntoks.shape}"
-
-    def test_dpo_loss_beta_effect(self):
-        """Test that higher beta increases loss magnitude."""
-        from mlx_tune.losses import dpo_loss
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss_low_beta, _ = dpo_loss(model, chosen_ids, rejected_ids,
-                                     chosen_lengths, rejected_lengths, beta=0.01)
-        loss_high_beta, _ = dpo_loss(model, chosen_ids, rejected_ids,
-                                      chosen_lengths, rejected_lengths, beta=1.0)
-
-        mx.eval(loss_low_beta, loss_high_beta)
-
-        # Both losses should be finite
-        assert not mx.isnan(loss_low_beta), "Low beta loss should not be NaN"
-        assert not mx.isnan(loss_high_beta), "High beta loss should not be NaN"
+class TinyTokenizer:
+    eos_token_id = 1
 
 
-class TestORPOLoss:
-    """Test ORPO loss computation."""
-
-    def test_orpo_loss_shape(self):
-        """Test ORPO loss returns scalar."""
-        from mlx_tune.losses import orpo_loss
-
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
-
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = orpo_loss(model, chosen_ids, rejected_ids,
-                                chosen_lengths, rejected_lengths, beta=0.1)
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
+class ConstantRewardModel:
+    def score(self, input_ids, **kwargs):
+        del input_ids, kwargs
+        return mx.array([1.0, 2.0], dtype=mx.float32)
 
 
-class TestSimPOLoss:
-    """Test SimPO loss computation."""
+def test_compute_log_probs_with_lengths_shape():
+    from mlx_tune.losses import compute_log_probs_with_lengths
 
-    def test_simpo_loss_shape(self):
-        """Test SimPO loss returns scalar."""
-        from mlx_tune.losses import simpo_loss
+    model = TinyModel()
+    mx.eval(model.parameters())
 
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
+    input_ids = mx.array([[1, 2, 3, 4], [1, 5, 6, 0]])
+    lengths = mx.array([3, 2])
 
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
-
-        model = MockModel()
-        mx.eval(model.parameters())
-
-        chosen_ids = mx.random.randint(0, 100, (2, 10))
-        rejected_ids = mx.random.randint(0, 100, (2, 10))
-        chosen_lengths = mx.array([8, 7])
-        rejected_lengths = mx.array([9, 6])
-
-        loss, ntoks = simpo_loss(model, chosen_ids, rejected_ids,
-                                  chosen_lengths, rejected_lengths,
-                                  beta=2.0, gamma=0.5)
-
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
+    log_probs = compute_log_probs_with_lengths(model, input_ids, lengths)
+    assert log_probs.shape == (2,)
 
 
-class TestSFTLoss:
-    """Test SFT loss computation."""
+def test_precompute_preference_reference_logprobs_matches_direct():
+    from mlx_tune.losses import (
+        compute_reference_logprobs,
+        precompute_preference_reference_logprobs,
+    )
 
-    def test_sft_loss_shape(self):
-        """Test SFT loss returns scalar."""
-        from mlx_tune.losses import sft_loss
+    model = TinyModel()
+    mx.eval(model.parameters())
 
-        class MockModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = nn.Embedding(100, 64)
-                self.linear = nn.Linear(64, 100)
+    chosen_ids = mx.array([[1, 2, 3, 4], [1, 4, 5, 6]])
+    rejected_ids = mx.array([[1, 3, 2, 4], [1, 6, 5, 4]])
+    chosen_lengths = mx.array([3, 3])
+    rejected_lengths = mx.array([3, 3])
 
-            def __call__(self, x):
-                return self.linear(self.embedding(x))
+    direct = compute_reference_logprobs(
+        model,
+        chosen_ids,
+        rejected_ids,
+        chosen_lengths,
+        rejected_lengths,
+    )
+    batched = precompute_preference_reference_logprobs(
+        model,
+        chosen_ids,
+        rejected_ids,
+        chosen_lengths,
+        rejected_lengths,
+        batch_size=1,
+    )
 
-        model = MockModel()
-        mx.eval(model.parameters())
+    assert mx.allclose(direct[0], batched[0])
+    assert mx.allclose(direct[1], batched[1])
 
-        input_ids = mx.random.randint(0, 100, (2, 10))
-        lengths = mx.array([8, 6])
 
-        loss, ntoks = sft_loss(model, input_ids, lengths)
+def test_precompute_kto_reference_logprobs_matches_direct():
+    from mlx_tune.losses import compute_log_probs_with_lengths, precompute_kto_reference_logprobs
 
-        assert loss.shape == (), f"Loss should be scalar, got shape {loss.shape}"
-        assert loss.item() > 0, "Cross entropy loss should be positive"
+    model = TinyModel()
+    mx.eval(model.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4], [1, 6, 7, 8]])
+    lengths = mx.array([3, 3])
+
+    direct = compute_log_probs_with_lengths(model, input_ids, lengths)
+    cached = precompute_kto_reference_logprobs(model, input_ids, lengths, batch_size=1)
+
+    assert mx.allclose(direct, cached)
+
+
+def test_compute_completion_log_probs_masks_prompt_tokens():
+    from mlx_tune.losses import compute_completion_log_probs
+
+    model = TinyModel()
+    mx.eval(model.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5]])
+    prompt_lengths = mx.array([3])
+    completion_lengths = mx.array([2])
+
+    completion_only = compute_completion_log_probs(
+        model,
+        input_ids,
+        prompt_lengths,
+        completion_lengths,
+    )
+
+    first_completion = compute_completion_log_probs(
+        model,
+        input_ids,
+        mx.array([4]),
+        mx.array([1]),
+    )
+
+    assert completion_only.shape == (1,)
+    assert not mx.allclose(completion_only, first_completion)
+
+
+def test_grpo_recompute_loss_is_finite_and_trainable():
+    from mlx_tune.losses import (
+        compute_completion_log_probs,
+        grpo_recompute_loss,
+    )
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]])
+    prompt_lengths = mx.array([3, 2])
+    completion_lengths = mx.array([2, 3])
+    rollout_logprobs = compute_completion_log_probs(
+        policy,
+        input_ids,
+        prompt_lengths,
+        completion_lengths,
+    )
+    advantages = mx.array([1.0, -0.5])
+
+    loss, ntoks = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+    )
+
+    mx.eval(loss, ntoks)
+    assert loss.shape == ()
+    assert ntoks.item() == 5
+
+
+def test_grpo_recompute_kl_penalty_is_temperature_invariant_when_advantages_are_zero():
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]])
+    prompt_lengths = mx.array([3, 2])
+    completion_lengths = mx.array([2, 3])
+    rollout_logprobs = mx.array([0.0, 0.0], dtype=mx.float32)
+    advantages = mx.array([0.0, 0.0], dtype=mx.float32)
+
+    loss_at_one, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+        temperature=1.0,
+    )
+    loss_at_point_seven, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=rollout_logprobs,
+        advantages=advantages,
+        beta=0.04,
+        temperature=0.7,
+    )
+
+    assert mx.allclose(loss_at_one, loss_at_point_seven)
+
+
+def test_ppo_kl_penalty_is_temperature_invariant_when_advantages_are_zero():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import ppo_sequence_loss
+
+    policy = TinyModel()
+    mx.eval(policy.parameters())
+
+    input_ids = [[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]]
+    prompt_lengths = [3, 2]
+    completion_lengths = [2, 3]
+    batch = make_policy_eval_batch(
+        input_ids,
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        old_logprobs=mx.array([0.0, 0.0], dtype=mx.float32),
+        advantages=mx.array([0.0, 0.0], dtype=mx.float32),
+    )
+    raw_scores = score_policy(policy, batch, mode="completion", temperature=1.0)
+    batch.reference_logprobs = raw_scores.summed_logprobs
+
+    loss_at_one, metrics_at_one = ppo_sequence_loss(
+        model=policy,
+        batch=batch,
+        beta=0.04,
+        temperature=1.0,
+    )
+    loss_at_point_seven, metrics_at_point_seven = ppo_sequence_loss(
+        model=policy,
+        batch=batch,
+        beta=0.04,
+        temperature=0.7,
+    )
+
+    assert mx.allclose(loss_at_one, loss_at_point_seven)
+    assert mx.allclose(metrics_at_one["kl_penalty"], mx.zeros_like(metrics_at_one["kl_penalty"]))
+    assert mx.allclose(
+        metrics_at_point_seven["kl_penalty"],
+        mx.zeros_like(metrics_at_point_seven["kl_penalty"]),
+    )
+
+
+def test_grpo_rollout_and_recompute_logprobs_match_with_temperature():
+    from mlx_tune.losses import compute_completion_log_probs, generate_with_log_probs
+
+    model = TinyModel()
+    tokenizer = TinyTokenizer()
+    mx.eval(model.parameters())
+    mx.random.seed(21)
+
+    prompt_ids = mx.array([2, 7, 8])
+    generated_ids, rollout_token_logprobs = generate_with_log_probs(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_tokens=3,
+        temperature=0.7,
+    )
+    completion_ids = generated_ids[len(prompt_ids):].tolist()
+    input_ids = mx.array([prompt_ids.tolist() + completion_ids])
+
+    recomputed = compute_completion_log_probs(
+        model,
+        input_ids,
+        mx.array([len(prompt_ids)]),
+        mx.array([len(completion_ids)]),
+        temperature=0.7,
+    )
+
+    assert mx.allclose(recomputed, mx.array([rollout_token_logprobs.sum()]))
+
+
+def test_reward_model_regression_loss_returns_expected_predictions():
+    from mlx_tune.losses import reward_model_regression_loss
+
+    loss, predictions = reward_model_regression_loss(
+        ConstantRewardModel(),
+        input_ids=mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+        sequence_lengths=mx.array([2, 2], dtype=mx.int32),
+        targets=mx.array([1.0, 2.0], dtype=mx.float32),
+    )
+
+    assert float(loss.item()) == 0.0
+    assert predictions.tolist() == [1.0, 2.0]
+
+
+def test_grpo_loss_routes_produce_distinct_losses_from_same_rollout():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]], dtype=mx.int32)
+    prompt_lengths = mx.array([3, 2], dtype=mx.int32)
+    completion_lengths = mx.array([2, 3], dtype=mx.int32)
+    batch = make_policy_eval_batch(
+        input_ids.tolist(),
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths.tolist(),
+        completion_lengths=completion_lengths.tolist(),
+    )
+    scored = score_policy(policy, batch, mode="completion")
+    advantages = mx.array([1.0, -0.5], dtype=mx.float32)
+
+    losses = {
+        name: grpo_recompute_loss(
+            model=policy,
+            reference_model=reference,
+            input_ids=input_ids,
+            prompt_lengths=prompt_lengths,
+            completion_lengths=completion_lengths,
+            rollout_logprobs=scored.summed_logprobs,
+            old_token_logprobs=scored.token_logprobs * batch.token_mask.astype(mx.float32),
+            advantages=advantages,
+            loss_type=name,
+            max_completion_length=4,
+        )[0]
+        for name in ["grpo", "dapo", "dr_grpo", "gspo"]
+    }
+
+    unique_losses = {round(float(loss.item()), 6) for loss in losses.values()}
+    assert len(unique_losses) >= 3
+
+
+def test_grpo_recompute_loss_supports_asymmetric_clip_bounds():
+    from mlx_tune._rl_runtime import make_policy_eval_batch, score_policy
+    from mlx_tune.losses import grpo_recompute_loss
+
+    policy = TinyModel()
+    reference = TinyModel()
+    mx.eval(policy.parameters(), reference.parameters())
+
+    input_ids = mx.array([[1, 2, 3, 4, 5], [1, 4, 3, 2, 1]], dtype=mx.int32)
+    prompt_lengths = mx.array([3, 2], dtype=mx.int32)
+    completion_lengths = mx.array([2, 3], dtype=mx.int32)
+    batch = make_policy_eval_batch(
+        input_ids.tolist(),
+        pad_id=0,
+        mode="completion",
+        prompt_lengths=prompt_lengths.tolist(),
+        completion_lengths=completion_lengths.tolist(),
+    )
+    scored = score_policy(policy, batch, mode="completion")
+    advantages = mx.array([1.0, 0.5], dtype=mx.float32)
+    token_mask = batch.token_mask.astype(mx.float32)
+    old_token_logprobs = (scored.token_logprobs - (0.24 * token_mask)) * token_mask
+
+    symmetric_loss, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=scored.summed_logprobs,
+        old_token_logprobs=old_token_logprobs,
+        advantages=advantages,
+        loss_type="dapo",
+        clip_epsilon=0.2,
+        epsilon_low=0.2,
+        epsilon_high=0.2,
+        max_completion_length=4,
+    )
+    asymmetric_loss, _ = grpo_recompute_loss(
+        model=policy,
+        reference_model=reference,
+        input_ids=input_ids,
+        prompt_lengths=prompt_lengths,
+        completion_lengths=completion_lengths,
+        rollout_logprobs=scored.summed_logprobs,
+        old_token_logprobs=old_token_logprobs,
+        advantages=advantages,
+        loss_type="dapo",
+        clip_epsilon=0.2,
+        epsilon_low=0.2,
+        epsilon_high=0.28,
+        max_completion_length=4,
+    )
+
+    assert not mx.allclose(symmetric_loss, asymmetric_loss)
