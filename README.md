@@ -77,7 +77,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🚀 **v0.4.5** - Fix mlx-vlm 0.4.0 compatibility + text-only VLM inference
+> 🚀 **v0.4.6** - Fix VLM save/load/export + mlx-vlm 0.4.0 compatibility
 
 | Feature | Status | Notes |
 |---------|--------|-------|

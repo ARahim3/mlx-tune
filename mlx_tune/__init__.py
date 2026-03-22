@@ -13,7 +13,7 @@ Supported Training Methods:
 - VLM (Vision Language Model) fine-tuning
 """
 
-__version__ = "0.4.5"  # Fix mx.zeros_like dtype compat across MLX versions
+__version__ = "0.4.6"  # Fix VLM save/load: proper adapter_config.json, config.json, load_adapter
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (

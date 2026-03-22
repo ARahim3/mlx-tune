@@ -173,7 +173,7 @@ for q in questions:
     print(f"A: {response}")
 
 # ===========================================================================
-# Step 7: Save
+# Step 7: Save adapters
 # ===========================================================================
 print("\n" + "=" * 70)
 print("Step 7: Saving Adapters")
@@ -181,4 +181,31 @@ print("=" * 70)
 
 model.save_pretrained("qwen35_text_lora")
 
-print("\nDone! Text-only fine-tuning of Qwen3.5 complete.")
+# Verify saved files
+import os
+for f in sorted(os.listdir("qwen35_text_lora")):
+    size = os.path.getsize(f"qwen35_text_lora/{f}")
+    print(f"  {f} ({size:,} bytes)")
+
+# ===========================================================================
+# Step 8: Load saved adapters into a fresh model
+# ===========================================================================
+print("\n" + "=" * 70)
+print("Step 8: Loading Saved Adapters (verify save/load roundtrip)")
+print("=" * 70)
+
+model2, processor2 = FastVisionModel.from_pretrained(
+    "mlx-community/Qwen3.5-0.8B-8bit",
+)
+model2.load_adapter("qwen35_text_lora")
+
+FastVisionModel.for_inference(model2)
+
+for q in questions:
+    response = model2.generate(prompt=q, max_tokens=64, temperature=0.0)
+    print(f"\nQ: {q}")
+    print(f"A: {response}")
+
+print("\n" + "=" * 70)
+print("Done! Text-only fine-tuning of Qwen3.5 complete.")
+print("=" * 70)

@@ -73,6 +73,22 @@ def _require_mlx_vlm():
         )
 
 
+def _config_to_dict(obj):
+    """Recursively convert a config object (dataclass or dict) to a plain dict."""
+    if isinstance(obj, dict):
+        return {k: _config_to_dict(v) for k, v in obj.items()}
+    if hasattr(obj, "__dataclass_fields__"):
+        return {k: _config_to_dict(getattr(obj, k)) for k in obj.__dataclass_fields__}
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        # Generic object with __dict__ but not a dataclass — check if it's a config-like object
+        d = obj.__dict__
+        if d:
+            return {k: _config_to_dict(v) for k, v in d.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_config_to_dict(item) for item in obj]
+    return obj
+
+
 class FastVisionModel:
     """
     Unsloth-compatible API for Vision Language Models on Apple Silicon.
@@ -427,7 +443,7 @@ class VLMModelWrapper:
         )
 
     def save_pretrained(self, output_dir: str, **kwargs):
-        """Save LoRA adapters."""
+        """Save LoRA adapters with mlx-lm compatible config."""
         _require_mlx_vlm()
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -435,9 +451,138 @@ class VLMModelWrapper:
         if self._lora_applied:
             adapter_file = output_dir / "adapters.safetensors"
             save_adapter(self.model, str(adapter_file))
+
+            # Write mlx-lm compatible adapter_config.json
+            # (mlx-vlm's save_adapter writes a minimal format that mlx-lm can't load)
+            self._save_adapter_config(output_dir)
+
+            # Save model config.json (needed for loading and GGUF export)
+            self._save_model_config(output_dir)
+
             print(f"Adapters saved to {output_dir}")
         else:
             print("No LoRA adapters to save. Train the model first.")
+
+    def _save_adapter_config(self, output_dir: Path):
+        """Write adapter_config.json in mlx-lm format."""
+        lora_config = getattr(self, 'lora_config', {}) or {}
+        r = lora_config.get('r', 16)
+        alpha = lora_config.get('lora_alpha', r)
+        dropout = lora_config.get('lora_dropout', 0.0)
+
+        # Detect number of layers
+        num_layers = None
+        actual = self.model
+        for attr_path in [
+            ('language_model', 'model', 'layers'),
+            ('model', 'layers'),
+            ('layers',),
+        ]:
+            obj = actual
+            for a in attr_path:
+                obj = getattr(obj, a, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                num_layers = len(obj)
+                break
+
+        # Build target module keys in mlx-lm full-path format
+        target_modules = lora_config.get('target_modules') or [
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+        ]
+        short_to_full = {
+            'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
+            'v_proj': 'self_attn.v_proj', 'o_proj': 'self_attn.o_proj',
+            'gate_proj': 'mlp.gate_proj', 'up_proj': 'mlp.up_proj',
+            'down_proj': 'mlp.down_proj',
+        }
+        keys = [short_to_full.get(m, m) for m in target_modules]
+
+        adapter_config = {
+            "fine_tune_type": "lora",
+            "num_layers": num_layers,
+            "lora_parameters": {
+                "rank": r,
+                "scale": alpha / r if r else 1.0,
+                "dropout": dropout,
+                "keys": keys,
+            },
+        }
+
+        with open(output_dir / "adapter_config.json", "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+    def _save_model_config(self, output_dir: Path):
+        """Save config.json, properly serializing nested dataclasses."""
+        actual = self.model
+        if not hasattr(actual, "config"):
+            return
+
+        config_dict = _config_to_dict(actual.config)
+
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config_dict, f, indent=2)
+
+    def load_adapter(self, adapter_path: str, **kwargs):
+        """Load LoRA adapters from a saved directory."""
+        _require_mlx_vlm()
+        from mlx_vlm.trainer.utils import get_peft_model
+
+        adapter_path = Path(adapter_path)
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"Adapter path does not exist: {adapter_path}")
+
+        adapter_file = adapter_path / "adapters.safetensors"
+        config_file = adapter_path / "adapter_config.json"
+        if not adapter_file.exists():
+            raise FileNotFoundError(f"adapters.safetensors not found in {adapter_path}")
+        if not config_file.exists():
+            raise FileNotFoundError(f"adapter_config.json not found in {adapter_path}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
+        # Extract LoRA params from either mlx-lm or mlx-vlm format
+        if "lora_parameters" in config:
+            lp = config["lora_parameters"]
+            rank = lp["rank"]
+            # mlx-vlm uses alpha directly as scale factor in forward pass
+            # (NOT the raw lora_alpha value). Our config stores scale = alpha/r.
+            alpha = lp.get("scale", 1.0)
+            dropout = lp.get("dropout", 0.0)
+            # Convert mlx-lm full paths back to short names for get_peft_model
+            full_to_short = {
+                'self_attn.q_proj': 'q_proj', 'self_attn.k_proj': 'k_proj',
+                'self_attn.v_proj': 'v_proj', 'self_attn.o_proj': 'o_proj',
+                'mlp.gate_proj': 'gate_proj', 'mlp.up_proj': 'up_proj',
+                'mlp.down_proj': 'down_proj',
+            }
+            keys = lp.get("keys", [])
+            modules = [full_to_short.get(k, k) for k in keys]
+        else:
+            rank = config.get("rank", 16)
+            alpha = config.get("alpha", 1.0)
+            dropout = config.get("dropout", 0.0)
+            modules = None
+
+        # If no specific modules, use all linear layers (mlx-vlm default)
+        if not modules:
+            from mlx_vlm.trainer.utils import find_all_linear_names
+            modules = find_all_linear_names(self.model.language_model)
+
+        # Apply LoRA to only the correct modules, then load trained weights
+        self.model = get_peft_model(
+            self.model, modules,
+            rank=rank, alpha=alpha, dropout=dropout,
+            freeze=True, verbose=False,
+        )
+        self.model.load_weights(str(adapter_file), strict=False)
+
+        self._lora_applied = True
+        self._adapter_path = adapter_path
+        print(f"Adapters loaded from {adapter_path}")
 
     def save_pretrained_merged(
         self,
@@ -492,11 +637,11 @@ class VLMModelWrapper:
         if tokenizer_or_processor is not None:
             tokenizer_or_processor.save_pretrained(str(output_dir))
 
-        # Save config
+        # Save config (properly serialize nested dataclasses)
         if hasattr(actual_model, "config"):
-            config_dict = actual_model.config.__dict__ if hasattr(actual_model.config, "__dict__") else actual_model.config
+            config_dict = _config_to_dict(actual_model.config)
             with open(output_dir / "config.json", "w") as f:
-                json.dump(config_dict, f, indent=2, default=str)
+                json.dump(config_dict, f, indent=2)
 
         print(f"Merged model saved to {output_dir}")
 
