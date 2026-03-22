@@ -257,6 +257,13 @@
 
           <div class="api-signature" style="margin-top:12px;"><span class="api-name">FastVisionModel.for_training</span>(<span class="api-param">model</span>) &mdash; Enable training mode</div>
           <div class="api-signature" style="margin-top:8px;"><span class="api-name">FastVisionModel.for_inference</span>(<span class="api-param">model</span>) &mdash; Enable inference mode</div>
+
+          <h4>VLMModelWrapper Methods</h4>
+          <div class="api-signature"><span class="api-name">model.save_pretrained</span>(<span class="api-param">output_dir</span>) &mdash; Save LoRA adapters + config files</div>
+          <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.load_adapter</span>(<span class="api-param">adapter_path</span>) &mdash; Load saved adapters into a fresh model</div>
+          <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.save_pretrained_merged</span>(<span class="api-param">output_dir</span>, <span class="api-param">processor</span>) &mdash; Save full merged model (base + LoRA fused)</div>
+          <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.generate</span>(<span class="api-param">prompt</span>, <span class="api-param">image</span><span class="api-default">=None</span>, <span class="api-param">max_tokens</span><span class="api-default">=256</span>, <span class="api-param">temperature</span><span class="api-default">=0.0</span>, <span class="api-param">min_p</span><span class="api-default">=0.0</span>) &mdash; Generate response (text-only or vision+text)</div>
+          <p style="margin-top:8px;"><code>save_pretrained</code> writes three files: <code>adapters.safetensors</code>, <code>adapter_config.json</code> (mlx-lm compatible format), and <code>config.json</code>. Use <code>load_adapter</code> to reload into a fresh base model.</p>
         </div>
 
         <div class="api-entry" id="VLMSFTTrainer">

@@ -163,6 +163,15 @@ model.save_pretrained_gguf("model", tokenizer)  # Works!</code></pre>
       <h3>Text-only VLM training</h3>
       <p>Qwen3.5 can be fine-tuned on text-only data without images. See <a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/11_qwen35_text_finetuning.py" target="_blank">example 11</a>.</p>
 
+      <h3>VLM adapter save/load</h3>
+      <p>If you saved adapters with <strong>v0.4.5 or earlier</strong>, the <code>adapter_config.json</code> may be in mlx-vlm&rsquo;s minimal format (missing required fields for GGUF export or <code>load_adapter</code>). Upgrade to v0.4.6+ and re-save:</p>
+<pre><code class="language-python"># Re-save with proper config format
+model.save_pretrained("my_adapters")
+
+# Load into a fresh model
+model2, processor2 = FastVisionModel.from_pretrained("mlx-community/Qwen3.5-0.8B-bf16")
+model2.load_adapter("my_adapters")</code></pre>
+
       <!-- Getting Help -->
       <h2 id="help">Getting Help</h2>
       <ul style="color:var(--text-secondary);line-height:2.2;">
