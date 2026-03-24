@@ -346,9 +346,11 @@ class TestSTTDataCollator:
 
     def _make_collator(self):
         from mlx_tune.stt import STTDataCollator, STTModelWrapper, STTProcessor
+        from mlx_tune.audio_profiles import STT_PROFILES
         import mlx.core as mx
 
         mock_model = MagicMock(spec=STTModelWrapper)
+        mock_model.profile = STT_PROFILES["whisper"]
         mock_model.n_mels = 80
 
         mock_tokenizer = MagicMock()
@@ -418,6 +420,80 @@ class TestSTTDataCollator:
         }
         result = collator(sample)
         assert result["input_features"].shape[0] == 1
+
+    def test_language_specific_sot_sequence(self):
+        """Collator with non-English language should use language-specific SOT."""
+        from mlx_tune.stt import STTDataCollator, STTModelWrapper, STTProcessor
+        from mlx_tune.audio_profiles import STT_PROFILES
+        import mlx.core as mx
+
+        mock_model = MagicMock(spec=STTModelWrapper)
+        mock_model.profile = STT_PROFILES["whisper"]
+        mock_model.n_mels = 80
+
+        mock_en_tokenizer = MagicMock()
+        mock_en_tokenizer.encode.return_value = [100, 200]
+        mock_en_tokenizer.eot = 50257
+        mock_en_tokenizer.sot_sequence = (50258, 50259, 50360)
+
+        mock_fr_tokenizer = MagicMock()
+        mock_fr_tokenizer.encode.return_value = [100, 200]
+        mock_fr_tokenizer.eot = 50257
+        mock_fr_tokenizer.sot_sequence = (50258, 50265, 50360)
+
+        mock_processor = MagicMock(spec=STTProcessor)
+        mock_processor.tokenizer = mock_en_tokenizer
+        mock_processor.sot_sequence = (50258, 50259, 50360)
+        mock_processor.compute_mel.return_value = mx.zeros((3000, 80))
+        mock_processor.get_tokenizer.return_value = mock_fr_tokenizer
+
+        collator = STTDataCollator(
+            model=mock_model, processor=mock_processor,
+            language="fr", task="transcribe",
+        )
+        assert collator._lang_tokenizer is mock_fr_tokenizer
+
+        sample = {
+            "text": "Bonjour",
+            "audio": {"array": np.zeros(16000), "sampling_rate": 16000},
+        }
+        result = collator([sample])
+        dec_ids = result["decoder_input_ids"].tolist()[0]
+        assert dec_ids[:3] == [50258, 50265, 50360]
+
+    def test_default_english_no_extra_tokenizer(self):
+        """Default language='en' should NOT call get_tokenizer again."""
+        from mlx_tune.stt import STTDataCollator, STTModelWrapper, STTProcessor
+        from mlx_tune.audio_profiles import STT_PROFILES
+
+        mock_processor = MagicMock(spec=STTProcessor)
+        mock_model = MagicMock(spec=STTModelWrapper)
+        mock_model.profile = STT_PROFILES["whisper"]
+        collator = STTDataCollator(
+            model=mock_model, processor=mock_processor,
+            language="en", task="transcribe",
+        )
+        assert collator._lang_tokenizer is None
+        mock_processor.get_tokenizer.assert_not_called()
+
+    def test_translate_task_gets_specific_tokenizer(self):
+        """task='translate' should get a task-specific tokenizer."""
+        from mlx_tune.stt import STTDataCollator, STTModelWrapper, STTProcessor
+        from mlx_tune.audio_profiles import STT_PROFILES
+
+        mock_translate_tok = MagicMock()
+        mock_translate_tok.sot_sequence = (50258, 50259, 50358)
+
+        mock_processor = MagicMock(spec=STTProcessor)
+        mock_processor.get_tokenizer.return_value = mock_translate_tok
+
+        mock_model = MagicMock(spec=STTModelWrapper)
+        mock_model.profile = STT_PROFILES["whisper"]
+        collator = STTDataCollator(
+            model=mock_model, processor=mock_processor,
+            language="en", task="translate",
+        )
+        assert collator._lang_tokenizer is mock_translate_tok
 
 
 # ============================================================================

@@ -22,6 +22,13 @@ import numpy as np
 
 import mlx.core as mx
 
+from mlx_tune.audio_profiles import (
+    TTSModelProfile,
+    TTS_PROFILES,
+    detect_tts_model_type,
+)
+from mlx_tune.audio_codecs import CodecAdapter, SNACCodecAdapter, create_codec
+
 # Try to import mlx_lm for model loading and LoRA
 try:
     from mlx_lm import load as mlx_load
@@ -41,6 +48,15 @@ HAS_MLX_AUDIO = False
 try:
     from mlx_audio.codec.models.snac import SNAC
     HAS_MLX_AUDIO = True
+except ImportError:
+    pass
+
+# Try to import mlx-audio TTS loader (for OuteTTS, Spark, Sesame)
+HAS_MLX_AUDIO_TTS = False
+_tts_load_fn = None
+try:
+    from mlx_audio.tts import load as _tts_load_fn
+    HAS_MLX_AUDIO_TTS = True
 except ImportError:
     pass
 
@@ -122,12 +138,6 @@ class FastTTSModel:
         """
         _require_mlx_audio()
 
-        if not HAS_MLX_LM:
-            raise ImportError(
-                "mlx-lm is required for TTS model loading. "
-                "Install with: uv pip install mlx-lm"
-            )
-
         if load_in_4bit:
             warnings.warn(
                 "4-bit quantization is not recommended for TTS models. "
@@ -135,18 +145,88 @@ class FastTTSModel:
                 UserWarning,
             )
 
-        # Load the LLM (Orpheus is a Llama variant)
+        # Auto-detect model profile from name
+        profile_key = detect_tts_model_type(model_name, {})
+        profile = TTS_PROFILES.get(profile_key) if profile_key else None
+
+        # Determine codec model from profile if not explicitly provided
+        if codec_model == "mlx-community/snac_24khz" and profile and profile.codec_repo:
+            codec_model = profile.codec_repo
+
         print(f"Loading TTS model: {model_name}")
-        model, tokenizer = mlx_load(model_name)
 
-        # Load SNAC audio codec
-        print(f"Loading audio codec: {codec_model}")
-        codec = SNAC.from_pretrained(codec_model)
+        # Dispatch on loader type
+        if profile and profile.loader == "mlx_audio_tts":
+            # Load via mlx-audio's TTS loader (OuteTTS, Spark, Sesame)
+            if not HAS_MLX_AUDIO_TTS:
+                raise ImportError(
+                    "mlx-audio TTS loader is required for this model. "
+                    "Install with: uv pip install 'mlx-tune[audio]'"
+                )
 
-        # Get model config for saving
-        config = {}
-        if hasattr(model, "config"):
-            config = model.config if isinstance(model.config, dict) else {}
+            full_model = _tts_load_fn(model_name)
+
+            # Get inner LM for LoRA (e.g., model.model for OuteTTS/Spark)
+            inner_model = full_model
+            if profile.inner_model_attr:
+                inner_model = getattr(full_model, profile.inner_model_attr, full_model)
+
+            # Get tokenizer from inner model or full model
+            tokenizer = getattr(inner_model, "tokenizer", None)
+            if tokenizer is None:
+                tokenizer = getattr(full_model, "tokenizer", None)
+            if tokenizer is None and HAS_MLX_LM:
+                # Fallback: try loading tokenizer via mlx_lm
+                from transformers import AutoTokenizer
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+                except Exception:
+                    pass
+
+            # The codec may be bundled with the model under different attributes
+            codec = getattr(full_model, "codec", None)
+            if codec is None:
+                codec = getattr(full_model, "_audio_tokenizer", None)
+            if codec is None:
+                codec = getattr(full_model, "audio_tokenizer", None)
+            if codec is None:
+                # Try to get codec from model-specific audio processors
+                if profile.codec_type == "dac":
+                    try:
+                        from mlx_audio.tts.models.outetts.audio_processor import AudioProcessor
+                        ap = AudioProcessor()
+                        codec = ap.audio_codec
+                    except ImportError:
+                        codec = None
+                elif profile.codec_repo:
+                    try:
+                        codec = SNAC.from_pretrained(profile.codec_repo)
+                    except Exception:
+                        codec = None
+
+            config = {}
+            if hasattr(inner_model, "config"):
+                config = inner_model.config if isinstance(inner_model.config, dict) else {}
+
+            model = inner_model
+
+        else:
+            # Default: load via mlx_lm (Orpheus and other decoder-only LLMs)
+            if not HAS_MLX_LM:
+                raise ImportError(
+                    "mlx-lm is required for TTS model loading. "
+                    "Install with: uv pip install mlx-lm"
+                )
+
+            model, tokenizer = mlx_load(model_name)
+
+            # Load SNAC audio codec
+            print(f"Loading audio codec: {codec_model}")
+            codec = SNAC.from_pretrained(codec_model)
+
+            config = {}
+            if hasattr(model, "config"):
+                config = model.config if isinstance(model.config, dict) else {}
 
         wrapper = TTSModelWrapper(
             model=model,
@@ -156,10 +236,13 @@ class FastTTSModel:
             codec_model_name=codec_model,
             max_seq_length=max_seq_length,
             config=config,
+            profile=profile,
         )
 
+        sr = profile.sample_rate if profile else getattr(codec, "sampling_rate", 24000)
+        codec_name = profile.codec_type if profile else codec_model
         print(f"TTS model loaded: {model_name}")
-        print(f"Audio codec: {codec_model} (sample rate: {codec.sampling_rate}Hz)")
+        print(f"Audio codec: {codec_name} (sample rate: {sr}Hz)")
 
         return wrapper, tokenizer
 
@@ -300,7 +383,14 @@ class TTSModelWrapper:
         end_tokens: Optional[List[int]] = None,
         audio_token_offset: int = ORPHEUS_AUDIO_TOKEN_OFFSET,
         codebook_size: int = ORPHEUS_CODEBOOK_SIZE,
+        # Profile-based configuration (optional, overrides above if provided)
+        profile: Optional[TTSModelProfile] = None,
     ):
+        # Resolve profile: use provided, or fall back to Orpheus default
+        if profile is None:
+            profile = TTS_PROFILES["orpheus"]
+        self.profile = profile
+
         self.model = model
         self.tokenizer = tokenizer
         self.codec = codec
@@ -309,11 +399,15 @@ class TTSModelWrapper:
         self.max_seq_length = max_seq_length
         self.config = config or {}
 
-        # Audio token configuration
+        # Audio token configuration - profile values as defaults,
+        # explicit params override (for backward compat)
         self.start_token = start_token
-        self.end_tokens = end_tokens or ORPHEUS_END_TOKENS
+        self.end_tokens = end_tokens or list(self.profile.end_tokens)
         self.audio_token_offset = audio_token_offset
         self.codebook_size = codebook_size
+
+        # Create codec adapter for encode/decode delegation
+        self.codec_adapter: CodecAdapter = create_codec(self.profile, codec)
 
         # LoRA state
         self.lora_config = None
@@ -404,18 +498,10 @@ class TTSModelWrapper:
             "dropout": self.lora_config.get("lora_dropout", 0.0),
         }
 
-        # Map short module names to full paths
+        # Map short module names to full paths using profile mapping
         target_modules = self.lora_config.get("target_modules", [])
         if target_modules:
-            short_to_full = {
-                "q_proj": "self_attn.q_proj",
-                "k_proj": "self_attn.k_proj",
-                "v_proj": "self_attn.v_proj",
-                "o_proj": "self_attn.o_proj",
-                "gate_proj": "mlp.gate_proj",
-                "up_proj": "mlp.up_proj",
-                "down_proj": "mlp.down_proj",
-            }
+            short_to_full = dict(self.profile.lora_module_mapping)
             full_paths = []
             for module in target_modules:
                 full_paths.append(short_to_full.get(module, module))
@@ -458,105 +544,21 @@ class TTSModelWrapper:
         Returns:
             List of audio token IDs (with codec offset applied)
         """
-        if isinstance(audio, np.ndarray):
-            audio = mx.array(audio, dtype=mx.float32)
-
-        # Ensure shape [batch, channels, samples]
-        if audio.ndim == 1:
-            audio = audio.reshape(1, 1, -1)
-        elif audio.ndim == 2:
-            audio = audio.reshape(1, audio.shape[0], audio.shape[1])
-
-        # Encode through SNAC
-        codes = self.codec.encode(audio)
-        mx.eval(codes)
-
-        # Interleave codes from multiple VQ levels into flat sequence
-        # SNAC produces codes at different temporal resolutions
-        # For 3-level SNAC: level 0 (coarsest), level 1, level 2 (finest)
-        # Interleaving pattern: [L0_t, L1_2t, L1_2t+1, L2_4t, L2_4t+1, L2_4t+2, L2_4t+3]
-        # = 7 tokens per coarsest time step
-        return self._interleave_codes(codes)
+        return self.codec_adapter.encode(audio, sr=sr)
 
     def _interleave_codes(self, codes: List[mx.array]) -> List[int]:
         """
         Interleave hierarchical VQ codes into a flat token sequence.
-
-        For 3-level SNAC (Orpheus):
-        - Level 0: N frames (coarsest)
-        - Level 1: 2N frames
-        - Level 2: 4N frames
-        Pattern per coarsest frame: [L0, L1, L1, L2, L2, L2, L2] = 7 tokens
-
-        Each code is offset by: audio_token_offset + level_idx * codebook_size
+        Delegates to codec adapter.
         """
-        num_levels = len(codes)
-        if num_levels == 0:
-            return []
-
-        # Extract code arrays (remove batch dim if present)
-        code_arrays = []
-        for c in codes:
-            c_np = np.array(c)
-            if c_np.ndim > 1:
-                c_np = c_np.flatten()
-            code_arrays.append(c_np)
-
-        # Determine the coarsest level length
-        coarsest_len = len(code_arrays[0])
-
-        tokens = []
-        for t in range(coarsest_len):
-            for level in range(num_levels):
-                # How many codes at this level per coarsest frame
-                ratio = len(code_arrays[level]) // coarsest_len
-                for sub in range(ratio):
-                    idx = t * ratio + sub
-                    if idx < len(code_arrays[level]):
-                        code_val = int(code_arrays[level][idx])
-                        token_id = code_val + self.audio_token_offset + level * self.codebook_size
-                        tokens.append(token_id)
-
-        return tokens
+        return self.codec_adapter.interleave(codes)
 
     def _deinterleave_codes(self, token_ids: List[int]) -> List[np.ndarray]:
         """
         De-interleave flat token sequence back to hierarchical VQ codes.
-
-        Reverses the interleaving pattern to produce separate code arrays
-        per VQ level for SNAC decoding.
+        Delegates to codec adapter.
         """
-        # Remove offset and separate by level
-        # For 3-level SNAC: pattern is 7 tokens per coarsest frame
-        # [L0, L1, L1, L2, L2, L2, L2]
-        tokens_per_frame = 7  # 1 + 2 + 4 for 3-level SNAC
-        num_frames = len(token_ids) // tokens_per_frame
-
-        level_codes = [[], [], []]  # 3 levels
-
-        for t in range(num_frames):
-            base = t * tokens_per_frame
-            if base + tokens_per_frame > len(token_ids):
-                break
-
-            # Level 0: 1 code
-            level_codes[0].append(
-                token_ids[base] - self.audio_token_offset - 0 * self.codebook_size
-            )
-            # Level 1: 2 codes
-            level_codes[1].append(
-                token_ids[base + 1] - self.audio_token_offset - 1 * self.codebook_size
-            )
-            level_codes[1].append(
-                token_ids[base + 2] - self.audio_token_offset - 1 * self.codebook_size
-            )
-            # Level 2: 4 codes
-            for i in range(4):
-                level_codes[2].append(
-                    token_ids[base + 3 + i] - self.audio_token_offset - 2 * self.codebook_size
-                )
-
-        return [np.array(codes, dtype=np.int32) for codes in level_codes]
+        return self.codec_adapter.deinterleave(token_ids)
 
     def decode_audio(self, token_ids: List[int]) -> np.ndarray:
         """
@@ -568,21 +570,7 @@ class TTSModelWrapper:
         Returns:
             Audio waveform as numpy array
         """
-        # De-interleave to per-level codes
-        code_arrays = self._deinterleave_codes(token_ids)
-
-        # Convert to mx.arrays with proper shapes for SNAC decode
-        mx_codes = []
-        for codes in code_arrays:
-            mx_codes.append(mx.array(codes.reshape(1, -1)))
-
-        # Decode through SNAC
-        audio = self.codec.decode(mx_codes)
-        mx.eval(audio)
-
-        # Convert to numpy, squeeze batch and channel dims
-        audio_np = np.array(audio).squeeze()
-        return audio_np
+        return self.codec_adapter.decode(token_ids)
 
     def generate(
         self,
@@ -635,12 +623,9 @@ class TTSModelWrapper:
 
     def _build_tts_prompt(self, text: str, speaker: Optional[str] = None) -> str:
         """Build the TTS prompt in Orpheus format."""
-        speaker_str = speaker or "tara"
-        # Orpheus prompt format
-        prompt = (
-            f"<custom_token_3><|begin_of_text|>"
-            f"{speaker_str}: {text}<|eot_id|>"
-        )
+        speaker_str = speaker or self.profile.default_speaker
+        # Use profile's prompt template
+        prompt = self.profile.prompt_template.format(speaker=speaker_str, text=text)
         return prompt
 
     def _extract_audio_tokens(self, generated_text: str) -> List[int]:
@@ -932,9 +917,12 @@ class TTSDataCollator:
 
     def _process_sample(self, sample: Dict) -> Tuple[List[int], List[int]]:
         """Process a single sample into input_ids and labels."""
+        profile = self.model.profile
+
         # Get text
         text = sample.get(self.text_column, "")
-        speaker = sample.get(self.speaker_column, "tara") if self.speaker_column else "tara"
+        default_speaker = profile.default_speaker
+        speaker = sample.get(self.speaker_column, default_speaker) if self.speaker_column else default_speaker
 
         # Get audio
         audio_data = sample.get(self.audio_column)
@@ -957,21 +945,64 @@ class TTSDataCollator:
 
         audio_array = np.array(audio_array, dtype=np.float32)
 
-        # Encode audio to tokens
-        audio_tokens = self.model.encode_audio(audio_array, sr=sr)
+        # Encode audio to codec indices
+        audio_codes = self.model.encode_audio(audio_array, sr=sr)
 
-        # Build text prompt tokens
-        prompt_text = f"{speaker}: {text}"
-        text_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+        if profile.token_format == "text" and profile.audio_token_formats:
+            # Text-token format: format codes as text tokens, tokenize everything together
+            n_cb = profile.num_codebooks
+            audio_text_parts = []
 
-        # Build full sequence:
-        # [text_tokens, START_TOKEN, audio_tokens, END_TOKENS]
-        input_ids = text_tokens + [self.model.start_token] + audio_tokens + self.model.end_tokens
+            if profile.codec_type == "bicodec":
+                # BiCodec: sequential layout — first N are global, rest are semantic
+                # The encoder returns [global_0..global_N, semantic_0..semantic_M]
+                n_global = 32  # BiCodec always produces 32 global tokens
+                for i, code in enumerate(audio_codes):
+                    if i < n_global:
+                        fmt = profile.audio_token_formats[0]
+                    else:
+                        fmt = profile.audio_token_formats[1]
+                    audio_text_parts.append(fmt.format(code=code))
+                # Insert structural markers for Spark prompt format
+                audio_text = (
+                    "<|start_global_token|>"
+                    + "".join(audio_text_parts[:n_global])
+                    + "<|end_global_token|>"
+                    + "<|start_semantic_token|>"
+                    + "".join(audio_text_parts[n_global:])
+                )
+            else:
+                # Interleaved format (OuteTTS/DAC): cycle through codebooks
+                for i, code in enumerate(audio_codes):
+                    cb_idx = i % n_cb
+                    fmt = profile.audio_token_formats[cb_idx]
+                    audio_text_parts.append(fmt.format(code=code))
+                audio_text = "".join(audio_text_parts)
 
-        # Labels: mask text tokens, only train on audio tokens
-        # -100 for text + start token, actual IDs for audio + end tokens
-        num_masked = len(text_tokens) + 1  # text + START_TOKEN
-        labels = [-100] * num_masked + audio_tokens + self.model.end_tokens
+            # Build full prompt using profile template
+            prompt_text = profile.prompt_template.format(speaker=speaker, text=text)
+            full_text = prompt_text + audio_text
+
+            # Tokenize the full text
+            input_ids = self.tokenizer.encode(full_text, add_special_tokens=True)
+
+            # Labels: mask prompt tokens, train on audio portion
+            prompt_only_ids = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+            num_masked = len(prompt_only_ids)
+            labels = [-100] * num_masked + input_ids[num_masked:]
+
+        else:
+            # Numeric-token format (Orpheus, Sesame): offset-based token IDs
+            prompt_text = profile.prompt_template.format(speaker=speaker, text=text)
+            text_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+
+            # Build full sequence: [text_tokens, START_TOKEN, audio_tokens, END_TOKENS]
+            start_tokens = [self.model.start_token] if self.model.start_token else []
+            input_ids = text_tokens + start_tokens + audio_codes + self.model.end_tokens
+
+            # Labels: mask text tokens, only train on audio + end tokens
+            num_masked = len(text_tokens) + len(start_tokens)
+            labels = [-100] * num_masked + audio_codes + self.model.end_tokens
 
         return input_ids, labels
 

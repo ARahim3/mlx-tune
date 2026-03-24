@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Audio Fine-Tuning &mdash; MLX-Tune Docs</title>
-  <meta name="description" content="TTS and STT fine-tuning on Apple Silicon with MLX-Tune. Orpheus, Whisper, SNAC codec.">
+  <meta name="description" content="TTS and STT fine-tuning on Apple Silicon with MLX-Tune. Orpheus, OuteTTS, Spark-TTS, Whisper, Moonshine, and more.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%25' y='73%25' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='900' font-size='22' fill='%23e6edf3'>m</text></svg>">
   <meta property="og:title" content="Audio Fine-Tuning - MLX-Tune Docs">
   <meta property="og:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png">
@@ -40,11 +40,17 @@
       <div class="sidebar-title">On This Page</div>
       <ul class="sidebar-nav">
         <li><a href="#install">Installation</a></li>
+        <li><a href="#models">Supported Models</a></li>
         <li><a href="#tts">Text-to-Speech</a></li>
-        <li class="sub-item"><a href="#FastTTSModel">FastTTSModel</a></li>
+        <li class="sub-item"><a href="#tts-orpheus">Orpheus</a></li>
+        <li class="sub-item"><a href="#tts-outetts">OuteTTS</a></li>
+        <li class="sub-item"><a href="#tts-spark">Spark-TTS</a></li>
+        <li class="sub-item"><a href="#FastTTSModel">FastTTSModel API</a></li>
         <li class="sub-item"><a href="#TTSSFTTrainer">TTSSFTTrainer</a></li>
         <li><a href="#stt">Speech-to-Text</a></li>
-        <li class="sub-item"><a href="#FastSTTModel">FastSTTModel</a></li>
+        <li class="sub-item"><a href="#stt-whisper">Whisper</a></li>
+        <li class="sub-item"><a href="#stt-moonshine">Moonshine</a></li>
+        <li class="sub-item"><a href="#FastSTTModel">FastSTTModel API</a></li>
         <li class="sub-item"><a href="#STTSFTTrainer">STTSFTTrainer</a></li>
         <li><a href="#post-training">Post-Training</a></li>
         <li><a href="#examples">Examples</a></li>
@@ -60,16 +66,53 @@
       <section class="section" id="install">
         <div class="section-label">Setup</div>
         <h2 style="margin-top: 0;">Installation</h2>
-        <p>Audio fine-tuning requires the optional <code>[audio]</code> extra, which installs <code>mlx-audio</code> and <code>soundfile</code>.</p>
+        <p>Audio fine-tuning requires the optional <code>[audio]</code> extra, which installs <code>mlx-audio</code>, <code>soundfile</code>, and <code>librosa</code>.</p>
 
         <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
-<pre><code class="language-bash">uv pip install 'mlx-tune[audio]'</code></pre>
+<pre><code class="language-bash"># Install with audio support
+uv pip install 'mlx-tune[audio]'
+
+# System dependency: FFmpeg (required by mlx-audio for some codecs)
+brew install ffmpeg</code></pre>
         </div>
 
         <div class="callout">
           <div class="callout-title">Requirements</div>
-          <p>Requires <code>mlx-audio&gt;=0.4.0</code> and <code>soundfile&gt;=0.12.0</code>. These are installed automatically with the <code>[audio]</code> extra. Apple Silicon Mac with 16 GB+ unified RAM recommended for audio training.</p>
+          <p>Python packages (<code>mlx-audio</code>, <code>soundfile</code>, <code>librosa</code>) are installed automatically with the <code>[audio]</code> extra. <strong>FFmpeg</strong> is a system dependency needed by some audio codecs &mdash; install via <code>brew install ffmpeg</code>. Apple Silicon Mac with 16 GB+ unified RAM recommended.</p>
         </div>
+
+        <div class="callout">
+          <div class="callout-title">datasets version</div>
+          <p>MLX-Tune pins <code>datasets&lt;4.0.0</code>. Version 4.0+ dropped <code>soundfile</code> support and requires <code>torchcodec</code> (which has FFmpeg version conflicts on macOS). If you see <em>"please install torchcodec"</em> errors, downgrade: <code>uv pip install 'datasets&lt;4.0.0'</code>.</p>
+        </div>
+      </section>
+
+      <!-- ===== Supported Models ===== -->
+      <section class="section" id="models">
+        <div class="section-label">Overview</div>
+        <h2 style="margin-top: 0;">Supported Models</h2>
+        <p>MLX-Tune supports multiple TTS and STT model architectures. Models are auto-detected from their name &mdash; no manual profile configuration needed.</p>
+
+        <h3>Text-to-Speech</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>Params</th><th>Codec</th><th>Sample Rate</th><th>Architecture</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Orpheus-3B</strong></td><td>3B</td><td>SNAC</td><td>24 kHz</td><td>Llama (decoder-only)</td></tr>
+            <tr><td><strong>OuteTTS-1B</strong></td><td>1B</td><td>DAC</td><td>24 kHz</td><td>Llama (decoder-only)</td></tr>
+            <tr><td><strong>Spark-TTS</strong></td><td>0.5B</td><td>BiCodec</td><td>16 kHz</td><td>Qwen2 (decoder-only)</td></tr>
+            <tr><td><strong>Sesame/CSM-1B</strong></td><td>1B</td><td>Mimi</td><td>24 kHz</td><td>Backbone + Decoder</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Speech-to-Text</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>Params</th><th>Preprocessor</th><th>Sample Rate</th><th>Architecture</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Whisper</strong> (all sizes)</td><td>39M&ndash;1.5B</td><td>Log-mel spectrogram</td><td>16 kHz</td><td>Encoder-Decoder</td></tr>
+            <tr><td><strong>Distil-Whisper</strong></td><td>756M</td><td>Log-mel spectrogram</td><td>16 kHz</td><td>Encoder-Decoder (Whisper)</td></tr>
+            <tr><td><strong>Moonshine</strong></td><td>27M&ndash;330M</td><td>Raw conv frontend</td><td>16 kHz</td><td>Encoder-Decoder</td></tr>
+          </tbody>
+        </table>
       </section>
 
       <!-- ===== Text-to-Speech ===== -->
@@ -79,16 +122,18 @@
           <span class="module-path">mlx_tune.tts</span>
         </div>
 
-        <p>Orpheus is a Llama-based language model that uses the SNAC codec to convert audio waveforms into discrete tokens. Fine-tuning works like standard LLM training &mdash; text and audio tokens are concatenated into a single sequence, and LoRA adapters are applied to the transformer layers.</p>
+        <p>TTS models in MLX-Tune are decoder-only language models that predict discrete audio tokens. The API is the same regardless of model &mdash; <code>FastTTSModel</code> auto-detects the architecture and codec. Each model uses a different audio codec (SNAC, DAC, BiCodec, or Mimi), but this is handled transparently.</p>
 
-        <h3>Quick Start</h3>
-        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+        <!-- Model-specific sections -->
+        <div class="api-entry" id="tts-orpheus">
+          <h3>Orpheus-3B</h3>
+          <p>Llama-based model using the SNAC codec (3 codebooks, 24 kHz). The original and largest supported TTS model.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
 <pre><code class="language-python">from mlx_tune import FastTTSModel, TTSSFTTrainer, TTSSFTConfig, TTSDataCollator
 from datasets import load_dataset, Audio
 
 model, tokenizer = FastTTSModel.from_pretrained(
     "mlx-community/orpheus-3b-0.1-ft-bf16",
-    codec_model="mlx-community/snac_24khz",
 )
 model = FastTTSModel.get_peft_model(model, r=16, lora_alpha=16)
 
@@ -101,30 +146,80 @@ trainer = TTSSFTTrainer(
     data_collator=collator, train_dataset=dataset,
     args=TTSSFTConfig(output_dir="./tts_output", max_steps=60),
 )
-trainer.train()
+trainer.train()</code></pre>
+          </div>
+        </div>
 
-FastTTSModel.for_inference(model)
-audio = model.generate("Hello, how are you today?")
-import soundfile as sf
-sf.write("output.wav", audio, 24000)</code></pre>
+        <div class="api-entry" id="tts-outetts">
+          <h3>OuteTTS-1B</h3>
+          <p>Llama-based model using the DAC codec (2 codebooks, 24 kHz). Uses text-based audio tokens (<code>&lt;|c1_X|&gt;</code>, <code>&lt;|c2_X|&gt;</code>) instead of numeric offsets. Smaller and faster than Orpheus.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastTTSModel, TTSSFTTrainer, TTSSFTConfig, TTSDataCollator
+from datasets import load_dataset, Audio
+
+model, tokenizer = FastTTSModel.from_pretrained(
+    "mlx-community/Llama-OuteTTS-1.0-1B-8bit",
+)
+model = FastTTSModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("MrDragonFox/Elise", split="train[:100]")
+dataset = dataset.cast_column("audio", Audio(sampling_rate=24000))
+
+collator = TTSDataCollator(model, tokenizer)
+trainer = TTSSFTTrainer(
+    model=model, tokenizer=tokenizer,
+    data_collator=collator, train_dataset=dataset,
+    args=TTSSFTConfig(output_dir="./outetts_output", max_steps=60),
+)
+trainer.train()</code></pre>
+          </div>
+        </div>
+
+        <div class="api-entry" id="tts-spark">
+          <h3>Spark-TTS (0.5B)</h3>
+          <p>Qwen2-based model using BiCodec (global + semantic tokens, 16 kHz). Ultra-light at only 0.5B parameters &mdash; ideal for Apple Silicon with limited RAM.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastTTSModel, TTSSFTTrainer, TTSSFTConfig, TTSDataCollator
+from datasets import load_dataset, Audio
+
+model, tokenizer = FastTTSModel.from_pretrained(
+    "mlx-community/Spark-TTS-0.5B-bf16",
+)
+model = FastTTSModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Spark uses 16kHz (not 24kHz like Orpheus/OuteTTS)
+dataset = load_dataset("MrDragonFox/Elise", split="train[:100]")
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
+collator = TTSDataCollator(model, tokenizer)
+trainer = TTSSFTTrainer(
+    model=model, tokenizer=tokenizer,
+    data_collator=collator, train_dataset=dataset,
+    args=TTSSFTConfig(
+        output_dir="./spark_output", max_steps=60,
+        sample_rate=16000,
+    ),
+)
+trainer.train()</code></pre>
+          </div>
         </div>
 
         <!-- FastTTSModel -->
         <div class="api-entry" id="FastTTSModel">
-          <h3>FastTTSModel</h3>
-          <p>Main entry point for loading and configuring TTS models. Supports Orpheus-3B and compatible Llama-based audio models.</p>
+          <h3>FastTTSModel API</h3>
+          <p>Main entry point for loading and configuring TTS models. Auto-detects model architecture, codec, and token format from the model name.</p>
 
           <h4>FastTTSModel.from_pretrained()</h4>
           <div class="api-signature">
-            <span class="api-name">FastTTSModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=2048</span>, <span class="api-param">codec_model</span><span class="api-default">="mlx-community/snac_24khz"</span>, <span class="api-param">load_in_4bit</span><span class="api-default">=False</span>, ...) &rarr; <span class="api-param">Tuple[TTSModelWrapper, Tokenizer]</span>
+            <span class="api-name">FastTTSModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=2048</span>, <span class="api-param">codec_model</span><span class="api-default">=None</span>, <span class="api-param">load_in_4bit</span><span class="api-default">=False</span>, ...) &rarr; <span class="api-param">Tuple[TTSModelWrapper, Tokenizer]</span>
           </div>
-          <p>Load a pretrained TTS model and SNAC audio codec.</p>
+          <p>Load a pretrained TTS model. Auto-detects the model profile and loads the appropriate codec.</p>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
             <tbody>
-              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID (e.g., <code>"mlx-community/orpheus-3b-0.1-ft-bf16"</code>) or local path</td></tr>
+              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Orpheus, OuteTTS, Spark-TTS, Sesame/CSM</td></tr>
               <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum sequence length for training/inference</td></tr>
-              <tr><td><code>codec_model</code></td><td>str</td><td>SNAC codec model ID. Must be MLX format</td></tr>
+              <tr><td><code>codec_model</code></td><td>str, optional</td><td>Override codec model ID. Auto-detected from profile if not specified</td></tr>
               <tr><td><code>load_in_4bit</code></td><td>bool</td><td>Load model with 4-bit quantization</td></tr>
             </tbody>
           </table>
@@ -154,8 +249,8 @@ sf.write("output.wav", audio, 24000)</code></pre>
           <p>Convert a HuggingFace TTS model to MLX format.</p>
 
           <h4>TTSModelWrapper Methods</h4>
-          <div class="api-signature"><span class="api-name">model.encode_audio</span>(<span class="api-param">audio_array</span>, <span class="api-param">sr</span><span class="api-default">=24000</span>) &rarr; <span class="api-param">List[int]</span> &mdash; Encode audio waveform to SNAC token IDs</div>
-          <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.decode_audio</span>(<span class="api-param">token_ids</span>) &rarr; <span class="api-param">np.ndarray</span> &mdash; Decode SNAC token IDs back to audio waveform</div>
+          <div class="api-signature"><span class="api-name">model.encode_audio</span>(<span class="api-param">audio_array</span>, <span class="api-param">sr</span><span class="api-default">=None</span>) &rarr; <span class="api-param">List[int]</span> &mdash; Encode audio waveform to codec token IDs</div>
+          <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.decode_audio</span>(<span class="api-param">token_ids</span>) &rarr; <span class="api-param">np.ndarray</span> &mdash; Decode codec token IDs back to audio waveform</div>
           <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.generate</span>(<span class="api-param">text</span>, <span class="api-param">speaker</span><span class="api-default">=None</span>, <span class="api-param">max_tokens</span><span class="api-default">=1250</span>, ...) &rarr; <span class="api-param">np.ndarray</span> &mdash; Generate audio from text</div>
           <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.save_pretrained</span>(<span class="api-param">output_dir</span>) &mdash; Save LoRA adapters</div>
           <div class="api-signature" style="margin-top:8px;"><span class="api-name">model.load_adapter</span>(<span class="api-param">adapter_path</span>) &mdash; Load saved adapters</div>
@@ -200,9 +295,9 @@ sf.write("output.wav", audio, 24000)</code></pre>
 
           <h3 style="margin-top:24px;">TTSDataCollator</h3>
           <div class="api-signature">
-            <span class="api-name">TTSDataCollator</span>(<span class="api-param">model</span>, <span class="api-param">tokenizer</span>)
+            <span class="api-name">TTSDataCollator</span>(<span class="api-param">model</span>, <span class="api-param">tokenizer</span>, <span class="api-param">text_column</span><span class="api-default">="text"</span>, <span class="api-param">audio_column</span><span class="api-default">="audio"</span>)
           </div>
-          <p>Data collator for TTS training. Encodes audio via the SNAC codec, tokenizes text prompts, builds concatenated sequences, and masks prompt tokens so loss is computed only on audio outputs.</p>
+          <p>Data collator for TTS training. Encodes audio via the appropriate codec (SNAC, DAC, BiCodec, or Mimi), tokenizes text prompts, builds concatenated sequences, and masks prompt tokens so loss is computed only on audio outputs. Handles both numeric and text-based audio token formats automatically.</p>
         </div>
       </div>
 
@@ -213,51 +308,88 @@ sf.write("output.wav", audio, 24000)</code></pre>
           <span class="module-path">mlx_tune.stt</span>
         </div>
 
-        <p>Whisper is an encoder-decoder model. The encoder processes mel spectrograms from audio input, and the decoder generates text tokens autoregressively. LoRA adapters are applied to both encoder and decoder attention blocks (<code>query</code>, <code>key</code>, <code>value</code>, <code>out</code> projections in self-attention and cross-attention).</p>
+        <p>STT models in MLX-Tune are encoder-decoder architectures. The encoder processes audio input (mel spectrograms or raw waveforms), and the decoder generates text tokens autoregressively. LoRA adapters are applied to both encoder and decoder attention blocks. The API auto-detects the model type.</p>
 
-        <h3>Quick Start</h3>
-        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+        <!-- Whisper -->
+        <div class="api-entry" id="stt-whisper">
+          <h3>Whisper / Distil-Whisper</h3>
+          <p>Whisper processes 80-bin log-mel spectrograms padded to 30 seconds. All Whisper sizes (tiny through large-v3) and Distil-Whisper variants are supported. LoRA targets: <code>query</code>, <code>key</code>, <code>value</code>, <code>out</code> in self-attention and cross-attention.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
 <pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
 from datasets import load_dataset, Audio
 
 model, processor = FastSTTModel.from_pretrained(
-    "mlx-community/whisper-tiny-asr-fp16"
+    "mlx-community/whisper-tiny-asr-fp16",
 )
 model = FastSTTModel.get_peft_model(
     model, r=16, finetune_encoder=True, finetune_decoder=True,
 )
 
-dataset = load_dataset("mozilla-foundation/common_voice_11_0", "en",
+dataset = load_dataset("mozilla-foundation/common_voice_16_0", "en",
                        split="train[:100]", trust_remote_code=True)
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
-collator = STTDataCollator(model, processor)
+collator = STTDataCollator(model, processor, language="en", task="transcribe")
 trainer = STTSFTTrainer(
     model=model, processor=processor,
     data_collator=collator, train_dataset=dataset,
     args=STTSFTConfig(output_dir="./stt_output", max_steps=100),
 )
-trainer.train()
+trainer.train()</code></pre>
+          </div>
+          <div class="callout">
+            <div class="callout-title">Distil-Whisper</div>
+            <p>Distil-Whisper variants auto-detect as the <code>whisper</code> profile and work with zero configuration changes. Just swap the model name:</p>
+            <p><code>FastSTTModel.from_pretrained("mlx-community/distil-whisper-large-v3")</code></p>
+          </div>
+        </div>
 
-FastSTTModel.for_inference(model)
-result = model.transcribe(audio_array)
-print(result)</code></pre>
+        <!-- Moonshine -->
+        <div class="api-entry" id="stt-moonshine">
+          <h3>Moonshine</h3>
+          <p>Moonshine from Useful Sensors is an efficient STT model designed for edge devices. It processes raw audio waveforms directly through a convolutional frontend (no mel spectrogram needed). Very fast inference. LoRA targets: <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>o_proj</code>.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset, Audio
+
+model, processor = FastSTTModel.from_pretrained(
+    "UsefulSensors/moonshine-tiny",
+)
+model = FastSTTModel.get_peft_model(
+    model, r=16, lora_alpha=16,
+    # Moonshine uses different attention names than Whisper
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    finetune_encoder=True, finetune_decoder=True,
+)
+
+dataset = load_dataset("mozilla-foundation/common_voice_16_0", "en",
+                       split="train[:100]", trust_remote_code=True)
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
+collator = STTDataCollator(model, processor, language="en", task="transcribe")
+trainer = STTSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=STTSFTConfig(output_dir="./moonshine_output", max_steps=100),
+)
+trainer.train()</code></pre>
+          </div>
         </div>
 
         <!-- FastSTTModel -->
         <div class="api-entry" id="FastSTTModel">
-          <h3>FastSTTModel</h3>
-          <p>Main entry point for loading and configuring STT models. Supports Whisper variants available in MLX format.</p>
+          <h3>FastSTTModel API</h3>
+          <p>Main entry point for loading and configuring STT models. Auto-detects model architecture and preprocessor from the model name.</p>
 
           <h4>FastSTTModel.from_pretrained()</h4>
           <div class="api-signature">
             <span class="api-name">FastSTTModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=448</span>, ...) &rarr; <span class="api-param">Tuple[STTModelWrapper, STTProcessor]</span>
           </div>
-          <p>Load a pretrained Whisper model. Returns model wrapper and processor (not tokenizer).</p>
+          <p>Load a pretrained STT model. Returns model wrapper and processor.</p>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
             <tbody>
-              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID (e.g., <code>"mlx-community/whisper-tiny-asr-fp16"</code>) or local path</td></tr>
+              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Whisper, Distil-Whisper, Moonshine</td></tr>
               <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum decoder sequence length</td></tr>
             </tbody>
           </table>
@@ -332,9 +464,9 @@ print(result)</code></pre>
 
           <h3 style="margin-top:24px;">STTDataCollator</h3>
           <div class="api-signature">
-            <span class="api-name">STTDataCollator</span>(<span class="api-param">model</span>, <span class="api-param">processor</span>)
+            <span class="api-name">STTDataCollator</span>(<span class="api-param">model</span>, <span class="api-param">processor</span>, <span class="api-param">language</span><span class="api-default">="en"</span>, <span class="api-param">task</span><span class="api-default">="transcribe"</span>, <span class="api-param">audio_column</span><span class="api-default">="audio"</span>, <span class="api-param">text_column</span><span class="api-default">="text"</span>)
           </div>
-          <p>Data collator for STT training. Computes 80-bin log-mel spectrograms from audio, pads or trims to 30 seconds (480,000 samples), and tokenizes transcription targets.</p>
+          <p>Data collator for STT training. For Whisper models, computes 80-bin log-mel spectrograms padded to 30 seconds. For Moonshine, passes raw audio through the conv frontend. Tokenizes transcription targets with language-specific SOT tokens.</p>
 
           <h3 style="margin-top:24px;">STTProcessor</h3>
           <div class="api-signature">
@@ -403,6 +535,27 @@ FastTTSModel.convert(
             <div class="example-tags"><span class="example-tag">STT</span><span class="example-tag">Whisper</span><span class="example-tag">Transcription</span></div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/13_whisper_stt_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
           </div>
+
+          <div class="example-card">
+            <h4>14 &mdash; OuteTTS Fine-Tuning</h4>
+            <p>Fine-tune OuteTTS-1B (Llama-based, DAC codec) for voice cloning. Text-based audio tokens, same API as Orpheus.</p>
+            <div class="example-tags"><span class="example-tag">TTS</span><span class="example-tag">OuteTTS</span><span class="example-tag">DAC</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/14_outetts_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>15 &mdash; Spark-TTS Fine-Tuning</h4>
+            <p>Fine-tune Spark-TTS (0.5B, Qwen2-based) with BiCodec. Ultra-light TTS ideal for limited RAM.</p>
+            <div class="example-tags"><span class="example-tag">TTS</span><span class="example-tag">Spark</span><span class="example-tag">BiCodec</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/15_spark_tts_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>16 &mdash; Moonshine STT Fine-Tuning</h4>
+            <p>Fine-tune Moonshine for speech-to-text. Raw conv frontend (no mel spectrogram), fast edge-device STT.</p>
+            <div class="example-tags"><span class="example-tag">STT</span><span class="example-tag">Moonshine</span><span class="example-tag">Conv Frontend</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/16_moonshine_stt_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
+          </div>
         </div>
       </section>
 
@@ -417,23 +570,43 @@ FastTTSModel.convert(
         </div>
 
         <div class="callout">
-          <div class="callout-title">SNAC Codec</div>
-          <p>Always use <code>mlx-community/snac_24khz</code> for the SNAC codec &mdash; this is the MLX-format version with safetensors weights. The original <code>hubertsiuzdak/snac_24khz</code> only has PyTorch weights and will not work.</p>
-        </div>
-
-        <div class="callout">
-          <div class="callout-title">Whisper Models</div>
-          <p>Use the <code>mlx-community/whisper-*-asr-fp16</code> model variants. These include the required <code>preprocessor_config.json</code> and <code>tokenizer.json</code> files needed for training.</p>
+          <div class="callout-title">Auto-Detection</div>
+          <p>MLX-Tune auto-detects the model type from the model name. You don't need to specify profiles, codecs, or token formats manually &mdash; just pass the model ID to <code>from_pretrained()</code>.</p>
         </div>
 
         <div class="callout">
           <div class="callout-title">Sample Rates</div>
-          <p>TTS (Orpheus) uses <strong>24 kHz</strong>. STT (Whisper) uses <strong>16 kHz</strong>. Always cast your dataset audio column to the correct sample rate before training: <code>dataset.cast_column("audio", Audio(sampling_rate=...))</code>.</p>
+          <p>Different models use different sample rates. Always cast your dataset audio column to match:</p>
+          <ul style="margin: 8px 0 0 16px;">
+            <li><strong>24 kHz</strong>: Orpheus, OuteTTS, Sesame/CSM</li>
+            <li><strong>16 kHz</strong>: Spark-TTS, Whisper, Distil-Whisper, Moonshine</li>
+          </ul>
+          <p style="margin-top:8px;"><code>dataset.cast_column("audio", Audio(sampling_rate=24000))</code></p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Recommended Models</div>
+          <p>Use MLX-format models from <code>mlx-community</code> on HuggingFace:</p>
+          <ul style="margin: 8px 0 0 16px;">
+            <li>Orpheus: <code>mlx-community/orpheus-3b-0.1-ft-bf16</code></li>
+            <li>OuteTTS: <code>mlx-community/Llama-OuteTTS-1.0-1B-8bit</code></li>
+            <li>Spark: <code>mlx-community/Spark-TTS-0.5B-bf16</code></li>
+            <li>Whisper: <code>mlx-community/whisper-*-asr-fp16</code></li>
+            <li>Distil-Whisper: <code>mlx-community/distil-whisper-large-v3</code></li>
+            <li>Moonshine: <code>UsefulSensors/moonshine-tiny</code></li>
+          </ul>
         </div>
 
         <div class="callout">
           <div class="callout-title">Memory</div>
-          <p><strong>16 GB+</strong> unified RAM recommended for audio training. Orpheus-3B in 4-bit quantization fits in ~8 GB; full precision requires ~12 GB. Whisper-tiny fits easily in 8 GB.</p>
+          <p><strong>16 GB+</strong> unified RAM recommended. Approximate requirements:</p>
+          <ul style="margin: 8px 0 0 16px;">
+            <li>Spark-TTS (0.5B): ~4 GB</li>
+            <li>OuteTTS (1B, 8-bit): ~4 GB</li>
+            <li>Whisper-tiny / Moonshine-tiny: ~2 GB</li>
+            <li>Orpheus-3B (4-bit): ~8 GB</li>
+            <li>Distil-Whisper-large-v3: ~6 GB</li>
+          </ul>
         </div>
 
         <div class="callout">

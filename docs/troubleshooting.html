@@ -208,12 +208,25 @@ model, processor = FastSTTModel.from_pretrained("mlx-community/whisper-tiny-asr-
       <p>Like VLM training, audio training forces <code>batch_size=1</code> due to variable-length audio sequences. Use <code>gradient_accumulation_steps</code> to simulate larger batches.</p>
 
       <h3>Sample rate mismatch</h3>
-      <p>TTS (Orpheus) expects <strong>24kHz</strong> audio. STT (Whisper) expects <strong>16kHz</strong>. Always cast your dataset to the correct sample rate:</p>
+      <p>Each model expects a specific sample rate. Always cast your dataset to match:</p>
+      <table style="width:100%;margin:1rem 0;border-collapse:collapse;">
+        <thead><tr style="border-bottom:1px solid var(--border);text-align:left;">
+          <th style="padding:0.5rem;">Model</th><th style="padding:0.5rem;">Sample Rate</th>
+        </tr></thead>
+        <tbody style="color:var(--text-secondary);">
+          <tr><td style="padding:0.4rem 0.5rem;">Orpheus (SNAC)</td><td style="padding:0.4rem 0.5rem;">24 kHz</td></tr>
+          <tr><td style="padding:0.4rem 0.5rem;">OuteTTS (DAC)</td><td style="padding:0.4rem 0.5rem;">24 kHz</td></tr>
+          <tr><td style="padding:0.4rem 0.5rem;">Spark-TTS (BiCodec)</td><td style="padding:0.4rem 0.5rem;">16 kHz</td></tr>
+          <tr><td style="padding:0.4rem 0.5rem;">Sesame/CSM (Mimi)</td><td style="padding:0.4rem 0.5rem;">24 kHz</td></tr>
+          <tr><td style="padding:0.4rem 0.5rem;">Whisper (STT)</td><td style="padding:0.4rem 0.5rem;">16 kHz</td></tr>
+          <tr><td style="padding:0.4rem 0.5rem;">Moonshine (STT)</td><td style="padding:0.4rem 0.5rem;">16 kHz</td></tr>
+        </tbody>
+      </table>
       <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
 <pre><code class="language-python">from datasets import Audio
-# TTS: 24kHz
+# TTS: 24kHz (Orpheus, OuteTTS, Sesame) or 16kHz (Spark)
 dataset = dataset.cast_column("audio", Audio(sampling_rate=24000))
-# STT: 16kHz
+# STT: 16kHz (Whisper, Moonshine)
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))</code></pre>
       </div>
 
@@ -226,6 +239,37 @@ FastTTSModel.convert("canopylabs/orpheus-3b-0.1-ft", output_dir="./orpheus-mlx")
 # STT models
 FastSTTModel.convert("openai/whisper-large-v3", output_dir="./whisper-mlx")</code></pre>
       </div>
+
+      <h3>FFmpeg not installed (audio loading errors)</h3>
+      <p>Audio datasets require FFmpeg for decoding. If you see errors like <code>RuntimeError: Failed to load audio</code> or <code>soundfile</code>/<code>librosa</code> failures:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># macOS
+brew install ffmpeg
+
+# Verify
+ffmpeg -version</code></pre>
+      </div>
+
+      <h3><code>datasets</code> version conflict (torchcodec)</h3>
+      <p><code>datasets &ge; 4.0</code> dropped <code>soundfile</code>/<code>librosa</code> audio backends and requires <code>torchcodec</code>, which needs specific FFmpeg versions (4&ndash;7) that conflict with Homebrew's FFmpeg 8. MLX-Tune pins <code>datasets &lt; 4.0</code> to avoid this. If you see:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-text">ImportError: torchcodec is required but not installed
+# or
+RuntimeError: FFmpeg version 8 is not supported by torchcodec</code></pre>
+      </div>
+      <p>Fix by ensuring you have the correct datasets version:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-bash">uv pip install 'datasets>=2.14.0,<4.0.0'</code></pre>
+      </div>
+
+      <h3>Model-specific codec not loading</h3>
+      <p>Each TTS model uses a different audio codec. MLX-Tune auto-detects the codec from the model, but if you see errors about missing codec attributes:</p>
+      <ul style="color:var(--text-secondary);line-height:2;">
+        <li><strong>Orpheus</strong> &mdash; Uses SNAC. Pass <code>codec_model="mlx-community/snac_24khz"</code> explicitly if auto-detection fails.</li>
+        <li><strong>OuteTTS</strong> &mdash; Uses DAC. The codec is loaded via <code>AudioProcessor()</code> internally.</li>
+        <li><strong>Spark-TTS</strong> &mdash; Uses BiCodec. Accessed via <code>model._audio_tokenizer</code> after loading.</li>
+        <li><strong>Sesame/CSM</strong> &mdash; Uses Mimi. Loaded from the model's codec attribute.</li>
+      </ul>
 
       <!-- Getting Help -->
       <h2 id="help">Getting Help</h2>

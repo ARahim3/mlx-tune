@@ -15,7 +15,7 @@ Supported Training Methods:
 - STT (Speech-to-Text) fine-tuning
 """
 
-__version__ = "0.4.7"  # Add TTS (Orpheus) and STT (Whisper) fine-tuning support
+__version__ = "0.4.8"  # Audio model profiles, multi-model abstraction
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (
@@ -83,6 +83,20 @@ from mlx_tune.stt import (
     STTSFTConfig,
     STTDataCollator,
     STTProcessor,
+)
+
+# Audio Profiles and Codec Adapters
+from mlx_tune.audio_profiles import (
+    TTSModelProfile,
+    STTModelProfile,
+    TTS_PROFILES,
+    STT_PROFILES,
+    detect_tts_model_type,
+    detect_stt_model_type,
+)
+from mlx_tune.audio_codecs import (
+    CodecAdapter,
+    create_codec,
 )
 
 # Chat Templates and Dataset Formatting (Unsloth-compatible)
@@ -153,6 +167,15 @@ __all__ = [
     "STTSFTConfig",
     "STTDataCollator",
     "STTProcessor",
+    # Audio Profiles and Codec Adapters
+    "TTSModelProfile",
+    "STTModelProfile",
+    "TTS_PROFILES",
+    "STT_PROFILES",
+    "detect_tts_model_type",
+    "detect_stt_model_type",
+    "CodecAdapter",
+    "create_codec",
     # Loss Functions
     "compute_log_probs",
     "compute_log_probs_with_lengths",

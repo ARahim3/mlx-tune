@@ -279,7 +279,9 @@ class TestTTSDataCollator:
 
     def _make_collator(self):
         from mlx_tune.tts import TTSDataCollator, TTSModelWrapper
+        from mlx_tune.audio_profiles import TTS_PROFILES
         mock_model = MagicMock(spec=TTSModelWrapper)
+        mock_model.profile = TTS_PROFILES["orpheus"]
         mock_model.sample_rate = 24000
         mock_model.start_token = 128259
         mock_model.end_tokens = [128009, 128260]

@@ -23,6 +23,12 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_tune.audio_profiles import (
+    STTModelProfile,
+    STT_PROFILES,
+    detect_stt_model_type,
+)
+
 # Try to import mlx-audio for Whisper
 HAS_MLX_AUDIO = False
 _whisper_audio = None
@@ -182,18 +188,23 @@ class FastSTTModel:
 
         processor = STTProcessor(tokenizer=tokenizer, model=model, hf_processor=hf_processor)
 
+        # Auto-detect model profile
+        profile_key = detect_stt_model_type(model_name, {})
+        profile = STT_PROFILES.get(profile_key) if profile_key else None
+
         wrapper = STTModelWrapper(
             model=model,
             processor=processor,
             model_name=model_name,
             max_seq_length=max_seq_length,
+            profile=profile,
         )
 
         n_enc = model.dims.n_audio_layer if hasattr(model, "dims") else "?"
         n_dec = model.dims.n_text_layer if hasattr(model, "dims") else "?"
         print(f"STT model loaded: {model_name}")
         print(f"  Encoder layers: {n_enc}, Decoder layers: {n_dec}")
-        print(f"  Sample rate: {WHISPER_SAMPLE_RATE}Hz, Max decode length: {max_seq_length}")
+        print(f"  Sample rate: {wrapper.profile.sample_rate}Hz, Max decode length: {max_seq_length}")
 
         return wrapper, processor
 
@@ -325,11 +336,13 @@ class STTProcessor:
     into a single processor object (similar to HF WhisperProcessor).
     """
 
-    def __init__(self, tokenizer: Any = None, model: Any = None, hf_processor: Any = None):
+    def __init__(self, tokenizer: Any = None, model: Any = None, hf_processor: Any = None,
+                 max_audio_samples: int = WHISPER_N_SAMPLES):
         self._raw_tokenizer = tokenizer  # HF WhisperTokenizer
         self._model = model
         self._hf_processor = hf_processor  # transformers.WhisperProcessor
         self._whisper_tokenizer = None  # HFTokenizerWrapper from model.get_tokenizer()
+        self._max_audio_samples = max_audio_samples
 
         # Try to get the Whisper tokenizer wrapper (has sot_sequence, eot, etc.)
         if model is not None and hf_processor is not None:
@@ -381,8 +394,8 @@ class STTProcessor:
         if isinstance(audio, np.ndarray):
             audio = mx.array(audio)
 
-        # Pad or trim to 30 seconds
-        audio = _whisper_audio.pad_or_trim(audio, WHISPER_N_SAMPLES)
+        # Pad or trim to max audio length (default 30 seconds)
+        audio = _whisper_audio.pad_or_trim(audio, self._max_audio_samples)
 
         # Compute mel spectrogram
         mel = _whisper_audio.log_mel_spectrogram(audio, n_mels=n_mels)
@@ -391,6 +404,24 @@ class STTProcessor:
             mel = mx.array(mel)
 
         return mel
+
+    def preprocess_raw_audio(self, audio: Union[np.ndarray, mx.array]) -> mx.array:
+        """
+        Preprocess raw audio for models with conv frontends (e.g., Moonshine).
+
+        No mel spectrogram — just normalize and convert to mx.array.
+        The model's conv encoder handles feature extraction.
+
+        Args:
+            audio: Audio waveform at model sample rate
+
+        Returns:
+            Preprocessed audio as mx.array
+        """
+        if isinstance(audio, np.ndarray):
+            audio = mx.array(audio, dtype=mx.float32)
+
+        return audio
 
     @property
     def sot_sequence(self) -> Tuple[int, ...]:
@@ -418,7 +449,13 @@ class STTModelWrapper:
         model_name: str,
         max_seq_length: int = 448,
         config: Optional[Dict] = None,
+        profile: Optional[STTModelProfile] = None,
     ):
+        # Resolve profile: use provided, or fall back to Whisper default
+        if profile is None:
+            profile = STT_PROFILES["whisper"]
+        self.profile = profile
+
         self.model = model
         self.processor = processor
         self.model_name = model_name
@@ -443,7 +480,7 @@ class STTModelWrapper:
         else:
             self.n_audio_layer = 0
             self.n_text_layer = 0
-            self.n_mels = WHISPER_N_MELS
+            self.n_mels = self.profile.n_mels
             self.n_vocab = 51865
 
     def configure_lora(
@@ -508,7 +545,8 @@ class STTModelWrapper:
         lora_alpha = self.lora_config["lora_alpha"]
         scale = lora_alpha / r
         dropout = self.lora_config.get("lora_dropout", 0.0)
-        target_modules = self.lora_config.get("target_modules", ["query", "key", "value", "out"])
+        target_modules = self.lora_config.get("target_modules",
+                                                list(self.profile.lora_target_modules))
         finetune_encoder = self.lora_config.get("finetune_encoder", True)
         finetune_decoder = self.lora_config.get("finetune_decoder", True)
 
@@ -517,11 +555,19 @@ class STTModelWrapper:
 
         total_replaced = 0
 
+        # Navigate to encoder/decoder blocks using profile paths
+        enc_parts = self.profile.encoder_block_path.split(".")  # e.g. ["encoder", "blocks"]
+        dec_parts = self.profile.decoder_block_path.split(".")  # e.g. ["decoder", "blocks"]
+
         # Apply LoRA to encoder blocks
-        if finetune_encoder and hasattr(self.model, "encoder"):
-            encoder = self.model.encoder
-            if hasattr(encoder, "blocks"):
-                for block in encoder.blocks:
+        if finetune_encoder:
+            enc_obj = self.model
+            for part in enc_parts:
+                enc_obj = getattr(enc_obj, part, None)
+                if enc_obj is None:
+                    break
+            if enc_obj is not None:
+                for block in enc_obj:
                     total_replaced += self._apply_lora_to_block(
                         block, target_modules, r, scale, dropout,
                         has_cross_attn=False,
@@ -529,10 +575,14 @@ class STTModelWrapper:
             print(f"  Encoder: LoRA applied to {self.n_audio_layer} blocks")
 
         # Apply LoRA to decoder blocks
-        if finetune_decoder and hasattr(self.model, "decoder"):
-            decoder = self.model.decoder
-            if hasattr(decoder, "blocks"):
-                for block in decoder.blocks:
+        if finetune_decoder:
+            dec_obj = self.model
+            for part in dec_parts:
+                dec_obj = getattr(dec_obj, part, None)
+                if dec_obj is None:
+                    break
+            if dec_obj is not None:
+                for block in dec_obj:
                     total_replaced += self._apply_lora_to_block(
                         block, target_modules, r, scale, dropout,
                         has_cross_attn=True,
@@ -579,25 +629,30 @@ class STTModelWrapper:
         """
         replaced = 0
 
-        # Self-attention
-        if hasattr(block, "attn"):
+        # Self-attention - use profile's attn_names to find the attribute
+        self_attn_attr = self.profile.attn_names.get("self_attn", "attn")
+        if hasattr(block, self_attn_attr):
+            attn_module = getattr(block, self_attn_attr)
             for module_name in target_modules:
-                if hasattr(block.attn, module_name):
-                    original = getattr(block.attn, module_name)
+                if hasattr(attn_module, module_name):
+                    original = getattr(attn_module, module_name)
                     if isinstance(original, nn.Linear):
                         lora_layer = _create_lora_linear(original, r, scale, dropout)
-                        setattr(block.attn, module_name, lora_layer)
+                        setattr(attn_module, module_name, lora_layer)
                         replaced += 1
 
-        # Cross-attention (decoder only)
-        if has_cross_attn and hasattr(block, "cross_attn") and block.cross_attn is not None:
-            for module_name in target_modules:
-                if hasattr(block.cross_attn, module_name):
-                    original = getattr(block.cross_attn, module_name)
-                    if isinstance(original, nn.Linear):
-                        lora_layer = _create_lora_linear(original, r, scale, dropout)
-                        setattr(block.cross_attn, module_name, lora_layer)
-                        replaced += 1
+        # Cross-attention (decoder only) - use profile's cross_attn_attr
+        cross_attn_attr = self.profile.cross_attn_attr
+        if has_cross_attn and hasattr(block, cross_attn_attr):
+            cross_attn_module = getattr(block, cross_attn_attr)
+            if cross_attn_module is not None:
+                for module_name in target_modules:
+                    if hasattr(cross_attn_module, module_name):
+                        original = getattr(cross_attn_module, module_name)
+                        if isinstance(original, nn.Linear):
+                            lora_layer = _create_lora_linear(original, r, scale, dropout)
+                            setattr(cross_attn_module, module_name, lora_layer)
+                            replaced += 1
 
         # MLP layers (if "mlp1" or "mlp2" in target_modules)
         for mlp_name in ["mlp1", "mlp2"]:
@@ -682,7 +737,7 @@ class STTModelWrapper:
                     "n_text_layer": self.n_text_layer,
                     "n_mels": self.n_mels,
                     "n_vocab": self.n_vocab,
-                    "sample_rate": WHISPER_SAMPLE_RATE,
+                    "sample_rate": self.profile.sample_rate,
                     "max_seq_length": self.max_seq_length,
                 },
             }
@@ -928,6 +983,17 @@ class STTDataCollator:
         # Possible text column names
         self._text_candidates = ["text", "transcription", "sentence", "transcript"]
 
+        # Get a language/task-specific tokenizer so SOT sequence has correct
+        # language and task tokens (e.g. <|fr|> instead of hardcoded <|en|>)
+        self._lang_tokenizer = None
+        if language != "en" or task != "transcribe":
+            try:
+                self._lang_tokenizer = processor.get_tokenizer(
+                    language=language, task=task
+                )
+            except Exception:
+                pass
+
     def _find_text_column(self, sample: Dict) -> str:
         """Auto-detect the text column name."""
         if self.text_column:
@@ -987,48 +1053,61 @@ class STTDataCollator:
         }
 
     def _process_sample(self, sample: Dict) -> Tuple[mx.array, List[int], List[int]]:
-        """Process a single sample into mel, decoder_input_ids, and labels."""
+        """Process a single sample into audio features, decoder_input_ids, and labels."""
         # Get audio
         audio_data = sample.get(self.audio_column)
         if audio_data is None:
             raise ValueError(f"Sample missing '{self.audio_column}' column")
 
+        # Get target sample rate from profile
+        target_sr = self.model.profile.sample_rate
+
         # Handle HuggingFace Audio format
         if isinstance(audio_data, dict):
             audio_array = np.array(audio_data.get("array", audio_data.get("data")), dtype=np.float32)
-            sr = audio_data.get("sampling_rate", WHISPER_SAMPLE_RATE)
+            sr = audio_data.get("sampling_rate", target_sr)
         elif isinstance(audio_data, np.ndarray):
             audio_array = audio_data.astype(np.float32)
-            sr = WHISPER_SAMPLE_RATE
+            sr = target_sr
         else:
             audio_array = np.array(audio_data, dtype=np.float32)
-            sr = WHISPER_SAMPLE_RATE
+            sr = target_sr
 
         # Resample if needed
-        if sr != WHISPER_SAMPLE_RATE:
+        if sr != target_sr:
             try:
                 from mlx_audio.stt.utils import resample_audio
-                audio_array = resample_audio(audio_array, sr, WHISPER_SAMPLE_RATE)
+                audio_array = resample_audio(audio_array, sr, target_sr)
             except ImportError:
                 import librosa
-                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=WHISPER_SAMPLE_RATE)
+                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=target_sr)
 
-        # Compute mel spectrogram
-        mel = self.processor.compute_mel(audio_array, n_mels=self.model.n_mels)
+        # Compute audio features based on preprocessor type
+        preprocessor = self.model.profile.preprocessor
+        if preprocessor == "raw_conv":
+            # Raw waveform for conv-frontend models (Moonshine)
+            features = self.processor.preprocess_raw_audio(audio_array)
+        else:
+            # Default: log-mel spectrogram (Whisper)
+            features = self.processor.compute_mel(audio_array, n_mels=self.model.n_mels)
 
         # Get text
         text_col = self._find_text_column(sample)
         text = sample[text_col]
 
-        # Tokenize transcript
-        tokenizer = self.processor.tokenizer
+        # Use language-specific tokenizer if available, otherwise default
+        tokenizer = self._lang_tokenizer or self.processor.tokenizer
         if tokenizer is not None:
             transcript_tokens = tokenizer.encode(text)
         else:
             transcript_tokens = []
 
         # Build decoder input: SOT sequence + transcript tokens
-        sot_seq = list(self.processor.sot_sequence)
+        # Use language-specific SOT sequence (contains correct <|lang|> and <|task|> tokens)
+        if self._lang_tokenizer and hasattr(self._lang_tokenizer, "sot_sequence"):
+            sot_seq = list(self._lang_tokenizer.sot_sequence)
+        else:
+            sot_seq = list(self.processor.sot_sequence)
 
         # Decoder input: [SOT, lang, task, ...transcript_tokens]
         decoder_input_ids = sot_seq + transcript_tokens
@@ -1042,7 +1121,7 @@ class STTDataCollator:
         while len(labels) < len(decoder_input_ids):
             labels = [-100] + labels  # Pad front with ignore
 
-        return mel, decoder_input_ids, labels
+        return features, decoder_input_ids, labels
 
 
 class STTSFTTrainer:
@@ -1142,14 +1221,29 @@ class STTSFTTrainer:
         print(f"  Gradient accumulation: {self.gradient_accumulation_steps}")
         print(f"  Learning rate: {self.learning_rate}")
 
+        # Detect model architecture for forward pass dispatch
+        _is_moonshine = (self.wrapper and self.wrapper.profile
+                         and self.wrapper.profile.name == "moonshine")
+
         # Seq2seq loss function
         def loss_fn(model, batch):
             mel = batch["input_features"]
             decoder_input_ids = batch["decoder_input_ids"]
             labels = batch["labels"]
 
-            # Forward pass: mel -> encoder -> decoder -> logits
-            logits = model(mel, decoder_input_ids)
+            # Forward pass: dispatch based on model architecture
+            if _is_moonshine:
+                # Moonshine: encoder(audio) -> decoder(tokens, encoder_out)
+                encoder_out = model.encoder(mel)
+                decoder_out, _ = model.decoder(decoder_input_ids, encoder_out)
+                # Project to vocab
+                if hasattr(model, "proj_out"):
+                    logits = model.proj_out(decoder_out)
+                else:
+                    logits = model.decoder.embed_tokens.as_linear(decoder_out)
+            else:
+                # Whisper: model(mel, decoder_input_ids) -> logits
+                logits = model(mel, decoder_input_ids)
 
             # Handle models that return objects
             if hasattr(logits, "logits"):

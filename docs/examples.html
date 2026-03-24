@@ -419,6 +419,101 @@ print(result)</code></pre>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/13_whisper_stt_finetuning.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
+
+        <div class="example-card">
+          <h4>14 &mdash; OuteTTS Fine-Tuning</h4>
+          <p>Fine-tune OuteTTS-1B (Llama + DAC codec) for voice cloning with text-based audio tokens.</p>
+          <div class="example-tags"><span class="example-tag">FastTTSModel</span><span class="example-tag">TTS</span><span class="example-tag">DAC</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code" style="display:none;">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastTTSModel, TTSSFTTrainer, TTSSFTConfig, TTSDataCollator
+from datasets import load_dataset, Audio
+
+model, tokenizer = FastTTSModel.from_pretrained(
+    "mlx-community/Llama-OuteTTS-1.0-1B-8bit",
+)
+model = FastTTSModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("MrDragonFox/Elise", split="train[:10]")
+dataset = dataset.cast_column("audio", Audio(sampling_rate=24000))
+
+collator = TTSDataCollator(model, tokenizer)
+trainer = TTSSFTTrainer(
+    model=model, tokenizer=tokenizer,
+    data_collator=collator, train_dataset=dataset,
+    args=TTSSFTConfig(output_dir="./outetts_output", max_steps=60),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/14_outetts_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>15 &mdash; Spark-TTS Fine-Tuning</h4>
+          <p>Fine-tune Spark-TTS (0.5B, Qwen2 + BiCodec) &mdash; ultra-light TTS for Apple Silicon.</p>
+          <div class="example-tags"><span class="example-tag">FastTTSModel</span><span class="example-tag">TTS</span><span class="example-tag">BiCodec</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code" style="display:none;">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastTTSModel, TTSSFTTrainer, TTSSFTConfig, TTSDataCollator
+from datasets import load_dataset, Audio
+
+model, tokenizer = FastTTSModel.from_pretrained(
+    "mlx-community/Spark-TTS-0.5B-bf16",
+)
+model = FastTTSModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("MrDragonFox/Elise", split="train[:10]")
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
+collator = TTSDataCollator(model, tokenizer)
+trainer = TTSSFTTrainer(
+    model=model, tokenizer=tokenizer,
+    data_collator=collator, train_dataset=dataset,
+    args=TTSSFTConfig(output_dir="./spark_output", max_steps=60, sample_rate=16000),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/15_spark_tts_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>16 &mdash; Moonshine STT Fine-Tuning</h4>
+          <p>Fine-tune Moonshine for speech-to-text with raw conv frontend (no mel spectrogram).</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Moonshine</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code" style="display:none;">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset, Audio
+
+model, processor = FastSTTModel.from_pretrained(
+    "UsefulSensors/moonshine-tiny",
+)
+model = FastSTTModel.get_peft_model(
+    model, r=16, lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+)
+
+dataset = load_dataset("mozilla-foundation/common_voice_16_0", "en",
+                       split="train[:10]", trust_remote_code=True)
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+
+collator = STTDataCollator(model, processor, language="en", task="transcribe",
+                           audio_column="audio", text_column="sentence")
+trainer = STTSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=STTSFTConfig(output_dir="./moonshine_output", max_steps=100),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/16_moonshine_stt_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
       </div>
 
       <footer class="footer">
