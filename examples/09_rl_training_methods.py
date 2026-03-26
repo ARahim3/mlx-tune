@@ -17,8 +17,9 @@ from mlx_tune import (
     ORPOTrainer, ORPOConfig,
     GRPOTrainer, GRPOConfig,
     # Utilities
-    prepare_preference_dataset,
+    prepare_rl_dataset,
     create_reward_function,
+    resume_from_checkpoint,
 )
 
 
@@ -60,6 +61,8 @@ def demo_dpo_training():
         },
     ]
 
+    prepared_dataset = prepare_rl_dataset(preference_data, mode="preference", tokenizer=tokenizer)
+
     # Configure DPO
     config = DPOConfig(
         beta=0.1,  # KL penalty coefficient
@@ -72,7 +75,7 @@ def demo_dpo_training():
     # Create trainer
     trainer = DPOTrainer(
         model=model,
-        train_dataset=preference_data,
+        train_dataset=prepared_dataset,
         tokenizer=tokenizer,
         args=config,
     )
@@ -122,12 +125,19 @@ def demo_grpo_training():
         },
     ]
 
-    # Create a math reward function
-    math_reward = create_reward_function("math")
+    prepared_dataset = prepare_rl_dataset(reasoning_data, mode="prompt", tokenizer=tokenizer)
+
+    # Compose rewards through the public RL API surface.
+    math_reward = create_reward_function(
+        rewards=[
+            {"name": "math", "source": "math", "weight": 1.0},
+            {"name": "length", "source": "length", "weight": 0.1},
+        ]
+    )
 
     # Configure GRPO
     config = GRPOConfig(
-        loss_type="grpo",  # grpo, dr_grpo, dapo, bnpo
+        loss_type="grpo",  # Phase 1 accepts grpo/dr_grpo/dapo/bnpo via one shared objective
         beta=0.04,
         num_generations=4,  # Multiple generations per prompt
         temperature=0.7,
@@ -139,7 +149,7 @@ def demo_grpo_training():
     # Create trainer with custom reward function
     trainer = GRPOTrainer(
         model=model,
-        train_dataset=reasoning_data,
+        train_dataset=prepared_dataset,
         tokenizer=tokenizer,
         reward_fn=math_reward,  # Custom reward!
         args=config,
@@ -153,6 +163,7 @@ def demo_grpo_training():
 
     # Would train with: trainer.train()
     print("\nTo train: trainer.train()")
+    print(f"To inspect a saved checkpoint first: {resume_from_checkpoint.__name__}('./grpo_output')")
 
 
 def demo_orpo_training():
@@ -221,14 +232,14 @@ def show_available_trainers():
         print(f"| {name} | {method} | {use_case} |")
 
     print("\n" + "=" * 70)
-    print("GRPO Loss Types (for reasoning models)")
+    print("GRPO Loss Types (accepted in Phase 1)")
     print("=" * 70)
 
     grpo_types = [
-        ("grpo", "Standard GRPO", "Default for reasoning"),
-        ("dr_grpo", "Dr. GRPO", "Distilled version"),
-        ("dapo", "DAPO", "Data-efficient variant"),
-        ("bnpo", "BNPO", "Batch-normalized variant"),
+        ("grpo", "Standard GRPO", "Primary Phase 1 name"),
+        ("dr_grpo", "Dr. GRPO", "Accepted alias; shared Phase 1 objective"),
+        ("dapo", "DAPO", "Accepted alias; shared Phase 1 objective"),
+        ("bnpo", "BNPO", "Accepted alias; shared Phase 1 objective"),
     ]
 
     print("\n| Loss Type | Name | Description |")
