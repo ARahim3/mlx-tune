@@ -15,7 +15,7 @@ Supported Training Methods:
 - STT (Speech-to-Text) fine-tuning
 """
 
-__version__ = "0.4.10"  # Qwen3-TTS fine-tuning support
+__version__ = "0.4.11"  # E2E RL training support (GRPO fix, KTOConfig, SimPOConfig)
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (
@@ -37,7 +37,9 @@ from mlx_tune.rl_trainers import (
     GRPOTrainer,
     GRPOConfig,
     KTOTrainer,
+    KTOConfig,
     SimPOTrainer,
+    SimPOConfig,
     prepare_preference_dataset,
     create_reward_function,
 )
@@ -147,7 +149,9 @@ __all__ = [
     "GRPOTrainer",
     "GRPOConfig",
     "KTOTrainer",
+    "KTOConfig",
     "SimPOTrainer",
+    "SimPOConfig",
     # Vision Models
     "FastVisionModel",
     "VLMSFTTrainer",

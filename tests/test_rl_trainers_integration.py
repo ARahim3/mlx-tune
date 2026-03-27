@@ -136,10 +136,12 @@ def preference_dataset():
 
 @pytest.fixture
 def kto_dataset():
-    """Sample dataset for KTO (binary feedback)."""
+    """Sample dataset for KTO (binary feedback) — both TRL and legacy formats."""
     return [
-        {"text": "Machine learning is a branch of AI.", "label": 1},  # Good
-        {"text": "idk computers stuff", "label": 0},  # Bad
+        # TRL format (prompt + completion + label)
+        {"prompt": "What is ML?", "completion": "Machine learning is a branch of AI.", "label": True},
+        {"prompt": "What is ML?", "completion": "idk computers stuff", "label": False},
+        # Legacy format (text + numeric label)
         {"text": "Python is a programming language.", "label": 1},  # Good
         {"text": "python snake", "label": 0},  # Bad
     ]
@@ -521,14 +523,36 @@ class TestGRPOTrainerIntegration:
 class TestKTOTrainerIntegration:
     """Integration tests for KTOTrainer."""
 
-    def test_kto_trainer_init(self, small_model, mock_tokenizer, kto_dataset):
-        """Test KTOTrainer can be initialized."""
+    def test_kto_trainer_init_with_config(self, small_model, mock_tokenizer, kto_dataset):
+        """Test KTOTrainer can be initialized with KTOConfig."""
+        from mlx_tune import KTOTrainer, KTOConfig
+
+        config = KTOConfig(
+            beta=0.1,
+            learning_rate=1e-4,
+            max_steps=2,
+            output_dir="./test_kto_output",
+        )
+
+        trainer = KTOTrainer(
+            model=small_model,
+            train_dataset=kto_dataset,
+            tokenizer=mock_tokenizer,
+            args=config,
+        )
+
+        assert trainer is not None
+        assert trainer.beta == 0.1
+
+    def test_kto_trainer_init_kwargs_compat(self, small_model, mock_tokenizer, kto_dataset):
+        """Test KTOTrainer backward-compat with kwargs."""
         from mlx_tune import KTOTrainer
 
         trainer = KTOTrainer(
             model=small_model,
             train_dataset=kto_dataset,
             tokenizer=mock_tokenizer,
+            beta=0.2,
             learning_rate=1e-4,
             max_steps=2,
         )
@@ -537,33 +561,43 @@ class TestKTOTrainerIntegration:
 
     def test_kto_trainer_train_runs(self, small_model, mock_tokenizer, kto_dataset):
         """Test KTOTrainer.train() executes without errors."""
-        from mlx_tune import KTOTrainer
+        from mlx_tune import KTOTrainer, KTOConfig
+
+        config = KTOConfig(
+            learning_rate=1e-4,
+            max_steps=2,
+            output_dir="./test_kto_output",
+        )
 
         trainer = KTOTrainer(
             model=small_model,
             train_dataset=kto_dataset,
             tokenizer=mock_tokenizer,
-            learning_rate=1e-4,
-            max_steps=2,
+            args=config,
         )
 
         result = trainer.train()
         assert result is not None
 
-    def test_kto_binary_feedback(self, small_model, mock_tokenizer, kto_dataset):
-        """Test KTO processes binary feedback correctly."""
-        from mlx_tune import KTOTrainer
+    def test_kto_binary_feedback_both_formats(self, small_model, mock_tokenizer, kto_dataset):
+        """Test KTO processes both TRL and legacy format samples."""
+        from mlx_tune import KTOTrainer, KTOConfig
 
-        # Ensure dataset has both positive and negative examples
-        assert any(d['label'] == 1 for d in kto_dataset), "Need positive examples"
-        assert any(d['label'] == 0 for d in kto_dataset), "Need negative examples"
+        # Dataset has both TRL format (prompt+completion+label) and legacy (text+label)
+        assert any('prompt' in d for d in kto_dataset), "Need TRL format samples"
+        assert any('text' in d for d in kto_dataset), "Need legacy format samples"
+
+        config = KTOConfig(
+            learning_rate=1e-4,
+            max_steps=3,
+            output_dir="./test_kto_output",
+        )
 
         trainer = KTOTrainer(
             model=small_model,
             train_dataset=kto_dataset,
             tokenizer=mock_tokenizer,
-            learning_rate=1e-4,
-            max_steps=3,
+            args=config,
         )
 
         result = trainer.train()
@@ -578,30 +612,44 @@ class TestKTOTrainerIntegration:
 class TestSimPOTrainerIntegration:
     """Integration tests for SimPOTrainer."""
 
-    def test_simpo_trainer_init(self, small_model, mock_tokenizer, preference_dataset):
-        """Test SimPOTrainer can be initialized."""
-        from mlx_tune import SimPOTrainer
+    def test_simpo_trainer_init_with_config(self, small_model, mock_tokenizer, preference_dataset):
+        """Test SimPOTrainer can be initialized with SimPOConfig."""
+        from mlx_tune import SimPOTrainer, SimPOConfig
+
+        config = SimPOConfig(
+            beta=2.0,
+            gamma=0.5,
+            learning_rate=1e-4,
+            max_steps=2,
+            output_dir="./test_simpo_output",
+        )
 
         trainer = SimPOTrainer(
             model=small_model,
             train_dataset=preference_dataset,
             tokenizer=mock_tokenizer,
-            learning_rate=1e-4,
-            max_steps=2,
+            args=config,
         )
 
         assert trainer is not None
+        assert trainer.beta == 2.0
+        assert trainer.gamma == 0.5
 
     def test_simpo_trainer_train_runs(self, small_model, mock_tokenizer, preference_dataset):
         """Test SimPOTrainer.train() executes without errors."""
-        from mlx_tune import SimPOTrainer
+        from mlx_tune import SimPOTrainer, SimPOConfig
+
+        config = SimPOConfig(
+            learning_rate=1e-4,
+            max_steps=2,
+            output_dir="./test_simpo_output",
+        )
 
         trainer = SimPOTrainer(
             model=small_model,
             train_dataset=preference_dataset,
             tokenizer=mock_tokenizer,
-            learning_rate=1e-4,
-            max_steps=2,
+            args=config,
         )
 
         result = trainer.train()
@@ -609,15 +657,19 @@ class TestSimPOTrainerIntegration:
 
     def test_simpo_no_reference_model(self, small_model, mock_tokenizer, preference_dataset):
         """Test SimPO works without reference model."""
-        from mlx_tune import SimPOTrainer
+        from mlx_tune import SimPOTrainer, SimPOConfig
 
-        # SimPO is special: it doesn't require a reference model
+        config = SimPOConfig(
+            learning_rate=1e-4,
+            max_steps=3,
+            output_dir="./test_simpo_output",
+        )
+
         trainer = SimPOTrainer(
             model=small_model,
             train_dataset=preference_dataset,
             tokenizer=mock_tokenizer,
-            learning_rate=1e-4,
-            max_steps=3,
+            args=config,
         )
 
         result = trainer.train()
@@ -828,6 +880,140 @@ class TestRewardFunctions:
         assert my_reward("Thank you") == 0.5
         assert my_reward("Please help, thank you!") == 1.0
         assert my_reward("Hello world") == 0.0
+
+
+# =============================================================================
+# CONFIG CLASS TESTS
+# =============================================================================
+
+class TestConfigClasses:
+    """Test RL trainer config classes."""
+
+    def test_kto_config_defaults(self):
+        """Test KTOConfig with default values."""
+        from mlx_tune import KTOConfig
+
+        config = KTOConfig()
+        assert config.beta == 0.1
+        assert config.desirable_weight == 1.0
+        assert config.undesirable_weight == 1.0
+        assert config.learning_rate == 5e-7
+        assert config.max_steps == -1
+
+    def test_kto_config_custom(self):
+        """Test KTOConfig with custom values."""
+        from mlx_tune import KTOConfig
+
+        config = KTOConfig(
+            beta=0.2,
+            desirable_weight=1.5,
+            learning_rate=1e-6,
+            max_steps=50,
+            output_dir="./custom_kto",
+        )
+        assert config.beta == 0.2
+        assert config.desirable_weight == 1.5
+        assert config.learning_rate == 1e-6
+        assert config.max_steps == 50
+
+    def test_kto_config_to_dict(self):
+        """Test KTOConfig.to_dict()."""
+        from mlx_tune import KTOConfig
+
+        config = KTOConfig(beta=0.3)
+        d = config.to_dict()
+        assert d['beta'] == 0.3
+        assert 'learning_rate' in d
+
+    def test_simpo_config_defaults(self):
+        """Test SimPOConfig with default values."""
+        from mlx_tune import SimPOConfig
+
+        config = SimPOConfig()
+        assert config.beta == 2.0
+        assert config.gamma == 0.5
+        assert config.learning_rate == 5e-7
+
+    def test_simpo_config_custom(self):
+        """Test SimPOConfig with custom values."""
+        from mlx_tune import SimPOConfig
+
+        config = SimPOConfig(
+            beta=3.0,
+            gamma=1.0,
+            learning_rate=1e-6,
+            max_steps=100,
+        )
+        assert config.beta == 3.0
+        assert config.gamma == 1.0
+        assert config.max_steps == 100
+
+    def test_simpo_config_to_dict(self):
+        """Test SimPOConfig.to_dict()."""
+        from mlx_tune import SimPOConfig
+
+        config = SimPOConfig(gamma=0.8)
+        d = config.to_dict()
+        assert d['gamma'] == 0.8
+        assert d['beta'] == 2.0
+
+
+# =============================================================================
+# GRPO GRADIENT FLOW TEST (verifying the fix)
+# =============================================================================
+
+@pytest.mark.integration
+class TestGRPOGradientFlow:
+    """Test that GRPO actually updates model parameters (the critical fix)."""
+
+    def test_grpo_parameters_change(self, mock_tokenizer, grpo_dataset):
+        """Test that GRPO training actually modifies model parameters."""
+        from mlx_tune import GRPOTrainer, GRPOConfig
+        from mlx.utils import tree_flatten
+
+        model = MockModelWrapper(SmallLanguageModel())
+        mx.eval(model.model.parameters())
+
+        # Capture initial parameters
+        initial_params = {}
+        for name, param in tree_flatten(model.model.parameters()):
+            initial_params[name] = param.tolist()
+
+        # Use a reward fn that gives varied scores based on completion hash
+        # This ensures std > 0, so the optimizer actually runs
+        call_count = [0]
+        def varied_reward(response: str, answer: str) -> float:
+            call_count[0] += 1
+            return 1.0 if call_count[0] % 2 == 0 else 0.0
+
+        config = GRPOConfig(
+            beta=0.04,
+            num_generations=2,
+            learning_rate=1e-2,  # High LR for visible change
+            max_steps=2,
+            max_completion_length=10,
+            temperature=1.0,
+            output_dir="./test_grpo_grad_output",
+        )
+
+        trainer = GRPOTrainer(
+            model=model,
+            train_dataset=grpo_dataset,
+            tokenizer=mock_tokenizer,
+            reward_fn=varied_reward,
+            args=config,
+        )
+
+        trainer.train()
+
+        # Check that at least some parameters changed
+        params_changed = False
+        for name, param in tree_flatten(model.model.parameters()):
+            if name in initial_params and param.tolist() != initial_params[name]:
+                params_changed = True
+                break
+
+        assert params_changed, "GRPO training should modify model parameters"
 
 
 # Run tests

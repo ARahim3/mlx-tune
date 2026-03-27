@@ -36,6 +36,7 @@ from mlx_tune.losses import (
     kto_loss as compute_kto_loss,
     simpo_loss as compute_simpo_loss,
     grpo_batch_loss,
+    generate_with_log_probs,
     compute_reference_logprobs,
     compute_log_probs_with_lengths,
 )
@@ -284,6 +285,120 @@ class GRPOConfig:
                 if not k.startswith('_') and k != 'reward_fn'}
 
 
+class KTOConfig:
+    """
+    Configuration for Kahneman-Tversky Optimization training.
+
+    KTO uses prospect theory with asymmetric treatment of gains and losses.
+    Unlike DPO, KTO works with binary feedback (desirable/undesirable)
+    instead of paired preferences.
+
+    Compatible with TRL's KTOConfig.
+
+    Example:
+        >>> config = KTOConfig(
+        ...     beta=0.1,
+        ...     learning_rate=5e-7,
+        ...     max_steps=100,
+        ... )
+    """
+
+    def __init__(
+        self,
+        # KTO-specific
+        beta: float = 0.1,  # Temperature coefficient
+        desirable_weight: float = 1.0,  # Weight for positive examples
+        undesirable_weight: float = 1.0,  # Weight for negative examples
+        # Training args
+        output_dir: str = "./kto_outputs",
+        learning_rate: float = 5e-7,
+        per_device_train_batch_size: int = 2,
+        gradient_accumulation_steps: int = 4,
+        num_train_epochs: int = 1,
+        max_steps: int = -1,
+        warmup_steps: int = 10,
+        logging_steps: int = 10,
+        save_steps: int = 100,
+        max_seq_length: int = 2048,
+        **kwargs
+    ):
+        self.beta = beta
+        self.desirable_weight = desirable_weight
+        self.undesirable_weight = undesirable_weight
+        self.output_dir = output_dir
+        self.learning_rate = learning_rate
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_train_epochs = num_train_epochs
+        self.max_steps = max_steps
+        self.warmup_steps = warmup_steps
+        self.logging_steps = logging_steps
+        self.save_steps = save_steps
+        self.max_seq_length = max_seq_length
+
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+
+class SimPOConfig:
+    """
+    Configuration for Simple Preference Optimization training.
+
+    SimPO removes the need for a reference model by using
+    length-normalized log probabilities as implicit rewards.
+
+    Compatible with TRL's SimPOConfig.
+
+    Example:
+        >>> config = SimPOConfig(
+        ...     beta=2.0,
+        ...     gamma=0.5,
+        ...     learning_rate=5e-7,
+        ...     max_steps=100,
+        ... )
+    """
+
+    def __init__(
+        self,
+        # SimPO-specific
+        beta: float = 2.0,  # Temperature coefficient
+        gamma: float = 0.5,  # Target reward margin
+        # Training args
+        output_dir: str = "./simpo_outputs",
+        learning_rate: float = 5e-7,
+        per_device_train_batch_size: int = 2,
+        gradient_accumulation_steps: int = 4,
+        num_train_epochs: int = 1,
+        max_steps: int = -1,
+        warmup_steps: int = 10,
+        logging_steps: int = 10,
+        save_steps: int = 100,
+        max_seq_length: int = 2048,
+        **kwargs
+    ):
+        self.beta = beta
+        self.gamma = gamma
+        self.output_dir = output_dir
+        self.learning_rate = learning_rate
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_train_epochs = num_train_epochs
+        self.max_steps = max_steps
+        self.warmup_steps = warmup_steps
+        self.logging_steps = logging_steps
+        self.save_steps = save_steps
+        self.max_seq_length = max_seq_length
+
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+
 class DPOTrainer:
     """
     Direct Preference Optimization Trainer.
@@ -440,8 +555,12 @@ class DPOTrainer:
         tokenized_data = self._prepare_dpo_batches()
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
 
-        # Get actual model
+        # Get actual model and switch to training mode
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self.model, 'train'):
+            self.model.train()
+        if hasattr(actual_model, 'train'):
+            actual_model.train()
 
         # Create optimizer
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
@@ -681,6 +800,11 @@ class ORPOTrainer:
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self.model, 'train'):
+            self.model.train()
+        if hasattr(actual_model, 'train'):
+            actual_model.train()
+
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
@@ -853,66 +977,156 @@ class GRPOTrainer:
             return self._train_subprocess()
 
     def _train_native(self):
-        """Train with native GRPO: multi-generation + reward + policy gradient."""
-        print("\n[Using Native GRPO Training with Multi-Generation]")
+        """
+        Train with native GRPO using two-phase approach per step:
+
+        Phase 1 (no gradients): Generate N completions, score with reward_fn,
+            compute group-normalized advantages.
+        Phase 2 (with gradients): Forward pass on generated tokens to compute
+            log probs, apply policy gradient loss weighted by advantages,
+            update model via optimizer.
+        """
+        print("\n[Using Native GRPO Training with Policy Gradient]")
 
         if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
             self.model._apply_lora()
 
-        # Prepare prompts
+        # Prepare prompts and ground truth answers
         prompts = []
+        answers = []
         for sample in self.train_dataset:
-            if 'prompt' in sample:
-                prompts.append(sample['prompt'])
-            elif 'question' in sample:
-                prompts.append(sample['question'])
-        print(f"✓ Prepared {len(prompts)} prompts")
+            prompt = sample.get('prompt', sample.get('question', ''))
+            if prompt:
+                prompts.append(prompt)
+                answers.append(sample.get('answer', ''))
+        print(f"  Prepared {len(prompts)} prompts")
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self.model, 'train'):
+            self.model.train()
+        if hasattr(actual_model, 'train'):
+            actual_model.train()
+
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
         print(f"\nStarting training for {self.iters} iterations...")
         print(f"  Generating {self.num_generations} completions per prompt")
 
+        # Define policy gradient loss function for nn.value_and_grad
+        def pg_loss_fn(model, sequences, seq_lengths, advantages):
+            """Compute policy gradient loss on pre-generated completions."""
+            # Forward pass to get log probs for all completions
+            total_loss = mx.array(0.0)
+            for i in range(sequences.shape[0]):
+                seq = sequences[i:i+1]  # [1, seq_len]
+                length = seq_lengths[i:i+1]  # [1]
+                adv = advantages[i]
+
+                log_prob = compute_log_probs_with_lengths(model, seq, length)
+                total_loss = total_loss - adv * log_prob[0]
+
+            return total_loss / sequences.shape[0]
+
+        loss_and_grad = nn.value_and_grad(actual_model, pg_loss_fn)
+
         total_loss = 0.0
+        total_reward = 0.0
         for step in range(self.iters):
-            # Get prompt for this step
             prompt_idx = step % len(prompts)
             prompt = prompts[prompt_idx]
+            answer = answers[prompt_idx]
 
-            # Compute GRPO loss with multi-generation
-            loss, n_gen = grpo_batch_loss(
-                model=actual_model,
-                tokenizer=self.tokenizer,
-                prompts=[prompt],
-                reward_fn=self.reward_fn,
-                num_generations=self.num_generations,
-                temperature=self.temperature,
-                max_tokens=self.max_completion_length,
-                beta=self.beta,
-            )
+            prompt_ids = mx.array(self.tokenizer.encode(prompt))
 
-            # Manual backward pass since grpo_batch_loss generates internally
-            # For a proper implementation, we'd need to track gradients through generation
-            # This is a simplified version that uses the loss for logging
-            mx.eval(loss)
+            # ---- Phase 1: Generate completions and compute rewards (no gradients) ----
+            completions_data = []
+            rewards = []
+
+            for _ in range(self.num_generations):
+                gen_ids, _ = generate_with_log_probs(
+                    actual_model, self.tokenizer, prompt_ids,
+                    max_tokens=self.max_completion_length,
+                    temperature=self.temperature,
+                )
+                mx.eval(gen_ids)
+
+                # Decode completion text (skip prompt)
+                prompt_len = len(prompt_ids)
+                completion_ids = gen_ids[prompt_len:]
+                completion_text = self.tokenizer.decode(completion_ids.tolist())
+
+                # Score with reward function
+                reward = self.reward_fn(completion_text, answer)
+                rewards.append(reward)
+                completions_data.append({
+                    'full_ids': gen_ids.tolist(),
+                    'length': len(gen_ids),
+                })
+
+            rewards_arr = mx.array(rewards)
+            mean_reward = mx.mean(rewards_arr)
+            std_reward = mx.std(rewards_arr)
+            mx.eval(mean_reward, std_reward)
+
+            avg_reward = mean_reward.item()
+            total_reward += avg_reward
+
+            # Skip update if all rewards are equal (std=0)
+            if std_reward.item() < 1e-8:
+                total_loss += 0.0
+                if (step + 1) % self.logging_steps == 0:
+                    avg_loss = total_loss / self.logging_steps
+                    avg_rew = total_reward / self.logging_steps
+                    print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | Reward: {avg_rew:.3f} (skipped, equal rewards)")
+                    total_loss = 0.0
+                    total_reward = 0.0
+                continue
+
+            advantages = (rewards_arr - mean_reward) / (std_reward + 1e-8)
+            mx.eval(advantages)
+
+            # ---- Phase 2: Compute policy gradient loss with gradient tracking ----
+            # Pad sequences to same length for batched processing
+            max_len = max(c['length'] for c in completions_data)
+            pad_id = getattr(self.tokenizer, 'pad_token_id', None) or 0
+
+            padded_seqs = []
+            lengths = []
+            for c in completions_data:
+                ids = c['full_ids']
+                padded = ids + [pad_id] * (max_len - len(ids))
+                padded_seqs.append(padded)
+                lengths.append(c['length'])
+
+            sequences = mx.array(padded_seqs)
+            seq_lengths = mx.array(lengths)
+
+            loss, grads = loss_and_grad(actual_model, sequences, seq_lengths, advantages)
+            optimizer.update(actual_model, grads)
+            mx.eval(actual_model.parameters(), optimizer.state)
+
             total_loss += loss.item()
 
             if (step + 1) % self.logging_steps == 0:
                 avg_loss = total_loss / self.logging_steps
-                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f}")
+                avg_rew = total_reward / self.logging_steps
+                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | Reward: {avg_rew:.3f}")
                 total_loss = 0.0
+                total_reward = 0.0
 
-        # Save adapters and config
+            # Save checkpoint
+            if (step + 1) % self.save_steps == 0:
+                _save_adapters_and_config(self.model, self.adapter_path)
+                print(f"    Saved checkpoint at step {step + 1}")
+
+        # Final save
         _save_adapters_and_config(self.model, self.adapter_path)
 
         print("\n" + "=" * 70)
         print("GRPO Training Complete!")
         print("=" * 70)
         print(f"  Adapters saved to: {self.adapter_path}")
-        print(f"Note: Full GRPO with gradient flow through generation requires")
-        print(f"      custom implementation. This version uses reward signals.")
         return {"status": "success", "adapter_path": str(self.adapter_path)}
 
     def _train_subprocess(self):
@@ -950,7 +1164,21 @@ class KTOTrainer:
 
     KTO uses prospect theory for preference optimization,
     treating gains and losses asymmetrically.
-    Now with proper KTO loss implementation!
+
+    Supports two dataset formats:
+    - TRL format: {"prompt": "...", "completion": "...", "label": true/false}
+    - Legacy format: {"text": "...", "label": 1/0}
+
+    Compatible with TRL's KTOTrainer API.
+
+    Example:
+        >>> trainer = KTOTrainer(
+        ...     model=model,
+        ...     train_dataset=kto_dataset,
+        ...     tokenizer=tokenizer,
+        ...     args=KTOConfig(beta=0.1, max_steps=100),
+        ... )
+        >>> trainer.train()
     """
 
     def __init__(
@@ -958,26 +1186,42 @@ class KTOTrainer:
         model: Any,
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
-        beta: float = 0.1,
+        args: Optional[KTOConfig] = None,
         use_native: bool = True,
         **kwargs
     ):
         self.model = model
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
-        self.beta = beta
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get('output_dir', './kto_outputs'))
-        self.learning_rate = kwargs.get('learning_rate', 5e-7)
-        self.iters = kwargs.get('max_steps', 100)
-        self.max_seq_length = kwargs.get('max_seq_length', 2048)
-        self.logging_steps = kwargs.get('logging_steps', 10)
+
+        # Extract config from args or kwargs (backward compat)
+        if args is None:
+            args = KTOConfig(**kwargs)
+
+        self.config = args
+        self.beta = args.beta
+        self.output_dir = Path(args.output_dir)
+        self.learning_rate = args.learning_rate
+        self.max_seq_length = args.max_seq_length
+        self.logging_steps = args.logging_steps
+        self.save_steps = args.save_steps
+
+        if args.max_steps > 0:
+            self.iters = args.max_steps
+        else:
+            dataset_size = len(train_dataset) if hasattr(train_dataset, '__len__') else 100
+            self.iters = max(1, dataset_size * args.num_train_epochs)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"KTOTrainer initialized (beta={self.beta}, native={self.use_native})")
+        print(f"KTOTrainer initialized:")
+        print(f"  Beta: {self.beta}")
+        print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Iterations: {self.iters}")
+        print(f"  Native training: {self.use_native}")
 
     def train(self):
         """Train using KTO with proper loss."""
@@ -995,21 +1239,36 @@ class KTOTrainer:
             self.model._apply_lora()
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self.model, 'train'):
+            self.model.train()
+        if hasattr(actual_model, 'train'):
+            actual_model.train()
+
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
-        # Prepare data - KTO expects samples with 'text' and 'label' (1=positive, 0=negative)
+        # Prepare data - supports both TRL and legacy formats
         tokenized_data = []
         for sample in self.train_dataset:
-            if 'text' in sample and 'label' in sample:
-                ids = self.tokenizer.encode(sample['text'])[:self.max_seq_length]
-                tokenized_data.append({
-                    'ids': ids,
-                    'length': len(ids),
-                    'label': float(sample['label']),
-                })
+            if 'prompt' in sample and 'completion' in sample:
+                # TRL format: prompt + completion + boolean label
+                text = sample['prompt'] + sample['completion']
+                label = 1.0 if sample.get('label', True) else 0.0
+            elif 'text' in sample and 'label' in sample:
+                # Legacy format: text + numeric label
+                text = sample['text']
+                label = float(sample['label'])
+            else:
+                continue
 
-        print(f"✓ Prepared {len(tokenized_data)} samples")
+            ids = self.tokenizer.encode(text)[:self.max_seq_length]
+            tokenized_data.append({
+                'ids': ids,
+                'length': len(ids),
+                'label': label,
+            })
+
+        print(f"  Prepared {len(tokenized_data)} samples")
 
         def loss_fn(model, batch_data):
             input_ids, lengths, labels = batch_data
@@ -1040,7 +1299,10 @@ class KTOTrainer:
                 print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f}")
                 total_loss = 0.0
 
-        # Save adapters and config
+            if (step + 1) % self.save_steps == 0:
+                _save_adapters_and_config(self.model, self.adapter_path)
+
+        # Final save
         _save_adapters_and_config(self.model, self.adapter_path)
 
         print("\n" + "=" * 70)
@@ -1056,7 +1318,17 @@ class SimPOTrainer:
 
     SimPO simplifies DPO by removing the reference model requirement.
     Uses length-normalized log probabilities as implicit rewards.
-    Now with proper SimPO loss implementation!
+
+    Compatible with TRL's SimPOTrainer API.
+
+    Example:
+        >>> trainer = SimPOTrainer(
+        ...     model=model,
+        ...     train_dataset=preference_dataset,
+        ...     tokenizer=tokenizer,
+        ...     args=SimPOConfig(beta=2.0, gamma=0.5, max_steps=100),
+        ... )
+        >>> trainer.train()
     """
 
     def __init__(
@@ -1064,28 +1336,43 @@ class SimPOTrainer:
         model: Any,
         train_dataset: Any,
         tokenizer: Optional[Any] = None,
-        gamma: float = 0.5,
-        beta: float = 2.0,
+        args: Optional[SimPOConfig] = None,
         use_native: bool = True,
         **kwargs
     ):
         self.model = model
         self.train_dataset = train_dataset
         self.tokenizer = tokenizer or getattr(model, 'tokenizer', None)
-        self.gamma = gamma
-        self.beta = beta
         self.use_native = use_native and HAS_NATIVE_TRAINING
-        self.output_dir = Path(kwargs.get('output_dir', './simpo_outputs'))
-        self.learning_rate = kwargs.get('learning_rate', 5e-7)
-        self.iters = kwargs.get('max_steps', 100)
-        self.max_seq_length = kwargs.get('max_seq_length', 2048)
-        self.logging_steps = kwargs.get('logging_steps', 10)
+
+        # Extract config from args or kwargs (backward compat)
+        if args is None:
+            args = SimPOConfig(**kwargs)
+
+        self.config = args
+        self.gamma = args.gamma
+        self.beta = args.beta
+        self.output_dir = Path(args.output_dir)
+        self.learning_rate = args.learning_rate
+        self.max_seq_length = args.max_seq_length
+        self.logging_steps = args.logging_steps
+        self.save_steps = args.save_steps
+
+        if args.max_steps > 0:
+            self.iters = args.max_steps
+        else:
+            dataset_size = len(train_dataset) if hasattr(train_dataset, '__len__') else 100
+            self.iters = max(1, dataset_size * args.num_train_epochs)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_path = self.output_dir / "adapters"
         self.adapter_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"SimPOTrainer initialized (gamma={gamma}, beta={beta}, native={self.use_native})")
+        print(f"SimPOTrainer initialized:")
+        print(f"  Beta: {self.beta}, Gamma: {self.gamma}")
+        print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Iterations: {self.iters}")
+        print(f"  Native training: {self.use_native}")
 
     def _tokenize_pair(self, sample):
         prompt = sample.get('prompt', '')
@@ -1127,6 +1414,11 @@ class SimPOTrainer:
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self.model, 'train'):
+            self.model.train()
+        if hasattr(actual_model, 'train'):
+            actual_model.train()
+
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 

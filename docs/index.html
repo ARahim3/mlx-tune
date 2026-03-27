@@ -125,6 +125,7 @@
         <li><a href="vlm.html">VLM</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="examples.html">Examples</a></li>
         <li><a href="troubleshooting.html">Troubleshooting</a></li>
       </ul>
 
@@ -144,7 +145,7 @@
 
       <!-- ===== Hero ===== -->
       <section class="hero hero-glow">
-        <span class="hero-version">v0.4.10</span>
+        <span class="hero-version">v0.4.11</span>
         <img src="assets/img/logo.png" alt="MLX-Tune" class="hero-logo">
         <h1 class="hero-tagline">Fine-tune LLMs, Vision, and Audio models on your Mac</h1>
         <p class="hero-subtitle">SFT, DPO, GRPO, Vision, TTS, and STT fine-tuning &mdash; natively on MLX. Unsloth-compatible API.</p>
@@ -374,13 +375,13 @@ uv pip install -e .</code></pre>
             </tr>
             <tr>
               <td><strong>KTO</strong></td>
-              <td><code>KTOTrainer</code></td>
-              <td>Kahneman-Tversky optimization</td>
+              <td><code>KTOTrainer</code> + <code>KTOConfig</code></td>
+              <td>Binary feedback (Kahneman-Tversky optimization)</td>
             </tr>
             <tr>
               <td><strong>SimPO</strong></td>
-              <td><code>SimPOTrainer</code></td>
-              <td>Simple preference optimization</td>
+              <td><code>SimPOTrainer</code> + <code>SimPOConfig</code></td>
+              <td>No reference model (length-normalized log probs)</td>
             </tr>
             <tr>
               <td><strong>VLM SFT</strong></td>

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-tune"
-version = "0.4.10"
+version = "0.4.11"
 description = "MLX-powered LLM/VLM/TTS/STT fine-tuning for Apple Silicon - Unsloth-compatible API for Mac"
 readme = "README.md"
 requires-python = ">=3.9"

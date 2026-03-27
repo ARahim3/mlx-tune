@@ -31,6 +31,7 @@
         <li><a href="vlm.html">VLM</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="examples.html">Examples</a></li>
         <li><a href="troubleshooting.html">Troubleshooting</a></li>
       </ul>
       <div class="nav-right">
@@ -52,7 +53,10 @@
         <li class="sub-item"><a href="#SFTTrainer">SFTTrainer</a></li>
         <li><a href="#rl">RL Trainers</a></li>
         <li class="sub-item"><a href="#DPOTrainer">DPOTrainer</a></li>
+        <li class="sub-item"><a href="#ORPOTrainer">ORPOTrainer</a></li>
         <li class="sub-item"><a href="#GRPOTrainer">GRPOTrainer</a></li>
+        <li class="sub-item"><a href="#KTOTrainer">KTOTrainer</a></li>
+        <li class="sub-item"><a href="#SimPOTrainer">SimPOTrainer</a></li>
         <li><a href="#chat-templates">Chat Templates</a></li>
         <li><a href="#post-training">Post-Training</a></li>
         <li><a href="#examples">Examples</a></li>
@@ -302,24 +306,24 @@ model.save_pretrained("lora_model")</code></pre>
 
           <h4>DPOConfig</h4>
           <div class="api-signature">
-            <span class="api-name">DPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">beta</span><span class="api-default">=0.1</span>, <span class="api-param">max_steps</span><span class="api-default">=-1</span>, <span class="api-param">learning_rate</span><span class="api-default">=5e-5</span>, ...)
+            <span class="api-name">DPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">beta</span><span class="api-default">=0.1</span>, <span class="api-param">max_steps</span><span class="api-default">=-1</span>, <span class="api-param">learning_rate</span><span class="api-default">=5e-7</span>, ...)
           </div>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
             <tbody>
               <tr><td><code>beta</code></td><td><code>0.1</code></td><td>KL penalty coefficient (higher = more conservative)</td></tr>
-              <tr><td><code>learning_rate</code></td><td><code>5e-5</code></td><td>Lower than SFT to avoid reward hacking</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>5e-7</code></td><td>Lower than SFT to avoid reward hacking</td></tr>
             </tbody>
           </table>
         </div>
 
-        <div class="api-entry">
+        <div class="api-entry" id="ORPOTrainer">
           <h3>ORPOTrainer</h3>
           <div class="api-signature">
             <span class="api-name">ORPOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>, ...)
           </div>
           <p>Odds Ratio Preference Optimization. Combines SFT loss with odds-ratio preference alignment.</p>
-          <div class="api-signature" style="margin-top:8px;"><span class="api-name">ORPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">lambda_orpo</span><span class="api-default">=1.0</span>, ...)</div>
+          <div class="api-signature" style="margin-top:8px;"><span class="api-name">ORPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">beta</span><span class="api-default">=0.1</span>, ...)</div>
         </div>
 
         <div class="api-entry" id="GRPOTrainer">
@@ -331,23 +335,58 @@ model.save_pretrained("lora_model")</code></pre>
 
           <h4>GRPOConfig</h4>
           <div class="api-signature">
-            <span class="api-name">GRPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">num_generations</span><span class="api-default">=4</span>, <span class="api-param">kl_coeff</span><span class="api-default">=0.1</span>, ...)
+            <span class="api-name">GRPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">num_generations</span><span class="api-default">=4</span>, <span class="api-param">beta</span><span class="api-default">=0.04</span>, ...)
           </div>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
             <tbody>
               <tr><td><code>num_generations</code></td><td><code>4</code></td><td>Number of completions generated per prompt</td></tr>
-              <tr><td><code>kl_coeff</code></td><td><code>0.1</code></td><td>KL divergence coefficient</td></tr>
+              <tr><td><code>beta</code></td><td><code>0.04</code></td><td>KL divergence coefficient</td></tr>
             </tbody>
           </table>
         </div>
 
-        <div class="api-entry">
-          <h3>KTOTrainer &amp; SimPOTrainer</h3>
-          <div class="api-signature"><span class="api-name">KTOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>, ...) &mdash; Kahneman-Tversky Optimization</div>
-          <div class="api-signature" style="margin-top:8px;"><span class="api-name">KTOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">desirable_weight</span><span class="api-default">=1.0</span>, <span class="api-param">undesirable_weight</span><span class="api-default">=1.0</span>, ...)</div>
-          <div class="api-signature" style="margin-top:16px;"><span class="api-name">SimPOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>, ...) &mdash; Simple Preference Optimization</div>
-          <div class="api-signature" style="margin-top:8px;"><span class="api-name">SimPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">gamma</span><span class="api-default">=1.0</span>, ...)</div>
+        <div class="api-entry" id="KTOTrainer">
+          <h3>KTOTrainer</h3>
+          <div class="api-signature">
+            <span class="api-name">KTOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>, <span class="api-param">tokenizer</span><span class="api-default">=None</span>, ...)
+          </div>
+          <p>Kahneman-Tversky Optimization. Works with binary feedback (desirable/undesirable) instead of paired preferences. Supports both TRL format (<code>prompt</code>+<code>completion</code>+<code>label</code>) and legacy format (<code>text</code>+<code>label</code>).</p>
+
+          <h4>KTOConfig</h4>
+          <div class="api-signature">
+            <span class="api-name">KTOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">beta</span><span class="api-default">=0.1</span>, <span class="api-param">desirable_weight</span><span class="api-default">=1.0</span>, <span class="api-param">undesirable_weight</span><span class="api-default">=1.0</span>, <span class="api-param">learning_rate</span><span class="api-default">=5e-7</span>, ...)
+          </div>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>beta</code></td><td><code>0.1</code></td><td>Temperature coefficient for KL penalty</td></tr>
+              <tr><td><code>desirable_weight</code></td><td><code>1.0</code></td><td>Weight for desirable (positive) examples</td></tr>
+              <tr><td><code>undesirable_weight</code></td><td><code>1.0</code></td><td>Weight for undesirable (negative) examples</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>5e-7</code></td><td>Learning rate</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="api-entry" id="SimPOTrainer">
+          <h3>SimPOTrainer</h3>
+          <div class="api-signature">
+            <span class="api-name">SimPOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>, <span class="api-param">tokenizer</span><span class="api-default">=None</span>, ...)
+          </div>
+          <p>Simple Preference Optimization. No reference model needed &mdash; uses length-normalized log probabilities as implicit rewards. More memory efficient than DPO.</p>
+
+          <h4>SimPOConfig</h4>
+          <div class="api-signature">
+            <span class="api-name">SimPOConfig</span>(<span class="api-param">output_dir</span>, <span class="api-param">beta</span><span class="api-default">=2.0</span>, <span class="api-param">gamma</span><span class="api-default">=0.5</span>, <span class="api-param">learning_rate</span><span class="api-default">=5e-7</span>, ...)
+          </div>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>beta</code></td><td><code>2.0</code></td><td>Temperature coefficient (typically higher than DPO)</td></tr>
+              <tr><td><code>gamma</code></td><td><code>0.5</code></td><td>Target reward margin between chosen and rejected</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>5e-7</code></td><td>Learning rate</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -485,12 +524,32 @@ trainer = train_on_responses_only(
             </tr>
             <tr>
               <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/09_rl_training_methods.py" target="_blank" rel="noopener">09</a></strong></td>
-              <td>RL training methods: DPO, ORPO, GRPO, KTO, SimPO</td>
+              <td>RL training overview: all 5 methods in one script</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/21_dpo_preference_tuning.py" target="_blank" rel="noopener">21</a></strong></td>
+              <td>DPO &mdash; E2E preference tuning with Qwen3.5</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/22_grpo_reasoning_training.py" target="_blank" rel="noopener">22</a></strong></td>
+              <td>GRPO &mdash; Reasoning training with custom reward functions (DeepSeek R1 style)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/23_orpo_preference_tuning.py" target="_blank" rel="noopener">23</a></strong></td>
+              <td>ORPO &mdash; Combined SFT + preference alignment (no reference model)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/24_kto_binary_feedback.py" target="_blank" rel="noopener">24</a></strong></td>
+              <td>KTO &mdash; Binary feedback training (no paired preferences needed)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/25_simpo_simple_preference.py" target="_blank" rel="noopener">25</a></strong></td>
+              <td>SimPO &mdash; Simple preference optimization (no reference model)</td>
             </tr>
           </tbody>
         </table>
 
-        <p>Browse all examples on <a href="https://github.com/ARahim3/mlx-tune/tree/main/examples" target="_blank" rel="noopener">GitHub</a>.</p>
+        <p>Browse all examples on <a href="https://github.com/ARahim3/mlx-tune/tree/main/examples" target="_blank" rel="noopener">GitHub</a> &middot; See the <a href="examples.html">Examples page</a> for code snippets.</p>
       </section>
 
       <footer class="footer">

@@ -78,7 +78,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🚀 **v0.4.10** - Qwen3-TTS fine-tuning; 5 TTS + 5 STT models supported
+> 🚀 **v0.4.11** - E2E RL training (DPO, GRPO, ORPO, KTO, SimPO); GRPO gradient fix; KTOConfig/SimPOConfig
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -88,7 +88,8 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 | DPO Training | ✅ Stable | **Full DPO loss** |
 | ORPO Training | ✅ Stable | **Full ORPO loss** |
 | GRPO Training | ✅ Stable | **Multi-generation + reward** |
-| KTO/SimPO | ✅ Stable | Proper loss implementations |
+| KTO Training | ✅ Stable | **Binary feedback + KTOConfig** |
+| SimPO Training | ✅ Stable | **No ref model + SimPOConfig** |
 | Chat Templates | ✅ Stable | 15 models (llama, gemma, qwen, phi, mistral) |
 | Response-Only Training | ✅ Stable | `train_on_responses_only()` |
 | Multi-turn Merging | ✅ Stable | `to_sharegpt()` + `conversation_extension` |
@@ -313,8 +314,9 @@ model.push_to_hub("username/my-model")
 Check [`examples/`](examples/) for working code:
 - Basic model loading and inference (01–07)
 - Complete SFT fine-tuning pipeline (08)
-- RL training methods — DPO, GRPO, ORPO (09)
-- Vision model fine-tuning — Qwen3.5 (10–11)
+- RL training overview (09)
+- Vision model fine-tuning — Qwen3.5 (10-11)
+- **RL E2E training** — DPO (21), GRPO (22), ORPO (23), KTO (24), SimPO (25)
 - TTS fine-tuning — Orpheus-3B (12), OuteTTS (14), Spark-TTS (15)
 - STT fine-tuning — Whisper (13), Moonshine (16), Qwen3-ASR (17), Canary (18), Voxtral (19)
 

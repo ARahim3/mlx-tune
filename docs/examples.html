@@ -25,6 +25,7 @@
         <li><a href="vlm.html">VLM</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="examples.html" class="active">Examples</a></li>
         <li><a href="troubleshooting.html">Troubleshooting</a></li>
       </ul>
       <div class="nav-right">
@@ -252,9 +253,9 @@ model.save_pretrained_merged("merged", tokenizer)</code></pre>
       <h2 id="rl">RL Methods</h2>
       <div class="example-grid">
         <div class="example-card">
-          <h4>09 &mdash; RL Training Methods</h4>
-          <p>DPO, ORPO, GRPO, KTO, and SimPO trainer demonstrations with preference datasets.</p>
-          <div class="example-tags"><span class="example-tag">DPO</span><span class="example-tag">ORPO</span><span class="example-tag">GRPO</span><span class="example-tag">KTO</span><span class="example-tag">SimPO</span></div>
+          <h4>09 &mdash; RL Training Methods (Overview)</h4>
+          <p>Quick demo of all 5 RL trainers with preference datasets.</p>
+          <div class="example-tags"><span class="example-tag">Overview</span><span class="example-tag">DPO</span><span class="example-tag">ORPO</span><span class="example-tag">GRPO</span></div>
           <button class="example-toggle">View Code</button>
           <div class="example-code">
             <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
@@ -262,24 +263,117 @@ model.save_pretrained_merged("merged", tokenizer)</code></pre>
     DPOTrainer, DPOConfig,
     ORPOTrainer, ORPOConfig,
     GRPOTrainer, GRPOConfig,
-    KTOTrainer, SimPOTrainer,
-)
-
-# DPO: Direct Preference Optimization
-trainer = DPOTrainer(
-    model=model, train_dataset=dpo_dataset,
-    args=DPOConfig(output_dir="dpo_output", max_steps=50),
-)
-trainer.train()
-
-# GRPO: Group Relative Policy Optimization (DeepSeek R1 style)
-trainer = GRPOTrainer(
-    model=model, train_dataset=grpo_dataset,
-    args=GRPOConfig(output_dir="grpo_output", max_steps=50),
-)
-trainer.train()</code></pre>
+    KTOTrainer, KTOConfig,
+    SimPOTrainer, SimPOConfig,
+)</code></pre>
             </div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/09_rl_training_methods.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>21 &mdash; DPO Preference Tuning</h4>
+          <p>End-to-end DPO training with chosen/rejected preference pairs. Trains a real model with proper log-probability loss.</p>
+          <div class="example-tags"><span class="example-tag">DPO</span><span class="example-tag">E2E</span><span class="example-tag">Qwen3.5</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, DPOTrainer, DPOConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"])
+
+config = DPOConfig(beta=0.1, learning_rate=5e-7, max_steps=30)
+trainer = DPOTrainer(model=model, train_dataset=preference_data,
+                     tokenizer=tokenizer, args=config)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/21_dpo_preference_tuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>22 &mdash; GRPO Reasoning Training</h4>
+          <p>DeepSeek R1-style reasoning training. Generates multiple completions, scores with custom reward functions, and updates via policy gradient.</p>
+          <div class="example-tags"><span class="example-tag">GRPO</span><span class="example-tag">E2E</span><span class="example-tag">Reasoning</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, GRPOTrainer, GRPOConfig
+
+def combined_reward(response, ground_truth):
+    return 0.7 * correctness_reward(response, ground_truth) + \
+           0.3 * format_reward(response, ground_truth)
+
+config = GRPOConfig(num_generations=2, max_completion_length=128,
+                    learning_rate=1e-6, max_steps=10)
+trainer = GRPOTrainer(model=model, train_dataset=reasoning_data,
+                      tokenizer=tokenizer, reward_fn=combined_reward, args=config)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/22_grpo_reasoning_training.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>23 &mdash; ORPO Preference Tuning</h4>
+          <p>Combined SFT + preference alignment in one training step. No reference model needed &mdash; more memory efficient than DPO.</p>
+          <div class="example-tags"><span class="example-tag">ORPO</span><span class="example-tag">E2E</span><span class="example-tag">Qwen3.5</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, ORPOTrainer, ORPOConfig
+
+config = ORPOConfig(beta=0.1, learning_rate=8e-6, max_steps=30)
+trainer = ORPOTrainer(model=model, train_dataset=preference_data,
+                      tokenizer=tokenizer, args=config)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/23_orpo_preference_tuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>24 &mdash; KTO Binary Feedback</h4>
+          <p>Kahneman-Tversky Optimization with binary feedback. No paired preferences needed &mdash; just label responses as good or bad.</p>
+          <div class="example-tags"><span class="example-tag">KTO</span><span class="example-tag">E2E</span><span class="example-tag">Binary</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, KTOTrainer, KTOConfig
+
+# Binary feedback: each sample independently labeled
+kto_data = [
+    {"prompt": "What is ML?", "completion": "Machine learning is...", "label": True},
+    {"prompt": "What is ML?", "completion": "idk", "label": False},
+]
+
+config = KTOConfig(beta=0.1, learning_rate=5e-7, max_steps=30)
+trainer = KTOTrainer(model=model, train_dataset=kto_data,
+                     tokenizer=tokenizer, args=config)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/24_kto_binary_feedback.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>25 &mdash; SimPO Simple Preference</h4>
+          <p>Simple Preference Optimization. No reference model needed &mdash; uses length-normalized log probs as implicit rewards.</p>
+          <div class="example-tags"><span class="example-tag">SimPO</span><span class="example-tag">E2E</span><span class="example-tag">Qwen3.5</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, SimPOTrainer, SimPOConfig
+
+config = SimPOConfig(beta=2.0, gamma=0.5, learning_rate=5e-7, max_steps=30)
+trainer = SimPOTrainer(model=model, train_dataset=preference_data,
+                       tokenizer=tokenizer, args=config)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/25_simpo_simple_preference.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
       </div>
