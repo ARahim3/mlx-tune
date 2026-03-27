@@ -105,6 +105,16 @@ def _save_adapters_and_config(model, adapter_path: Path):
         return False
 
 
+def _set_native_train_mode(model, actual_model):
+    """Ensure wrapped native RL models run with training-time behavior enabled."""
+    seen = set()
+    for candidate in (model, actual_model):
+        if candidate is None or id(candidate) in seen or not hasattr(candidate, "train"):
+            continue
+        candidate.train()
+        seen.add(id(candidate))
+
+
 class DPOConfig:
     """
     Configuration for Direct Preference Optimization training.
@@ -442,6 +452,7 @@ class DPOTrainer:
 
         # Get actual model
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        _set_native_train_mode(self.model, actual_model)
 
         # Create optimizer
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
@@ -681,6 +692,7 @@ class ORPOTrainer:
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        _set_native_train_mode(self.model, actual_model)
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
@@ -995,6 +1007,7 @@ class KTOTrainer:
             self.model._apply_lora()
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        _set_native_train_mode(self.model, actual_model)
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
@@ -1127,6 +1140,7 @@ class SimPOTrainer:
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
+        _set_native_train_mode(self.model, actual_model)
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
