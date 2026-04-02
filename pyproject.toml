@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-tune"
-version = "0.4.15"
-description = "MLX-powered LLM/VLM/TTS/STT/Embedding fine-tuning for Apple Silicon - Unsloth-compatible API for Mac"
+version = "0.4.16"
+description = "MLX-powered LLM/VLM/TTS/STT/Embedding/OCR fine-tuning for Apple Silicon - Unsloth-compatible API for Mac"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "MLX-Tune Contributors"}
 ]
-keywords = ["llm", "fine-tuning", "mlx", "apple-silicon", "lora", "unsloth", "mac", "mlx-tune", "embeddings", "sentence-transformers"]
+keywords = ["llm", "fine-tuning", "mlx", "apple-silicon", "lora", "unsloth", "mac", "mlx-tune", "embeddings", "sentence-transformers", "ocr", "document-understanding"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

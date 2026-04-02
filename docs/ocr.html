@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OCR Fine-Tuning &mdash; MLX-Tune Docs</title>
+  <meta name="description" content="Fine-tune OCR models on Apple Silicon with MLX-Tune. Dedicated OCR models, VLM-based OCR, evaluation metrics, and GRPO training with CER rewards.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%25' y='73%25' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='900' font-size='22' fill='%23e6edf3'>m</text></svg>">
+  <meta property="og:title" content="OCR Fine-Tuning - MLX-Tune Docs">
+  <meta property="og:description" content="Fine-tune OCR models on Apple Silicon with MLX-Tune. Dedicated OCR models, VLM-based OCR, evaluation metrics, and GRPO training.">
+  <meta property="og:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png">
+  <meta property="og:url" content="https://arahim3.github.io/mlx-tune/ocr.html">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="OCR Fine-Tuning - MLX-Tune Docs">
+  <meta name="twitter:description" content="Fine-tune OCR models on Apple Silicon with MLX-Tune. Dedicated OCR models, VLM-based OCR, evaluation metrics.">
+  <meta name="twitter:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/prism-dark.css">
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+
+  <nav class="top-nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-logo"><img src="assets/img/logo.png" alt="mlx-tune"></a>
+      <ul class="nav-links">
+        <li><a href="index.html">Home</a></li>
+        <li><a href="llm.html">LLM</a></li>
+        <li><a href="vlm.html">VLM</a></li>
+        <li><a href="ocr.html" class="active">OCR</a></li>
+        <li><a href="audio.html">Audio</a></li>
+        <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="examples.html">Examples</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      </ul>
+      <div class="nav-right">
+        <a href="https://github.com/ARahim3/mlx-tune" class="github-link" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" fill="currentColor"/></svg></a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+        <button class="mobile-toggle" aria-label="Menu">&#9776;</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="page-wrapper">
+    <aside class="sidebar">
+      <div class="sidebar-title">On This Page</div>
+      <ul class="sidebar-nav">
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#models">Supported Models</a></li>
+        <li><a href="#FastOCRModel">FastOCRModel</a></li>
+        <li class="sub-item"><a href="#OCRModelWrapper">OCRModelWrapper</a></li>
+        <li><a href="#training">Training</a></li>
+        <li class="sub-item"><a href="#OCRSFTTrainer">OCRSFTTrainer</a></li>
+        <li class="sub-item"><a href="#OCRGRPOTrainer">OCRGRPOTrainer</a></li>
+        <li><a href="#evaluation">Evaluation Metrics</a></li>
+        <li><a href="#rewards">Reward Functions</a></li>
+        <li><a href="#post-training">Post-Training</a></li>
+        <li><a href="#examples">Examples</a></li>
+        <li><a href="#tips">Tips</a></li>
+      </ul>
+    </aside>
+
+    <main class="content">
+      <h1>OCR Fine-Tuning</h1>
+      <p>Fine-tune OCR models on Apple Silicon. MLX-Tune supports both dedicated OCR architectures and general VLMs adapted for document understanding &mdash; all with native LoRA, built-in evaluation metrics, and CER-based GRPO training.</p>
+
+      <!-- ===== Overview ===== -->
+      <section class="section" id="overview">
+        <div class="section-label">Overview</div>
+        <h2 style="margin-top: 0;">Two tracks for OCR</h2>
+        <p>MLX-Tune provides two complementary approaches to OCR fine-tuning, depending on your accuracy and latency requirements.</p>
+
+        <div class="callout">
+          <div class="callout-title">Dedicated OCR Models</div>
+          <p>Purpose-built for text recognition. These models (DeepSeek-OCR, GLM-OCR, DOTS-OCR) are small, fast, and optimized for document transcription. They achieve high accuracy on structured text (invoices, receipts, printed documents) while running efficiently on Apple Silicon.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">General VLM &rarr; OCR</div>
+          <p>Large vision-language models like Qwen3.5, Qwen2.5-VL, and Pixtral can be fine-tuned for OCR tasks using the same VLM pipeline. This approach excels on complex layouts, handwriting, and documents requiring reasoning (e.g., form understanding, table extraction). Use <code>FastVisionModel</code> from the <a href="vlm.html">VLM track</a> for these models.</p>
+        </div>
+
+        <h3>What makes MLX-Tune OCR special</h3>
+        <ul>
+          <li><strong>Apple Silicon native</strong> &mdash; No CUDA required. Train and evaluate OCR models entirely on your Mac using the MLX framework.</li>
+          <li><strong>LoRA fine-tuning</strong> &mdash; Efficient adapter-based training. Fine-tune dedicated OCR models with as little as 8 GB unified memory.</li>
+          <li><strong>Built-in evaluation</strong> &mdash; CER, WER, and exact match metrics computed automatically during training and on demand.</li>
+          <li><strong>GRPO with OCR rewards</strong> &mdash; Train with character error rate-based reward functions to directly optimize transcription quality.</li>
+          <li><strong>Batch transcription</strong> &mdash; Process entire document sets efficiently with <code>batch_transcribe()</code>.</li>
+        </ul>
+      </section>
+
+      <!-- ===== Supported Models ===== -->
+      <section class="section" id="models">
+        <div class="section-label">Models</div>
+        <h2 style="margin-top: 0;">Supported OCR Models</h2>
+        <p>Dedicated OCR models supported by <code>FastOCRModel</code>, plus general VLMs that can be fine-tuned for OCR via the <a href="vlm.html">VLM track</a>.</p>
+
+        <h3>Dedicated OCR Models</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>Parameters</th><th>Type</th><th>Quantization</th></tr></thead>
+          <tbody>
+            <tr><td><code>DeepSeek-OCR</code></td><td>0.9B</td><td>Dedicated</td><td>4-bit, bf16</td></tr>
+            <tr><td><code>DeepSeek-OCR-2</code></td><td>1B</td><td>Dedicated</td><td>4-bit, bf16</td></tr>
+            <tr><td><code>GLM-OCR</code></td><td>0.9B</td><td>Dedicated</td><td>4-bit, bf16</td></tr>
+            <tr><td><code>DOTS-OCR</code></td><td>varies</td><td>Dedicated</td><td>4-bit, bf16</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Derived OCR Models</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>Parameters</th><th>Type</th><th>Quantization</th></tr></thead>
+          <tbody>
+            <tr><td><code>olmOCR-2</code></td><td>7B</td><td>VLM-derived</td><td>4-bit, 8-bit</td></tr>
+            <tr><td><code>LightOnOCR-1B</code></td><td>1B</td><td>VLM-derived</td><td>4-bit, bf16</td></tr>
+          </tbody>
+        </table>
+
+        <h3>General VLMs for OCR</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>Parameters</th><th>Type</th><th>Quantization</th></tr></thead>
+          <tbody>
+            <tr><td><code>Qwen3.5</code></td><td>0.8B&ndash;32B</td><td>General VLM</td><td>4-bit, 8-bit, bf16</td></tr>
+            <tr><td><code>Qwen2.5-VL</code></td><td>3B&ndash;72B</td><td>General VLM</td><td>4-bit, 8-bit, bf16</td></tr>
+            <tr><td><code>Pixtral</code></td><td>12B</td><td>General VLM</td><td>4-bit, 8-bit</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout" style="margin-top: 16px;">
+          <div class="callout-title">Which track to use?</div>
+          <p>Use <code>FastOCRModel</code> for dedicated and derived OCR models listed above. For general VLMs (Qwen3.5, Qwen2.5-VL, Pixtral), use <code>FastVisionModel</code> from the <a href="vlm.html">VLM track</a> &mdash; they share the same training pipeline.</p>
+        </div>
+      </section>
+
+      <!-- ===== FastOCRModel ===== -->
+      <div class="api-module" id="FastOCRModel">
+        <div class="api-module-header">
+          <h2 style="margin:0;">FastOCRModel</h2>
+          <span class="module-path">mlx_tune.ocr</span>
+        </div>
+
+        <div class="api-entry">
+          <h3>FastOCRModel.from_pretrained()</h3>
+          <div class="api-signature">
+            <span class="api-name">FastOCRModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=4096</span>, <span class="api-param">load_in_4bit</span><span class="api-default">=False</span>, ...) &rarr; <span class="api-param">Tuple[OCRModelWrapper, Processor]</span>
+          </div>
+          <p>Load a dedicated OCR model from HuggingFace. Returns a model wrapper and a processor that handles both image preprocessing and text tokenization.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID (e.g., <code>"deepseek-ai/DeepSeek-OCR"</code>) or local path</td></tr>
+              <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum sequence length. OCR outputs can be long; 4096 is recommended</td></tr>
+              <tr><td><code>load_in_4bit</code></td><td>bool</td><td>Load model with 4-bit quantization (reduces memory by ~75%)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="api-entry">
+          <h3>FastOCRModel.get_peft_model()</h3>
+          <div class="api-signature">
+            <span class="api-name">FastOCRModel.get_peft_model</span>(<span class="api-param">model</span>, <span class="api-param">finetune_vision_layers</span><span class="api-default">=False</span>, <span class="api-param">finetune_language_layers</span><span class="api-default">=True</span>, <span class="api-param">r</span><span class="api-default">=16</span>, <span class="api-param">lora_alpha</span><span class="api-default">=16</span>, ...) &rarr; <span class="api-param">OCRModelWrapper</span>
+          </div>
+          <p>Add LoRA adapters to the OCR model. By default, only the language layers are fine-tuned &mdash; the vision encoder is kept frozen since dedicated OCR models already have strong visual features.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>finetune_vision_layers</code></td><td>bool</td><td><code>False</code></td><td>Apply LoRA to vision encoder. Usually not needed for dedicated OCR models</td></tr>
+              <tr><td><code>finetune_language_layers</code></td><td>bool</td><td><code>True</code></td><td>Apply LoRA to language model layers</td></tr>
+              <tr><td><code>r</code></td><td>int</td><td><code>16</code></td><td>LoRA rank</td></tr>
+              <tr><td><code>lora_alpha</code></td><td>int</td><td><code>16</code></td><td>LoRA scaling factor. Recommended: equal to <code>r</code></td></tr>
+            </tbody>
+          </table>
+
+          <div class="callout" style="margin-top: 16px;">
+            <div class="callout-title">Why vision_layers=False by default?</div>
+            <p>Dedicated OCR models are pre-trained with vision encoders specifically optimized for document images. Fine-tuning only the language layers is usually sufficient and significantly faster. Enable <code>finetune_vision_layers=True</code> if you are working with unusual image formats (e.g., handwritten notes, degraded scans).</p>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h3>FastOCRModel.for_training()</h3>
+          <div class="api-signature">
+            <span class="api-name">FastOCRModel.for_training</span>(<span class="api-param">model</span>)
+          </div>
+          <p>Enable training mode. <strong>Required</strong> before starting any training loop.</p>
+        </div>
+
+        <div class="api-entry">
+          <h3>FastOCRModel.for_inference()</h3>
+          <div class="api-signature">
+            <span class="api-name">FastOCRModel.for_inference</span>(<span class="api-param">model</span>)
+          </div>
+          <p>Enable inference mode. Activates KV caching and disables dropout. <strong>Always call before generating or evaluating.</strong></p>
+        </div>
+      </div>
+
+      <!-- ===== OCRModelWrapper ===== -->
+      <div class="api-module" id="OCRModelWrapper">
+        <div class="api-module-header">
+          <h2 style="margin:0;">OCRModelWrapper</h2>
+          <span class="module-path">mlx_tune.ocr</span>
+        </div>
+
+        <div class="api-entry">
+          <p>Wrapper returned by <code>FastOCRModel.from_pretrained()</code>. Provides OCR-specific methods for transcription, batch processing, evaluation, and model persistence.</p>
+
+          <h4>model.transcribe()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.transcribe</span>(<span class="api-param">image</span>, <span class="api-param">prompt</span><span class="api-default">="Transcribe this image."</span>, <span class="api-param">max_tokens</span><span class="api-default">=2048</span>, <span class="api-param">temperature</span><span class="api-default">=0.0</span>) &rarr; <span class="api-param">str</span>
+          </div>
+          <p>Transcribe text from a single image. Returns the extracted text as a string.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>image</code></td><td>str or PIL.Image</td><td>Path to an image file, or a PIL Image object</td></tr>
+              <tr><td><code>prompt</code></td><td>str</td><td>Instruction prompt for the OCR model</td></tr>
+              <tr><td><code>max_tokens</code></td><td>int</td><td>Maximum number of tokens to generate</td></tr>
+              <tr><td><code>temperature</code></td><td>float</td><td>Sampling temperature (0.0 = greedy, recommended for OCR)</td></tr>
+            </tbody>
+          </table>
+
+          <h4>model.batch_transcribe()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.batch_transcribe</span>(<span class="api-param">images</span>, <span class="api-param">prompt</span><span class="api-default">="Transcribe this image."</span>, <span class="api-param">max_tokens</span><span class="api-default">=2048</span>) &rarr; <span class="api-param">list[str]</span>
+          </div>
+          <p>Transcribe text from a batch of images. Processes images sequentially and returns a list of transcription strings.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>images</code></td><td>list[str] or list[PIL.Image]</td><td>List of image paths or PIL Image objects</td></tr>
+              <tr><td><code>prompt</code></td><td>str</td><td>Instruction prompt applied to all images</td></tr>
+              <tr><td><code>max_tokens</code></td><td>int</td><td>Maximum tokens per transcription</td></tr>
+            </tbody>
+          </table>
+
+          <h4>model.evaluate()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.evaluate</span>(<span class="api-param">images</span>, <span class="api-param">references</span>, <span class="api-param">prompt</span><span class="api-default">="Transcribe this image."</span>) &rarr; <span class="api-param">dict</span>
+          </div>
+          <p>Evaluate model transcription quality against ground truth references. Returns a dictionary with CER, WER, and exact match scores.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>images</code></td><td>list[str] or list[PIL.Image]</td><td>Images to transcribe</td></tr>
+              <tr><td><code>references</code></td><td>list[str]</td><td>Ground truth text for each image</td></tr>
+              <tr><td><code>prompt</code></td><td>str</td><td>Instruction prompt</td></tr>
+            </tbody>
+          </table>
+          <p>Returns:</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">{
+    "cer": 0.032,          # Character Error Rate (lower is better)
+    "wer": 0.087,          # Word Error Rate (lower is better)
+    "exact_match": 0.85,   # Fraction of perfect transcriptions
+    "num_samples": 100,
+}</code></pre>
+          </div>
+
+          <h4>model.save_pretrained()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.save_pretrained</span>(<span class="api-param">output_dir</span>)
+          </div>
+          <p>Save LoRA adapters to disk. Writes <code>adapters.safetensors</code>, <code>adapter_config.json</code>, and <code>config.json</code>.</p>
+
+          <h4>model.load_adapter()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.load_adapter</span>(<span class="api-param">adapter_path</span>)
+          </div>
+          <p>Load previously saved LoRA adapters into the model.</p>
+
+          <h4>model.save_pretrained_merged()</h4>
+          <div class="api-signature">
+            <span class="api-name">model.save_pretrained_merged</span>(<span class="api-param">output_dir</span>, <span class="api-param">processor</span>)
+          </div>
+          <p>Fuse LoRA weights into the base model and save the full merged model.</p>
+        </div>
+      </div>
+
+      <!-- ===== Training ===== -->
+      <div class="api-module" id="training">
+        <div class="api-module-header">
+          <h2 style="margin:0;">Training</h2>
+          <span class="module-path">mlx_tune.ocr</span>
+        </div>
+
+        <div class="api-entry" id="OCRSFTTrainer">
+          <h3>OCRSFTTrainer</h3>
+          <div class="api-signature">
+            <span class="api-name">OCRSFTTrainer</span>(<span class="api-param">model</span>, <span class="api-param">tokenizer</span>, <span class="api-param">data_collator</span>, <span class="api-param">train_dataset</span>, <span class="api-param">args</span><span class="api-default">=None</span>)
+          </div>
+          <p>Supervised fine-tuning trainer for OCR models. Handles forward pass, loss computation, and gradient updates with OCR-optimized defaults.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>model</code></td><td>OCRModelWrapper</td><td>Model with LoRA adapters configured</td></tr>
+              <tr><td><code>tokenizer</code></td><td>Processor</td><td>Processor from <code>FastOCRModel.from_pretrained()</code></td></tr>
+              <tr><td><code>data_collator</code></td><td>OCRDataCollator</td><td>Data collator for image/text batching</td></tr>
+              <tr><td><code>train_dataset</code></td><td>Dataset</td><td>HuggingFace dataset with <code>image</code> and <code>text</code> fields</td></tr>
+              <tr><td><code>args</code></td><td>OCRSFTConfig</td><td>Training configuration</td></tr>
+            </tbody>
+          </table>
+          <div class="api-signature" style="margin-top:12px;"><span class="api-name">trainer.train</span>() &mdash; Start training. Returns training statistics.</div>
+        </div>
+
+        <div class="api-entry">
+          <h3>OCRSFTConfig</h3>
+          <div class="api-signature">
+            <span class="api-name">OCRSFTConfig</span>(<span class="api-param">learning_rate</span><span class="api-default">=5e-5</span>, <span class="api-param">max_length</span><span class="api-default">=4096</span>, <span class="api-param">max_steps</span><span class="api-default">=100</span>, <span class="api-param">per_device_train_batch_size</span><span class="api-default">=1</span>, <span class="api-param">output_dir</span><span class="api-default">="./ocr_outputs"</span>, <span class="api-param">train_on_completions</span><span class="api-default">=True</span>, <span class="api-param">gradient_accumulation_steps</span><span class="api-default">=4</span>, <span class="api-param">logging_steps</span><span class="api-default">=5</span>, <span class="api-param">save_steps</span><span class="api-default">=50</span>, ...)
+          </div>
+          <p>Training configuration for OCR fine-tuning.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>learning_rate</code></td><td><code>5e-5</code></td><td>Peak learning rate. Lower than VLM default since OCR models converge quickly</td></tr>
+              <tr><td><code>max_length</code></td><td><code>4096</code></td><td>Maximum sequence length for OCR outputs (long documents need high values)</td></tr>
+              <tr><td><code>max_steps</code></td><td><code>100</code></td><td>Total training steps</td></tr>
+              <tr><td><code>per_device_train_batch_size</code></td><td><code>1</code></td><td>Batch size (forced to 1, same as VLM)</td></tr>
+              <tr><td><code>output_dir</code></td><td><code>"./ocr_outputs"</code></td><td>Directory for checkpoints and logs</td></tr>
+              <tr><td><code>train_on_completions</code></td><td><code>True</code></td><td>Compute loss only on transcription tokens, not the prompt</td></tr>
+              <tr><td><code>gradient_accumulation_steps</code></td><td><code>4</code></td><td>Steps to accumulate gradients before updating</td></tr>
+              <tr><td><code>logging_steps</code></td><td><code>5</code></td><td>Log metrics every N steps</td></tr>
+              <tr><td><code>save_steps</code></td><td><code>50</code></td><td>Save checkpoint every N steps</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="api-entry">
+          <h3>OCRDataCollator</h3>
+          <div class="api-signature">
+            <span class="api-name">OCRDataCollator</span>(<span class="api-param">model</span>, <span class="api-param">processor</span>)
+          </div>
+          <p>Data collator for OCR tasks. Handles image preprocessing, prompt formatting, and token preparation for training.</p>
+        </div>
+
+        <div class="api-entry">
+          <h4>SFT usage example</h4>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune.ocr import FastOCRModel, OCRSFTTrainer, OCRSFTConfig, OCRDataCollator
+from datasets import load_dataset
+
+# Load a dedicated OCR model
+model, processor = FastOCRModel.from_pretrained(
+    "deepseek-ai/DeepSeek-OCR",
+    max_seq_length=4096,
+)
+
+# Add LoRA (language layers only by default)
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Load your OCR dataset (image + text pairs)
+dataset = load_dataset("your-ocr-dataset", split="train[:200]")
+
+# Train
+FastOCRModel.for_training(model)
+collator = OCRDataCollator(model, processor)
+trainer = OCRSFTTrainer(
+    model=model, tokenizer=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=OCRSFTConfig(output_dir="./ocr_output", max_steps=60),
+)
+trainer.train()
+
+# Evaluate
+FastOCRModel.for_inference(model)
+metrics = model.evaluate(test_images, test_references)
+print(f"CER: {metrics['cer']:.3f}, WER: {metrics['wer']:.3f}")</code></pre>
+          </div>
+        </div>
+
+        <!-- ===== OCRGRPOTrainer ===== -->
+        <div class="api-entry" id="OCRGRPOTrainer">
+          <h3>OCRGRPOTrainer</h3>
+          <div class="api-signature">
+            <span class="api-name">OCRGRPOTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">processor</span>, <span class="api-param">reward_fn</span>, <span class="api-param">args</span><span class="api-default">=None</span>)
+          </div>
+          <p>Group Relative Policy Optimization (GRPO) trainer for OCR models. Generates multiple transcriptions per image, scores them with character error rate-based reward functions, and updates the model to favor more accurate transcriptions.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>model</code></td><td>OCRModelWrapper</td><td>Model with LoRA adapters from <code>FastOCRModel.get_peft_model()</code></td></tr>
+              <tr><td><code>train_dataset</code></td><td>list[dict]</td><td>List of dicts with <code>image</code> (path or PIL Image) and <code>text</code> (ground truth) keys</td></tr>
+              <tr><td><code>processor</code></td><td>Processor</td><td>Processor from <code>FastOCRModel.from_pretrained()</code></td></tr>
+              <tr><td><code>reward_fn</code></td><td>Callable</td><td>Function <code>(transcription, ground_truth) &rarr; float</code> that scores each transcription</td></tr>
+              <tr><td><code>args</code></td><td>OCRGRPOConfig</td><td>Training configuration</td></tr>
+            </tbody>
+          </table>
+          <div class="api-signature" style="margin-top:12px;"><span class="api-name">trainer.train</span>() &mdash; Start GRPO training. Returns training statistics.</div>
+        </div>
+
+        <div class="api-entry">
+          <h3>OCRGRPOConfig</h3>
+          <div class="api-signature">
+            <span class="api-name">OCRGRPOConfig</span>(<span class="api-param">beta</span><span class="api-default">=0.04</span>, <span class="api-param">num_generations</span><span class="api-default">=4</span>, <span class="api-param">temperature</span><span class="api-default">=0.7</span>, <span class="api-param">max_completion_length</span><span class="api-default">=2048</span>, <span class="api-param">output_dir</span><span class="api-default">="./ocr_grpo_outputs"</span>, <span class="api-param">learning_rate</span><span class="api-default">=1e-6</span>, <span class="api-param">max_steps</span><span class="api-default">=-1</span>, <span class="api-param">logging_steps</span><span class="api-default">=1</span>, <span class="api-param">save_steps</span><span class="api-default">=100</span>)
+          </div>
+          <p>Configuration for OCR GRPO training.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>beta</code></td><td><code>0.04</code></td><td>KL penalty coefficient</td></tr>
+              <tr><td><code>num_generations</code></td><td><code>4</code></td><td>Transcriptions generated per image for advantage estimation</td></tr>
+              <tr><td><code>temperature</code></td><td><code>0.7</code></td><td>Sampling temperature for generation</td></tr>
+              <tr><td><code>max_completion_length</code></td><td><code>2048</code></td><td>Maximum tokens per transcription</td></tr>
+              <tr><td><code>output_dir</code></td><td><code>"./ocr_grpo_outputs"</code></td><td>Directory for checkpoints</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>1e-6</code></td><td>Learning rate (lower than SFT)</td></tr>
+              <tr><td><code>max_steps</code></td><td><code>-1</code></td><td><code>-1</code> trains for one full epoch</td></tr>
+              <tr><td><code>logging_steps</code></td><td><code>1</code></td><td>Log every N steps</td></tr>
+              <tr><td><code>save_steps</code></td><td><code>100</code></td><td>Save checkpoint every N steps</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="api-entry">
+          <div class="callout">
+            <div class="callout-title">How OCR GRPO works</div>
+            <p>For each document image, the trainer generates <code>num_generations</code> transcription attempts at non-zero temperature. Each transcription is scored by the <code>reward_fn</code> (typically based on CER against ground truth). The model is then updated via policy gradients to favor more accurate transcriptions while a KL penalty keeps it close to the reference policy.</p>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h4>GRPO usage example</h4>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune.ocr import FastOCRModel, OCRGRPOTrainer, OCRGRPOConfig, cer_reward
+
+# Load and configure model
+model, processor = FastOCRModel.from_pretrained("deepseek-ai/DeepSeek-OCR")
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Prepare dataset: list of dicts with image and ground truth text
+ocr_data = [
+    {"image": "receipt_001.png", "text": "Total: $42.50\nTax: $3.19"},
+    {"image": "receipt_002.png", "text": "Subtotal: $18.00\nTip: $3.60"},
+    # ...
+]
+
+# Train with CER-based rewards
+FastOCRModel.for_training(model)
+trainer = OCRGRPOTrainer(
+    model=model,
+    train_dataset=ocr_data,
+    processor=processor,
+    reward_fn=cer_reward,
+    args=OCRGRPOConfig(num_generations=4, max_steps=20),
+)
+result = trainer.train()</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Evaluation Metrics ===== -->
+      <section class="section" id="evaluation">
+        <div class="section-label">Evaluation</div>
+        <h2 style="margin-top: 0;">Evaluation Metrics</h2>
+        <p>MLX-Tune provides three standard OCR evaluation metrics, computed by <code>model.evaluate()</code> or available as standalone functions.</p>
+
+        <div class="api-entry">
+          <h3>Character Error Rate (CER)</h3>
+          <p>The edit distance between predicted and reference text, normalized by reference length. The primary metric for OCR quality.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">CER = edit_distance(prediction, reference) / len(reference)
+
+# Example:
+# prediction: "Helo World"
+# reference:  "Hello World"
+# edit_distance = 1 (missing 'l')
+# CER = 1 / 11 = 0.091</code></pre>
+          </div>
+          <p>Range: 0.0 (perfect) to 1.0+ (CER can exceed 1.0 if the prediction is much longer than the reference).</p>
+        </div>
+
+        <div class="api-entry">
+          <h3>Word Error Rate (WER)</h3>
+          <p>The edit distance computed at the word level. More interpretable for natural language but less granular than CER.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">WER = edit_distance(prediction_words, reference_words) / len(reference_words)
+
+# Example:
+# prediction: "Hello Wrold"
+# reference:  "Hello World"
+# word edit_distance = 1 ("Wrold" != "World")
+# WER = 1 / 2 = 0.50</code></pre>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h3>Exact Match</h3>
+          <p>The fraction of samples where the prediction matches the reference exactly (after whitespace normalization).</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">exact_match = sum(pred.strip() == ref.strip() for pred, ref in pairs) / len(pairs)
+
+# Example with 4 samples:
+# 3 exact matches out of 4
+# exact_match = 0.75</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Reward Functions ===== -->
+      <section class="section" id="rewards">
+        <div class="section-label">Rewards</div>
+        <h2 style="margin-top: 0;">Reward Functions</h2>
+        <p>Built-in reward functions for OCR GRPO training. These can be used directly with <code>OCRGRPOTrainer</code> or combined into custom reward functions.</p>
+
+        <div class="api-entry">
+          <h3>cer_reward</h3>
+          <div class="api-signature">
+            <span class="api-name">cer_reward</span>(<span class="api-param">transcription</span>, <span class="api-param">ground_truth</span>) &rarr; <span class="api-param">float</span>
+          </div>
+          <p>Returns <code>1.0 - CER</code>, clamped to [0.0, 1.0]. A perfect transcription scores 1.0; a completely wrong one scores 0.0.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune.ocr import cer_reward
+
+score = cer_reward("Hello World", "Hello World")   # 1.0
+score = cer_reward("Helo World", "Hello World")     # 0.909
+score = cer_reward("xyz", "Hello World")            # ~0.27</code></pre>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h3>exact_match_reward</h3>
+          <div class="api-signature">
+            <span class="api-name">exact_match_reward</span>(<span class="api-param">transcription</span>, <span class="api-param">ground_truth</span>) &rarr; <span class="api-param">float</span>
+          </div>
+          <p>Returns 1.0 if the transcription exactly matches the ground truth (after whitespace normalization), 0.0 otherwise. A strict binary reward.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune.ocr import exact_match_reward
+
+score = exact_match_reward("Hello World", "Hello World")   # 1.0
+score = exact_match_reward("Hello World ", "Hello World")   # 1.0 (whitespace normalized)
+score = exact_match_reward("Helo World", "Hello World")     # 0.0</code></pre>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h3>combined_ocr_reward</h3>
+          <div class="api-signature">
+            <span class="api-name">combined_ocr_reward</span>(<span class="api-param">transcription</span>, <span class="api-param">ground_truth</span>, <span class="api-param">cer_weight</span><span class="api-default">=0.7</span>, <span class="api-param">exact_weight</span><span class="api-default">=0.3</span>) &rarr; <span class="api-param">float</span>
+          </div>
+          <p>Weighted combination of CER reward and exact match reward. Balances continuous improvement (CER) with the incentive for perfect transcriptions (exact match).</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune.ocr import combined_ocr_reward
+
+# Combine CER (70%) and exact match (30%)
+score = combined_ocr_reward("Hello World", "Hello World")   # 1.0
+score = combined_ocr_reward("Helo World", "Hello World")     # 0.636
+
+# Custom weights
+score = combined_ocr_reward("Helo World", "Hello World",
+                            cer_weight=0.5, exact_weight=0.5)  # 0.455</code></pre>
+          </div>
+        </div>
+
+        <div class="api-entry">
+          <h4>Custom reward function</h4>
+          <p>You can write your own reward function for domain-specific OCR tasks.</p>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">import re
+
+def receipt_reward(transcription, ground_truth):
+    """Reward that prioritizes getting dollar amounts correct."""
+    # Extract dollar amounts from both strings
+    pred_amounts = set(re.findall(r'\$[\d.]+', transcription))
+    true_amounts = set(re.findall(r'\$[\d.]+', ground_truth))
+
+    if not true_amounts:
+        return cer_reward(transcription, ground_truth)
+
+    # 60% weight on amount accuracy, 40% on overall CER
+    amount_score = len(pred_amounts & true_amounts) / len(true_amounts)
+    cer_score = max(0.0, 1.0 - cer(transcription, ground_truth))
+    return 0.6 * amount_score + 0.4 * cer_score</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Post-Training ===== -->
+      <section class="section" id="post-training">
+        <div class="section-label">Post-Training</div>
+        <h2 style="margin-top: 0;">Save, load, and merge</h2>
+        <p>After training, save adapters for later use, reload them, or merge LoRA weights into the base model.</p>
+
+        <h3>Save adapters</h3>
+        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Save LoRA adapters only (small files)
+model.save_pretrained("./ocr_adapters")</code></pre>
+        </div>
+
+        <h3>Load adapters</h3>
+        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Load adapters into a fresh model
+model, processor = FastOCRModel.from_pretrained("deepseek-ai/DeepSeek-OCR")
+model.load_adapter("./ocr_adapters")</code></pre>
+        </div>
+
+        <h3>Merge LoRA into base model</h3>
+        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Fuse LoRA weights and save full model
+model.save_pretrained_merged("./ocr_merged", processor)</code></pre>
+        </div>
+
+        <h3>Evaluate after loading</h3>
+        <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Evaluate a saved model
+model, processor = FastOCRModel.from_pretrained("deepseek-ai/DeepSeek-OCR")
+model.load_adapter("./ocr_adapters")
+FastOCRModel.for_inference(model)
+
+metrics = model.evaluate(test_images, test_references)
+print(f"CER: {metrics['cer']:.3f}, WER: {metrics['wer']:.3f}, "
+      f"Exact Match: {metrics['exact_match']:.1%}")</code></pre>
+        </div>
+      </section>
+
+      <!-- ===== Examples ===== -->
+      <section class="section" id="examples">
+        <div class="section-label">Examples</div>
+        <h2 style="margin-top: 0;">Working examples</h2>
+        <p>Complete scripts you can run directly.</p>
+
+        <div class="example-grid">
+          <div class="example-card">
+            <h4>33 &mdash; DeepSeek-OCR Fine-Tuning</h4>
+            <p>Fine-tune DeepSeek-OCR on document images with LoRA. Includes evaluation with CER/WER metrics.</p>
+            <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">SFT</span><span class="example-tag">DeepSeek</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/33_deepseek_ocr_finetuning.py" target="_blank">View source &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>34 &mdash; GLM-OCR Fine-Tuning</h4>
+            <p>Fine-tune GLM-OCR for specialized document types. Receipt and invoice transcription with custom prompts.</p>
+            <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">SFT</span><span class="example-tag">GLM</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/34_glm_ocr_finetuning.py" target="_blank">View source &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>35 &mdash; OCR GRPO Training</h4>
+            <p>Train an OCR model with GRPO using CER-based rewards. Directly optimizes transcription accuracy via reinforcement learning.</p>
+            <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">GRPO</span><span class="example-tag">RL</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/35_ocr_grpo_training.py" target="_blank">View source &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>36 &mdash; olmOCR-2 Fine-Tuning</h4>
+            <p>Fine-tune the 7B olmOCR-2 model for complex document understanding. Tables, forms, and multi-column layouts.</p>
+            <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">SFT</span><span class="example-tag">7B</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/36_olmocr2_finetuning.py" target="_blank">View source &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>37 &mdash; OCR Evaluation Pipeline</h4>
+            <p>Complete evaluation pipeline: load a fine-tuned model, run batch transcription, compute CER/WER/exact match, and compare against baseline.</p>
+            <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">Evaluation</span><span class="example-tag">Metrics</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/37_ocr_evaluation_pipeline.py" target="_blank">View source &rarr;</a></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Tips ===== -->
+      <section class="section" id="tips">
+        <div class="section-label">Tips</div>
+        <h2 style="margin-top: 0;">Best practices</h2>
+
+        <div class="callout">
+          <div class="callout-title">Use greedy decoding for OCR</div>
+          <p>Set <code>temperature=0.0</code> for transcription and evaluation. Non-zero temperature introduces randomness that reduces OCR accuracy. Only use non-zero temperature during GRPO training where diversity is needed for advantage estimation.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Increase max_length for long documents</div>
+          <p>Default <code>max_length=4096</code> is sufficient for most single-page documents. For multi-page or dense documents, increase to 8192 or higher. Monitor for truncation in your evaluation metrics.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Dedicated vs. general VLMs</div>
+          <p>Dedicated OCR models (DeepSeek-OCR, GLM-OCR) are smaller and faster but focused on text extraction. General VLMs (Qwen3.5, Qwen2.5-VL) are larger but can handle complex tasks like table understanding, form field extraction, and document reasoning. Choose based on your task complexity.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Image preprocessing</div>
+          <p>OCR models work best with clean, well-lit images. For degraded scans, consider preprocessing with contrast enhancement or deskewing before training and inference. The processor handles resizing automatically.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Memory requirements</div>
+          <p>Dedicated OCR models (0.9B&ndash;1B) run comfortably on 8 GB unified memory. The 7B olmOCR-2 in 4-bit quantization needs 16 GB+. General VLMs follow the same memory guidelines as the <a href="vlm.html#tips">VLM track</a>.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Batch size must be 1</div>
+          <p>Like VLM training, OCR training is forced to <code>batch_size=1</code> since each document image produces a different number of vision tokens. Use <code>gradient_accumulation_steps</code> to simulate larger effective batch sizes.</p>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p>Community project, not affiliated with Unsloth AI or Apple.</p>
+        <p><a href="https://github.com/ARahim3/mlx-tune">GitHub</a> &middot; <a href="https://pypi.org/project/mlx-tune/">PyPI</a> &middot; Apache 2.0 License</p>
+      </footer>
+    </main>
+  </div>
+
+  <script src="assets/js/prism.min.js"></script>
+  <script src="assets/js/prism-python.min.js"></script>
+  <script src="assets/js/prism-bash.min.js"></script>
+  <script src="assets/js/main.js"></script>
+</body>
+</html>

@@ -14,9 +14,10 @@ Supported Training Methods:
 - TTS (Text-to-Speech) fine-tuning
 - STT (Speech-to-Text) fine-tuning
 - Embedding (Sentence Embedding) fine-tuning
+- OCR (Optical Character Recognition) fine-tuning
 """
 
-__version__ = "0.4.15"  # Harrier embedding support
+__version__ = "0.4.16"  # OCR fine-tuning support
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (
@@ -103,6 +104,30 @@ from mlx_tune.embeddings import (
     EmbeddingDataCollator,
 )
 
+# OCR Models
+from mlx_tune.ocr import (
+    FastOCRModel,
+    OCRModelWrapper,
+    OCRSFTTrainer,
+    OCRSFTConfig,
+    OCRGRPOTrainer,
+    OCRGRPOConfig,
+    # Metrics
+    compute_cer,
+    compute_wer,
+    compute_exact_match,
+    compute_ocr_metrics,
+    # Dataset helpers
+    load_ocr_dataset,
+    convert_ocr_pairs_to_messages,
+    # Reward functions
+    cer_reward,
+    exact_match_reward,
+    combined_ocr_reward,
+    # Registry
+    OCR_MODELS,
+)
+
 # Audio Profiles and Codec Adapters
 from mlx_tune.audio_profiles import (
     TTSModelProfile,
@@ -168,6 +193,23 @@ __all__ = [
     "KTOConfig",
     "SimPOTrainer",
     "SimPOConfig",
+    # OCR Models
+    "FastOCRModel",
+    "OCRModelWrapper",
+    "OCRSFTTrainer",
+    "OCRSFTConfig",
+    "OCRGRPOTrainer",
+    "OCRGRPOConfig",
+    "compute_cer",
+    "compute_wer",
+    "compute_exact_match",
+    "compute_ocr_metrics",
+    "load_ocr_dataset",
+    "convert_ocr_pairs_to_messages",
+    "cer_reward",
+    "exact_match_reward",
+    "combined_ocr_reward",
+    "OCR_MODELS",
     # Embedding Models
     "FastEmbeddingModel",
     "EmbeddingModelWrapper",

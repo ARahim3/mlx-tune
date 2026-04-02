@@ -23,6 +23,7 @@
         <li><a href="index.html">Home</a></li>
         <li><a href="llm.html">LLM</a></li>
         <li><a href="vlm.html">VLM</a></li>
+        <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
         <li><a href="examples.html" class="active">Examples</a></li>
@@ -46,6 +47,7 @@
         <li><a href="#vlm">Vision Models</a></li>
         <li><a href="#audio">Audio Models</a></li>
         <li><a href="#embedding">Embedding Models</a></li>
+        <li><a href="#ocr">OCR Models</a></li>
       </ul>
     </aside>
 
@@ -915,6 +917,163 @@ model.save_pretrained("./adapter")
 model2.load_adapter("./adapter")  # On fresh model with LoRA applied</code></pre>
             </div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/32_harrier_270m_embedding_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- OCR Models -->
+      <h2 id="ocr">OCR Models</h2>
+      <div class="example-grid">
+
+        <div class="example-card">
+          <h4>33 &mdash; OCR Document Fine-Tuning</h4>
+          <p>Fine-tune DeepSeek-OCR on LaTeX document images. Learns to convert document scans into structured LaTeX markup with high fidelity.</p>
+          <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">DeepSeek-OCR</span><span class="example-tag">LaTeX</span><span class="example-tag">Document</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastOCRModel, OCRSFTTrainer, OCRSFTConfig, OCRDataCollator
+from datasets import load_dataset
+
+model, processor = FastOCRModel.from_pretrained(
+    "mlx-community/DeepSeek-OCR-0.5B-4bit",
+)
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("unsloth/LaTeX_OCR", split="train[:100]")
+
+collator = OCRDataCollator(model, processor)
+trainer = OCRSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=OCRSFTConfig(output_dir="./ocr_output", max_steps=60),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/33_ocr_document_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>34 &mdash; VLM-to-OCR Fine-Tuning</h4>
+          <p>Adapt Qwen3.5 vision-language model for OCR tasks. Leverages VLM&rsquo;s visual understanding to extract text from LaTeX document images.</p>
+          <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">Qwen3.5</span><span class="example-tag">VLM</span><span class="example-tag">LaTeX</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastOCRModel, OCRSFTTrainer, OCRSFTConfig, OCRDataCollator
+from datasets import load_dataset
+
+model, processor = FastOCRModel.from_pretrained(
+    "mlx-community/Qwen3.5-0.8B-bf16",
+)
+model = FastOCRModel.get_peft_model(
+    model, r=16, lora_alpha=16,
+    finetune_vision_layers=True, finetune_language_layers=True,
+)
+
+dataset = load_dataset("unsloth/LaTeX_OCR", split="train[:100]")
+
+collator = OCRDataCollator(model, processor)
+trainer = OCRSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=OCRSFTConfig(output_dir="./vlm_ocr_output", max_steps=60),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/34_vlm_to_ocr_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>35 &mdash; Handwriting OCR</h4>
+          <p>Fine-tune DeepSeek-OCR-2 on handwritten text recognition using the Handwriting-OCR dataset. Handles varied writing styles and quality.</p>
+          <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">DeepSeek-OCR-2</span><span class="example-tag">Handwriting</span><span class="example-tag">Recognition</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastOCRModel, OCRSFTTrainer, OCRSFTConfig, OCRDataCollator
+from datasets import load_dataset
+
+model, processor = FastOCRModel.from_pretrained(
+    "mlx-community/DeepSeek-OCR-2-1B-4bit",
+)
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("Teklia/Handwriting-OCR", split="train[:100]")
+
+collator = OCRDataCollator(model, processor, image_column="image", text_column="text")
+trainer = OCRSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=OCRSFTConfig(output_dir="./handwriting_output", max_steps=60),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/35_handwriting_ocr_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>36 &mdash; OCR GRPO Training</h4>
+          <p>Train Qwen3.5 for OCR using GRPO with character error rate (CER) reward. Generates multiple OCR attempts and optimizes via policy gradient with edit-distance scoring.</p>
+          <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">GRPO</span><span class="example-tag">Qwen3.5</span><span class="example-tag">CER Reward</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastOCRModel
+from mlx_tune.ocr import OCRGRPOTrainer, OCRGRPOConfig
+
+def cer_reward(response, ground_truth):
+    """Character Error Rate reward: 1.0 - CER"""
+    import editdistance
+    dist = editdistance.eval(response, ground_truth)
+    return max(0.0, 1.0 - dist / max(len(ground_truth), 1))
+
+model, processor = FastOCRModel.from_pretrained(
+    "mlx-community/Qwen3.5-0.8B-bf16",
+)
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+trainer = OCRGRPOTrainer(
+    model=model, processor=processor,
+    train_dataset=ocr_data, reward_fn=cer_reward,
+    args=OCRGRPOConfig(num_generations=2, max_completion_length=256,
+                       learning_rate=1e-6, max_steps=20),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/36_ocr_grpo_training.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>37 &mdash; Multilingual OCR</h4>
+          <p>Fine-tune GLM-OCR on CORD-v2 receipt dataset for multilingual document understanding. Extracts structured fields from scanned receipts across languages.</p>
+          <div class="example-tags"><span class="example-tag">OCR</span><span class="example-tag">GLM-OCR</span><span class="example-tag">Multilingual</span><span class="example-tag">Receipts</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastOCRModel, OCRSFTTrainer, OCRSFTConfig, OCRDataCollator
+from datasets import load_dataset
+
+model, processor = FastOCRModel.from_pretrained(
+    "mlx-community/GLM-OCR-2B-4bit",
+)
+model = FastOCRModel.get_peft_model(model, r=16, lora_alpha=16)
+
+dataset = load_dataset("naver-clova-ix/cord-v2", split="train[:100]")
+
+collator = OCRDataCollator(model, processor, image_column="image", text_column="ground_truth")
+trainer = OCRSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=OCRSFTConfig(output_dir="./multilingual_ocr_output", max_steps=60),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/37_multilingual_ocr_finetuning.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
       </div>

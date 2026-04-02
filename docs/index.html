@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MLX-Tune &mdash; Fine-tune LLMs, Vision, and Audio models on Apple Silicon</title>
-  <meta name="description" content="Fine-tune LLMs, Vision, TTS, and STT models on Apple Silicon with MLX. Unsloth-compatible API.">
+  <title>MLX-Tune &mdash; Fine-tune LLMs, Vision, Audio, and OCR models on Apple Silicon</title>
+  <meta name="description" content="Fine-tune LLMs, Vision, TTS, STT, and OCR models on Apple Silicon with MLX. Unsloth-compatible API.">
 
   <!-- Favicon: bold "m" in SVG -->
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%25' y='73%25' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='900' font-size='22' fill='%23e6edf3'>m</text></svg>">
@@ -123,6 +123,7 @@
         <li><a href="index.html" class="active">Home</a></li>
         <li><a href="llm.html">LLM</a></li>
         <li><a href="vlm.html">VLM</a></li>
+        <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
         <li><a href="examples.html">Examples</a></li>
@@ -145,10 +146,10 @@
 
       <!-- ===== Hero ===== -->
       <section class="hero hero-glow">
-        <span class="hero-version">v0.4.15</span>
+        <span class="hero-version">v0.4.16</span>
         <img src="assets/img/logo.png" alt="MLX-Tune" class="hero-logo">
         <h1 class="hero-tagline">Fine-tune LLMs, Vision, and Audio models on your Mac</h1>
-        <p class="hero-subtitle">SFT, DPO, GRPO, Vision, TTS, and STT fine-tuning &mdash; natively on MLX. Unsloth-compatible API.</p>
+        <p class="hero-subtitle">SFT, DPO, GRPO, Vision, TTS, STT, and OCR fine-tuning &mdash; natively on MLX. Unsloth-compatible API.</p>
 
         <div class="hero-install" data-copy="pip install mlx-tune" role="button" tabindex="0" aria-label="Copy install command">
           <span class="copied-tooltip">Copied!</span>
@@ -216,6 +217,11 @@
             <div class="feature-icon">&#128269;</div>
             <h3>Embedding Fine-Tuning</h3>
             <p>Sentence embeddings with contrastive learning (InfoNCE). BERT, ModernBERT, Qwen3-Embedding, Harrier. Semantic search on Apple Silicon.</p>
+          </a>
+          <a href="ocr.html" class="feature-card" style="text-decoration:none; color:inherit; cursor:pointer;">
+            <div class="feature-icon">&#128196;</div>
+            <h3>OCR Fine-Tuning</h3>
+            <p>Document OCR with DeepSeek-OCR, VLM-to-OCR with Qwen3.5, handwriting recognition, GRPO with CER reward, and multilingual receipts.</p>
           </a>
           <a href="llm.html#moe" class="feature-card" style="text-decoration:none; color:inherit; cursor:pointer;">
             <div class="feature-icon">&#9881;</div>
@@ -417,6 +423,16 @@ uv pip install -e .</code></pre>
               <td><strong>Embedding</strong></td>
               <td><code>EmbeddingSFTTrainer</code></td>
               <td>Sentence embedding fine-tuning (BERT, ModernBERT, Qwen3-Embedding, Harrier — InfoNCE/contrastive)</td>
+            </tr>
+            <tr>
+              <td><strong>OCR SFT</strong></td>
+              <td><code>OCRSFTTrainer</code></td>
+              <td>Document OCR fine-tuning (DeepSeek-OCR, Qwen3.5 VLM-to-OCR, GLM-OCR &mdash; LaTeX, handwriting, multilingual)</td>
+            </tr>
+            <tr>
+              <td><strong>OCR GRPO</strong></td>
+              <td><code>OCRGRPOTrainer</code></td>
+              <td>OCR reasoning training with CER/edit-distance reward functions</td>
             </tr>
             <tr>
               <td><strong>MoE</strong></td>

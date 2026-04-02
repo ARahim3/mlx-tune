@@ -366,9 +366,21 @@ class VLMModelWrapper:
                     {"type": "text", "text": prompt or "Describe this image."},
                 ]},
             ]
-            formatted_prompt = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+            try:
+                formatted_prompt = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                formatted_prompt = ""
+
+            # If chat template didn't insert image tokens (e.g. DeepSeek-OCR),
+            # use a simple prompt with explicit image token
+            image_token = getattr(self.processor, "image_token", "<image>")
+            common_tokens = [image_token, "<|image_pad|>", "<|vision_start|>",
+                             "<image>", "<img>"]
+            if not any(tok in formatted_prompt for tok in common_tokens):
+                text = prompt or "Describe this image."
+                formatted_prompt = f"{image_token}\n{text}"
 
             # Convert PIL images to temp file paths (mlx-vlm expects file paths)
             temp_files = []
@@ -820,7 +832,15 @@ class UnslothVisionDataCollator:
             "attention_mask": mx.concatenate(all_masks, axis=0) if all_masks else None,
         }
         if all_pixel_values:
-            batch["pixel_values"] = mx.concatenate(all_pixel_values, axis=0)
+            # Some models (e.g. DeepSeek-OCR) return pixel_values as a list
+            # instead of mx.array — pass through directly for batch_size=1
+            if len(all_pixel_values) == 1 and not isinstance(all_pixel_values[0], mx.array):
+                batch["pixel_values"] = all_pixel_values[0]
+            else:
+                try:
+                    batch["pixel_values"] = mx.concatenate(all_pixel_values, axis=0)
+                except (TypeError, ValueError):
+                    batch["pixel_values"] = all_pixel_values[0]
         else:
             batch["pixel_values"] = None
 
@@ -828,19 +848,75 @@ class UnslothVisionDataCollator:
         return batch
 
     def _apply_chat_template(self, messages: List[Dict]) -> str:
-        """Apply chat template using the processor (inserts proper vision tokens)."""
+        """Apply chat template using the processor (inserts proper vision tokens).
+
+        Some models (e.g. DeepSeek-OCR) have chat templates that can't handle
+        mixed-type content lists (text + image markers). For these, we first
+        flatten content into a string with explicit image tokens, then apply
+        the template.
+        """
+        # Try the standard approach first
         if hasattr(self.processor, "apply_chat_template"):
-            return self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-        elif hasattr(self.processor, "tokenizer"):
-            return self.processor.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-        else:
-            return "\n".join(
-                f"{m['role']}: {m.get('content', '')}" for m in messages
-            )
+            try:
+                result = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False,
+                )
+                # Verify result contains image tokens if images are present
+                has_images = any(
+                    isinstance(m.get("content"), list)
+                    and any(
+                        isinstance(c, dict) and c.get("type") == "image"
+                        for c in m["content"]
+                    )
+                    for m in messages
+                )
+                if has_images:
+                    # Check for common image token patterns
+                    image_token = getattr(self.processor, "image_token", "<image>")
+                    common_tokens = [image_token, "<|image_pad|>", "<|vision_start|>",
+                                     "<image>", "<img>"]
+                    if any(tok in result for tok in common_tokens):
+                        return result
+                    # Template didn't insert image tokens — fall through to manual build
+                else:
+                    return result
+            except Exception:
+                pass
+
+        # Fallback: flatten mixed-type content into text with explicit image tokens
+        image_token = getattr(self.processor, "image_token", "<image>")
+        flat_messages = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            parts.append(item.get("text", ""))
+                        elif item.get("type") == "image":
+                            parts.append(image_token)
+                flat_messages.append({"role": msg["role"], "content": "\n".join(parts)})
+            else:
+                flat_messages.append(msg)
+
+        # Try applying template with flattened messages
+        try:
+            if hasattr(self.processor, "apply_chat_template"):
+                return self.processor.apply_chat_template(
+                    flat_messages, tokenize=False, add_generation_prompt=False,
+                )
+            elif hasattr(self.processor, "tokenizer"):
+                return self.processor.tokenizer.apply_chat_template(
+                    flat_messages, tokenize=False, add_generation_prompt=False,
+                )
+        except Exception:
+            pass
+
+        # Last resort: simple text concatenation
+        return "\n".join(
+            f"{m['role']}: {m.get('content', '')}" for m in flat_messages
+        )
 
 
 class _VLMTrainerShim:
