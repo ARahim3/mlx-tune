@@ -376,6 +376,12 @@ TEMPLATE_ALIASES: Dict[str, str] = {
     # OpenAI format
     "openai": "chatml",
     "im_start": "chatml",
+
+    # LFM (Liquid Foundation Models) aliases
+    "lfm2": "chatml",
+    "lfm25": "chatml",
+    "lfm2.5": "chatml",
+    "liquid": "chatml",
 }
 
 
@@ -772,6 +778,9 @@ def _detect_template_from_tokenizer(tokenizer: Any) -> str:
     if 'deepseek' in name:
         return 'deepseek-v2'
 
+    if 'lfm' in name or 'liquid' in name:
+        return 'chatml'
+
     if 'vicuna' in name:
         return 'vicuna'
 
@@ -999,6 +1008,9 @@ def get_template_for_model(model_name: str) -> str:
 
     if 'deepseek' in name:
         return 'deepseek-v2'
+
+    if 'lfm' in name or 'liquid' in name:
+        return 'chatml'
 
     if 'vicuna' in name:
         return 'vicuna'

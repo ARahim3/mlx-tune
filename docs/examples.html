@@ -75,6 +75,7 @@
         <li><a href="#audio">Audio Models</a></li>
         <li><a href="#embedding">Embedding Models</a></li>
         <li><a href="#ocr">OCR Models</a></li>
+        <li><a href="#cpt">Continual Pretraining</a></li>
       </ul>
     </aside>
 
@@ -275,6 +276,67 @@ model.save_pretrained("lora_model")
 model.save_pretrained_merged("merged", tokenizer)</code></pre>
             </div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/08_exact_unsloth_pipeline.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>41 &mdash; LFM2 SFT Fine-Tuning</h4>
+          <p>Fine-tune Liquid AI&rsquo;s LFM2 with SFT. Hybrid gated-conv + GQA architecture with ChatML format. Uses LFM2-specific target modules: <code>in_proj</code>, <code>out_proj</code>, <code>w1</code>, <code>w2</code>, <code>w3</code>.</p>
+          <div class="example-tags"><span class="example-tag">SFT</span><span class="example-tag">LFM2</span><span class="example-tag">Liquid AI</span><span class="example-tag">ChatML</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/LFM2-350M-4bit",
+    max_seq_length=2048, load_in_4bit=True,
+)
+# LFM2-specific targets: out_proj/in_proj (attention), w1/w2/w3 (gated conv)
+model = FastLanguageModel.get_peft_model(
+    model, r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj",
+                    "in_proj", "w1", "w2", "w3"],
+    lora_alpha=16,
+)
+
+trainer = SFTTrainer(
+    model=model, train_dataset=dataset, tokenizer=tokenizer,
+    args=SFTConfig(output_dir="outputs_lfm2", max_steps=50,
+                   learning_rate=2e-4),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/41_lfm2_sft_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>42 &mdash; LFM2.5-Thinking Reasoning</h4>
+          <p>Fine-tune LFM2.5-1.2B-Thinking for chain-of-thought reasoning. Uses <code>&lt;think&gt;</code> tags for internal reasoning (like Qwen3.5).</p>
+          <div class="example-tags"><span class="example-tag">SFT</span><span class="example-tag">LFM2</span><span class="example-tag">Reasoning</span><span class="example-tag">Thinking</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/LFM2.5-1.2B-Thinking-4bit",
+    max_seq_length=4096, load_in_4bit=True,
+)
+model = FastLanguageModel.get_peft_model(
+    model, r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj",
+                    "in_proj", "w1", "w2", "w3"],
+)
+
+trainer = SFTTrainer(
+    model=model, train_dataset=thinking_dataset, tokenizer=tokenizer,
+    args=SFTConfig(output_dir="outputs_lfm2_think", max_steps=50),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/42_lfm2_thinking_finetuning.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
       </div>
@@ -1251,6 +1313,138 @@ trainer = SFTTrainer(model=model, train_dataset=dataset, tokenizer=tokenizer,
 trainer.train()</code></pre>
             </div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/30_phi35_moe_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Continual Pretraining -->
+      <h2 id="cpt">Continual Pretraining</h2>
+      <div class="example-grid">
+
+        <div class="example-card">
+          <h4>43 &mdash; CPT Language Adaptation</h4>
+          <p>Teach a model a new language with continual pretraining on raw text. Loss on all tokens, optional embed_tokens/lm_head training with decoupled learning rate.</p>
+          <div class="example-tags"><span class="example-tag">CPT</span><span class="example-tag">Language</span><span class="example-tag">Adaptation</span><span class="example-tag">LoRA</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/SmolLM2-135M-Instruct",
+    max_seq_length=2048,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Raw text in target language
+dataset = [{"text": "Raw text in the target language..."}, ...]
+
+trainer = CPTTrainer(
+    model=model, train_dataset=dataset, tokenizer=tokenizer,
+    args=CPTConfig(
+        output_dir="cpt_language", learning_rate=2e-5,
+        include_embeddings=True,
+        embedding_learning_rate=1e-5, max_steps=100,
+    ),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/43_cpt_language_adaptation.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>44 &mdash; CPT Domain Knowledge</h4>
+          <p>Inject domain-specific knowledge (medical, legal, scientific) into a model via continual pretraining on domain corpora.</p>
+          <div class="example-tags"><span class="example-tag">CPT</span><span class="example-tag">Domain</span><span class="example-tag">Knowledge</span><span class="example-tag">LoRA</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/SmolLM2-360M-Instruct",
+    max_seq_length=2048,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Domain-specific text corpus
+dataset = load_dataset("medical_papers", split="train")
+
+trainer = CPTTrainer(
+    model=model, train_dataset=dataset, tokenizer=tokenizer,
+    args=CPTConfig(
+        output_dir="cpt_domain", learning_rate=2e-5,
+        max_steps=200,
+    ),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/44_cpt_domain_knowledge.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>45 &mdash; CPT Code Capabilities</h4>
+          <p>Extend a model&rsquo;s programming language coverage by pretraining on code corpora. Improves code generation and understanding.</p>
+          <div class="example-tags"><span class="example-tag">CPT</span><span class="example-tag">Code</span><span class="example-tag">Programming</span><span class="example-tag">LoRA</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/SmolLM2-135M-Instruct",
+    max_seq_length=4096,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Code corpus
+dataset = load_dataset("code_corpus", split="train")
+
+trainer = CPTTrainer(
+    model=model, train_dataset=dataset, tokenizer=tokenizer,
+    args=CPTConfig(
+        output_dir="cpt_code", learning_rate=2e-5,
+        max_seq_length=4096, max_steps=300,
+    ),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/45_cpt_code_capabilities.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>46 &mdash; LFM2 + Continual Pretraining</h4>
+          <p>Combine LFM2 with continual pretraining. Adapts Liquid AI&rsquo;s hybrid architecture to a new domain with raw text training.</p>
+          <div class="example-tags"><span class="example-tag">CPT</span><span class="example-tag">LFM2</span><span class="example-tag">Liquid AI</span><span class="example-tag">Domain</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/LFM2-350M-4bit",
+    max_seq_length=2048, load_in_4bit=True,
+)
+model = FastLanguageModel.get_peft_model(
+    model, r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj",
+                    "in_proj", "w1", "w2", "w3"],
+)
+
+trainer = CPTTrainer(
+    model=model, train_dataset=domain_text, tokenizer=tokenizer,
+    args=CPTConfig(
+        output_dir="cpt_lfm2", learning_rate=2e-5,
+        include_embeddings=True,
+        embedding_learning_rate=1e-5, max_steps=100,
+    ),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/46_lfm2_cpt_domain.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
       </div>

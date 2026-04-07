@@ -20,6 +20,9 @@ window.MLX_SEARCH_INDEX = [
   { title: "Response-Only Training", section: "train_on_responses_only()", url: "llm.html#response-only", tags: "response only train on responses prompt masking assistant", page: "LLM" },
   { title: "Dataset Utilities", section: "to_sharegpt / column mapping", url: "llm.html#datasets", tags: "dataset sharegpt alpaca column mapping hfdatasetconfig", page: "LLM" },
   { title: "MoE Fine-Tuning", section: "Mixture of Experts", url: "llm.html#moe", tags: "moe mixture experts switch linear qwen phi mixtral gemma4", page: "LLM" },
+  { title: "Continual Pretraining", section: "CPTTrainer / CPTConfig", url: "llm.html#cpt", tags: "cpt continual pretraining raw text domain language adaptation embedding learning rate", page: "LLM" },
+  { title: "CPTTrainer", section: "Continual Pretraining Trainer", url: "llm.html#CPTTrainer", tags: "cpttrainer cptconfig continual pretraining embed_tokens lm_head decoupled lr", page: "LLM" },
+  { title: "LFM2 Models", section: "Liquid Foundation Models", url: "llm.html#cpt", tags: "lfm2 lfm2.5 liquid ai hybrid gated conv gqa attention in_proj out_proj w1 w2 w3", page: "LLM" },
   { title: "Embedding Models", section: "Contrastive Learning", url: "llm.html#embedding", tags: "embedding sentence transformer bert modernbert qwen3 harrier infonce contrastive", page: "LLM" },
   { title: "Save & Export", section: "GGUF, LoRA, Merged", url: "llm.html#save", tags: "save export gguf lora merge push hub save_pretrained_merged convert", page: "LLM" },
 
@@ -60,6 +63,12 @@ window.MLX_SEARCH_INDEX = [
   { title: "Whisper STT", section: "Example 13", url: "examples.html#audio", tags: "whisper stt speech example 13", page: "Examples" },
   { title: "Embedding Fine-Tuning", section: "Example 27", url: "examples.html#embedding", tags: "embedding example 27 sentence bert infonce", page: "Examples" },
   { title: "MoE Fine-Tuning", section: "Example 29", url: "examples.html#moe", tags: "moe example 29 qwen3.5 mixture experts", page: "Examples" },
+  { title: "LFM2 SFT", section: "Example 41", url: "examples.html#sft", tags: "lfm2 liquid ai sft example 41 hybrid gated conv", page: "Examples" },
+  { title: "LFM2.5 Thinking", section: "Example 42", url: "examples.html#sft", tags: "lfm2 liquid ai thinking reasoning example 42 chain-of-thought", page: "Examples" },
+  { title: "CPT Language Adaptation", section: "Example 43", url: "examples.html#cpt", tags: "cpt continual pretraining language adaptation example 43 turkish", page: "Examples" },
+  { title: "CPT Domain Knowledge", section: "Example 44", url: "examples.html#cpt", tags: "cpt domain knowledge medical scientific example 44", page: "Examples" },
+  { title: "CPT Code Capabilities", section: "Example 45", url: "examples.html#cpt", tags: "cpt code programming capabilities example 45 mlx", page: "Examples" },
+  { title: "LFM2 + CPT", section: "Example 46", url: "examples.html#cpt", tags: "lfm2 cpt continual pretraining domain adaptation example 46", page: "Examples" },
 
   // --- Troubleshooting ---
   { title: "Troubleshooting", section: "Common Issues", url: "troubleshooting.html", tags: "troubleshoot error fix help debug issue", page: "Help" },

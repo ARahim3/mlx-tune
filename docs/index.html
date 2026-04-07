@@ -173,7 +173,7 @@
 
       <!-- ===== Hero ===== -->
       <section class="hero hero-glow">
-        <span class="hero-version">v0.4.18</span>
+        <span class="hero-version">v0.4.19</span>
         <img src="assets/img/logo.png" alt="MLX-Tune" class="hero-logo">
         <h1 class="hero-tagline">Fine-tune LLMs, Vision, and Audio models on your Mac</h1>
         <p class="hero-subtitle">SFT, DPO, GRPO, Vision, TTS, STT, and OCR fine-tuning &mdash; natively on MLX. Unsloth-compatible API.</p>
@@ -465,6 +465,16 @@ uv pip install -e .</code></pre>
               <td><strong>MoE</strong></td>
               <td><code>SFTTrainer</code></td>
               <td>Mixture of Experts fine-tuning (Qwen3.5-MoE, Phi-3.5-MoE, Mixtral, DeepSeek — 39+ architectures)</td>
+            </tr>
+            <tr>
+              <td><strong>LFM2</strong></td>
+              <td><code>SFTTrainer</code></td>
+              <td>Liquid Foundation Models (LFM2/LFM2.5 from Liquid AI — hybrid gated-conv + GQA architecture)</td>
+            </tr>
+            <tr>
+              <td><strong>CPT</strong></td>
+              <td><code>CPTTrainer</code> + <code>CPTConfig</code></td>
+              <td>Continual pretraining on raw text (loss on all tokens, optional embed/lm_head training, decoupled LR)</td>
             </tr>
           </tbody>
         </table>

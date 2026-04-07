@@ -438,6 +438,21 @@ class TestGetTemplateForModel:
         """Test detection of DeepSeek models."""
         assert get_template_for_model("deepseek-ai/DeepSeek-V2-Chat") == "deepseek-v2"
 
+    def test_detect_lfm2(self):
+        """Test detection of Liquid Foundation Models."""
+        assert get_template_for_model("LiquidAI/LFM2-1.2B") == "chatml"
+        assert get_template_for_model("LiquidAI/LFM2.5-1.2B-Instruct") == "chatml"
+        assert get_template_for_model("mlx-community/LFM2-2.6B-4bit") == "chatml"
+        assert get_template_for_model("lmstudio-community/LFM2.5-1.2B-Instruct-MLX-8bit") == "chatml"
+        assert get_template_for_model("LiquidAI/LFM2.5-1.2B-Thinking") == "chatml"
+
+    def test_lfm2_aliases(self):
+        """Test LFM2 template aliases resolve to chatml."""
+        assert TEMPLATE_ALIASES["lfm2"] == "chatml"
+        assert TEMPLATE_ALIASES["lfm25"] == "chatml"
+        assert TEMPLATE_ALIASES["lfm2.5"] == "chatml"
+        assert TEMPLATE_ALIASES["liquid"] == "chatml"
+
     def test_default_to_chatml(self):
         """Test that unknown models default to chatml."""
         assert get_template_for_model("unknown/some-model") == "chatml"

@@ -78,7 +78,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🚀 **v0.4.18** - Gemma 4 support (E2B, E4B, 26B MoE, 31B); Batched RL training; OCR fine-tuning
+> 🚀 **v0.4.19** - LFM2 (Liquid AI) support; Continual Pretraining (CPT) with decoupled LR
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -102,6 +102,8 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 | **`convert()`** | ✅ Stable | **HF → MLX conversion (LLM, TTS, STT)** |
 | **Embedding Fine-Tuning** | ✅ Stable | **BERT, ModernBERT, Qwen3-Embedding, Harrier (InfoNCE/contrastive)** |
 | **OCR Fine-Tuning** | ✅ Stable | **DeepSeek-OCR, GLM-OCR, olmOCR, Qwen-VL, Pixtral + CER/WER metrics** |
+| **LFM2 Support** | ✅ Stable | **Liquid AI LFM2/LFM2.5 (350M-24B, hybrid conv+GQA, Thinking)** |
+| **Continual Pretraining** | ✅ Stable | **CPTTrainer with decoupled LR, embed_tokens/lm_head, full-weight mode** |
 | **`push_to_hub()`** | ✅ Stable | **Upload to HuggingFace Hub** |
 | PyPI Package | ✅ Available | `uv pip install mlx-tune` |
 
@@ -344,6 +346,58 @@ metrics = model.evaluate(test_images, ground_truths)  # → {cer, wer, exact_mat
 
 See examples: [Document OCR](examples/33_ocr_document_finetuning.py), [VLM→OCR](examples/34_qwen_vlm_ocr_finetuning.py), [Handwriting](examples/35_handwriting_ocr_finetuning.py), [OCR GRPO](examples/36_ocr_grpo_training.py), [Multilingual](examples/37_multilingual_ocr_finetuning.py).
 
+### Continual Pretraining (CPT)
+
+Adapt any model to new domains or languages by training on raw text. Supports LoRA CPT (with optional embedding training) and full-weight CPT:
+
+```python
+from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+# Load a BASE model (not instruction-tuned)
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/SmolLM2-360M-Instruct", max_seq_length=2048,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, target_modules=[
+    "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+])
+
+# CPT: raw text, loss on ALL tokens, decoupled embedding LR
+trainer = CPTTrainer(
+    model=model, tokenizer=tokenizer,
+    train_dataset=[{"text": "Domain-specific document..."}, ...],
+    args=CPTConfig(
+        learning_rate=5e-5,
+        embedding_learning_rate=5e-6,  # 10x smaller for embeddings
+        include_embeddings=True,       # auto-adds embed_tokens + lm_head
+        max_steps=1000,
+    ),
+)
+trainer.train()
+```
+
+See examples: [Language Adaptation](examples/43_cpt_language_adaptation.py), [Domain Knowledge](examples/44_cpt_domain_knowledge.py), [Code Capabilities](examples/45_cpt_code_capabilities.py), [LFM2 + CPT](examples/46_lfm2_cpt_domain.py).
+
+### LFM2 (Liquid AI) Fine-Tuning
+
+Fine-tune Liquid Foundation Models with their hybrid gated-conv + GQA architecture:
+
+```python
+from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/LFM2-350M-4bit", max_seq_length=2048,
+)
+# LFM2-specific target modules (auto-resolved)
+model = FastLanguageModel.get_peft_model(model, r=16, target_modules=[
+    "q_proj", "k_proj", "v_proj", "out_proj",  # Attention
+    "in_proj", "w1", "w2", "w3",                # Gated conv MLP
+])
+```
+
+**Supported**: LFM2 (350M-2.6B dense), LFM2.5 (350M-1.2B), LFM2.5-Thinking, LFM2 MoE (8B-A1B, 24B-A2B).
+
+See examples: [LFM2 SFT](examples/41_lfm2_sft_finetuning.py), [LFM2.5-Thinking](examples/42_lfm2_thinking_finetuning.py).
+
 ### MoE Fine-Tuning
 
 Fine-tune Mixture of Experts models — 39+ architectures supported automatically. MLX-Tune detects MoE layers and applies per-expert LoRA via `LoRASwitchLinear`:
@@ -407,6 +461,8 @@ model.push_to_hub("username/my-model")
 | **OCR SFT** | `OCRSFTTrainer` | ✅ Native MLX | DeepSeek-OCR, GLM-OCR, Qwen-VL, Pixtral (CER/WER eval) |
 | **OCR GRPO** | `OCRGRPOTrainer` | ✅ Native MLX | OCR with character-level RL rewards |
 | **MoE** | `SFTTrainer` | ✅ Native MLX | Qwen3.5-MoE, Phi-3.5-MoE, Mixtral, DeepSeek (39+ archs) |
+| **CPT** | `CPTTrainer` | ✅ Native MLX | Continual pretraining with decoupled LR, embed training |
+| **LFM2** | `SFTTrainer` | ✅ Native MLX | Liquid AI LFM2/LFM2.5 (hybrid conv+GQA, Thinking) |
 
 ## Examples
 
@@ -421,6 +477,8 @@ Check [`examples/`](examples/) for working code:
 - Embedding fine-tuning — BERT/MiniLM (27), Qwen3-Embedding (28), Harrier-0.6B (31), Harrier-270M (32)
 - **OCR fine-tuning** — Document OCR (33), VLM→OCR (34), Handwriting (35), OCR GRPO (36), Multilingual (37)
 - **MoE fine-tuning** — Qwen3.5-35B-A3B (29), Phi-3.5-MoE (30)
+- **LFM2 fine-tuning** — LFM2 SFT (41), LFM2.5-Thinking (42)
+- **Continual Pretraining** — Language (43), Domain (44), Code (45), LFM2+CPT (46)
 
 ## Requirements
 

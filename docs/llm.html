@@ -85,6 +85,8 @@
         <li class="sub-item"><a href="#GRPOTrainer">GRPOTrainer</a></li>
         <li class="sub-item"><a href="#KTOTrainer">KTOTrainer</a></li>
         <li class="sub-item"><a href="#SimPOTrainer">SimPOTrainer</a></li>
+        <li><a href="#cpt">Continual Pretraining</a></li>
+        <li class="sub-item"><a href="#CPTTrainer">CPTTrainer</a></li>
         <li><a href="#moe">MoE Fine-Tuning</a></li>
         <li><a href="#embedding">Embedding Models</a></li>
         <li class="sub-item"><a href="#FastEmbeddingModel">FastEmbeddingModel</a></li>
@@ -422,6 +424,97 @@ model.save_pretrained("lora_model")</code></pre>
         </div>
       </div>
 
+      <!-- ===== Continual Pretraining ===== -->
+      <div class="api-module" id="cpt">
+        <div class="api-module-header">
+          <h2 style="margin:0;">Continual Pretraining</h2>
+          <span class="module-path">mlx_tune.cpt_trainer</span>
+        </div>
+
+        <p>Continual pretraining (CPT) lets you adapt a pretrained model to a new domain or language using raw text. Unlike SFT, loss is computed on <strong>all tokens</strong> (not just responses). Supports both LoRA-based CPT and full-weight training.</p>
+
+        <div class="callout">
+          <strong>When to use CPT:</strong>
+          <ul style="margin-top: 0.5rem; margin-bottom: 0;">
+            <li><strong>Language adaptation</strong> &mdash; Teach a model a new language with raw text corpora</li>
+            <li><strong>Domain knowledge</strong> &mdash; Inject domain-specific knowledge (medical, legal, scientific)</li>
+            <li><strong>Code capabilities</strong> &mdash; Extend a model&rsquo;s programming language coverage</li>
+          </ul>
+        </div>
+
+        <div class="api-entry" id="CPTTrainer">
+          <h3>CPTTrainer</h3>
+          <div class="api-signature">
+            <span class="api-name">CPTTrainer</span>(<span class="api-param">model</span>, <span class="api-param">train_dataset</span>, <span class="api-param">tokenizer</span><span class="api-default">=None</span>, <span class="api-param">args</span><span class="api-default">=None</span>, ...)
+          </div>
+          <p>Continual pretraining trainer. Trains on raw text with loss on all tokens. Optionally trains <code>embed_tokens</code> and <code>lm_head</code> layers with a separate (decoupled) learning rate.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>model</code></td><td>MLXModelWrapper</td><td>Model with LoRA adapters (or base model for full-weight CPT)</td></tr>
+              <tr><td><code>train_dataset</code></td><td>Dataset</td><td>Raw text dataset (each sample has a <code>"text"</code> field)</td></tr>
+              <tr><td><code>tokenizer</code></td><td>Tokenizer</td><td>Tokenizer from <code>from_pretrained()</code></td></tr>
+              <tr><td><code>args</code></td><td>CPTConfig</td><td>Training configuration</td></tr>
+            </tbody>
+          </table>
+          <div class="api-signature" style="margin-top:12px;"><span class="api-name">trainer.train</span>() &mdash; Start continual pretraining. Returns training statistics.</div>
+        </div>
+
+        <div class="api-entry">
+          <h3>CPTConfig</h3>
+          <div class="api-signature">
+            <span class="api-name">CPTConfig</span>(<span class="api-param">output_dir</span><span class="api-default">="./cpt_outputs"</span>, <span class="api-param">learning_rate</span><span class="api-default">=5e-5</span>, <span class="api-param">include_embeddings</span><span class="api-default">=True</span>, <span class="api-param">embedding_learning_rate</span><span class="api-default">=None</span>, ...)
+          </div>
+          <p>Configuration for continual pretraining. Extends SFTConfig with CPT-specific options.</p>
+          <table class="api-params">
+            <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>output_dir</code></td><td><code>"outputs"</code></td><td>Directory for checkpoints and logs</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>5e-5</code></td><td>Learning rate for LoRA / main parameters</td></tr>
+              <tr><td><code>include_embeddings</code></td><td><code>True</code></td><td>Auto-add embed_tokens + lm_head to target modules and unfreeze them</td></tr>
+              <tr><td><code>embedding_learning_rate</code></td><td><code>lr/5</code></td><td>Decoupled learning rate for embed_tokens/lm_head (defaults to learning_rate / 5)</td></tr>
+              <tr><td><code>per_device_train_batch_size</code></td><td><code>2</code></td><td>Batch size per device</td></tr>
+              <tr><td><code>max_steps</code></td><td><code>-1</code></td><td>Total training steps (-1 = use epochs)</td></tr>
+              <tr><td><code>max_seq_length</code></td><td><code>2048</code></td><td>Maximum sequence length for chunking raw text</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>LoRA CPT Example</h3>
+        <div class="code-block-wrapper">
+          <button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, CPTTrainer, CPTConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "mlx-community/SmolLM2-360M-Instruct",  # Use base model for CPT
+    max_seq_length=2048,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Raw text dataset — loss on ALL tokens (no chat template)
+dataset = [{"text": "Your domain-specific text here..."}, ...]
+
+trainer = CPTTrainer(
+    model=model, train_dataset=dataset, tokenizer=tokenizer,
+    args=CPTConfig(
+        learning_rate=5e-5,
+        embedding_learning_rate=5e-6,         # 10x smaller for embeddings
+        include_embeddings=True,              # Auto-adds embed_tokens + lm_head
+        max_steps=100,
+    ),
+)
+trainer.train()</code></pre>
+        </div>
+
+        <h3 id="cpt-examples">Examples</h3>
+        <ul>
+          <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/43_cpt_language_adaptation.py" target="_blank">Example 43</a> &mdash; Language adaptation (teach a new language)</li>
+          <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/44_cpt_domain_knowledge.py" target="_blank">Example 44</a> &mdash; Domain knowledge injection</li>
+          <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/45_cpt_code_capabilities.py" target="_blank">Example 45</a> &mdash; Code capabilities extension</li>
+          <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/46_lfm2_continual_pretraining.py" target="_blank">Example 46</a> &mdash; LFM2 + Continual Pretraining</li>
+        </ul>
+      </div>
+
       <!-- ===== MoE Fine-Tuning ===== -->
       <div class="api-module" id="moe">
         <div class="api-module-header">
@@ -749,6 +842,30 @@ trainer = train_on_responses_only(
             <tr>
               <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/30_phi35_moe_finetuning.py" target="_blank" rel="noopener">30</a></strong></td>
               <td>MoE &mdash; Phi-3.5-MoE fine-tuning (42B total, Microsoft)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/41_lfm2_sft_finetuning.py" target="_blank" rel="noopener">41</a></strong></td>
+              <td>LFM2 &mdash; Liquid Foundation Model SFT fine-tuning (hybrid gated-conv + GQA)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/42_lfm2_thinking_finetuning.py" target="_blank" rel="noopener">42</a></strong></td>
+              <td>LFM2 &mdash; Thinking/reasoning fine-tuning</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/43_cpt_language_adaptation.py" target="_blank" rel="noopener">43</a></strong></td>
+              <td>CPT &mdash; Language adaptation with continual pretraining</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/44_cpt_domain_knowledge.py" target="_blank" rel="noopener">44</a></strong></td>
+              <td>CPT &mdash; Domain knowledge injection (medical/legal/scientific)</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/45_cpt_code_capabilities.py" target="_blank" rel="noopener">45</a></strong></td>
+              <td>CPT &mdash; Code capabilities extension</td>
+            </tr>
+            <tr>
+              <td><strong><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/46_lfm2_continual_pretraining.py" target="_blank" rel="noopener">46</a></strong></td>
+              <td>CPT + LFM2 &mdash; Continual pretraining on Liquid Foundation Model</td>
             </tr>
           </tbody>
         </table>
