@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/ARahim3/mlx-tune"><img src="https://img.shields.io/github/stars/arahim3/mlx-tune?style=social" alt="GitHub stars"></a>
-  <a href="https://pepy.tech/projects/mlx-tune"><img src="https://static.pepy.tech/personalized-badge/mlx-tune?period=total&units=INTERNATIONAL_SYSTEM&left_color=GRAY&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"></a>
+  <a href="https://pepy.tech/projects/mlx-tune"><img src="https://static.pepy.tech/personalized-badge/mlx-tune?period=total&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"></a>
   <a href="https://github.com/ARahim3/mlx-tune"><img alt="GitHub forks" src="https://img.shields.io/github/forks/arahim3/mlx-tune"></a>
   <br>
   <a href="#installation"><img src="https://img.shields.io/badge/Platform-Apple%20Silicon-black?logo=apple" alt="Platform"></a>
