@@ -87,7 +87,11 @@ class STTModelProfile:
     # Identity
     name: str
 
-    # Architecture type: "encoder_decoder" (Whisper, Canary) or "audio_llm" (Qwen3-ASR, Voxtral)
+    # Architecture type:
+    #   "encoder_decoder" — Whisper, Canary, Moonshine
+    #   "audio_llm"        — Qwen3-ASR, Voxtral (audio tower + LLM with placeholder tokens)
+    #   "voxtral_realtime" — Voxtral Realtime (causal encoder + decoder with additive
+    #                        embedding fusion, AdaRMSNorm time conditioning, no LLM split)
     architecture: str = "encoder_decoder"
 
     # Audio preprocessing
@@ -110,6 +114,10 @@ class STTModelProfile:
 
     # Separate encoder LoRA targets (if encoder uses different names than decoder)
     encoder_lora_targets: Optional[Tuple[str, ...]] = None
+
+    # Optional FFN/MLP target names within decoder layers (e.g. SwiGLU w1/w2/w3)
+    # Used by Voxtral Realtime where the FFN modules live alongside attention.
+    decoder_ffn_targets: Optional[Tuple[str, ...]] = None
 
     # Audio-LLM specific
     audio_token_id: Optional[int] = None  # Placeholder token replaced by audio features
@@ -334,6 +342,29 @@ _VOXTRAL_PROFILE = STTModelProfile(
     loader="mlx_audio_stt",
 )
 
+_VOXTRAL_REALTIME_PROFILE = STTModelProfile(
+    name="voxtral_realtime",
+    # Third architecture type — streaming ASR with causal encoder + additive embedding
+    # fusion + AdaRMSNorm time conditioning. No audio_tower/language_model split.
+    architecture="voxtral_realtime",
+    sample_rate=16000,
+    preprocessor="log_mel_spectrogram",
+    n_mels=128,
+    max_audio_samples=0,  # Variable length
+    # decoder.layers[i].attention.{wq,wk,wv,wo} + .feed_forward_w{1,2,3}
+    decoder_block_path="decoder.layers",
+    # encoder.transformer_layers[i].attention.{wq,wk,wv,wo}  (frozen by default)
+    encoder_block_path="encoder.transformer_layers",
+    attn_names={"self_attn": "attention"},  # inner attn module is named .attention
+    cross_attn_attr="",  # No cross-attention in this architecture
+    sot_token_id=1,  # bos_token_id
+    # Mistral-internal naming (NOT q_proj/k_proj — keep as wq/wk/wv/wo)
+    lora_target_modules=("wq", "wk", "wv", "wo"),
+    encoder_lora_targets=("wq", "wk", "wv", "wo"),
+    decoder_ffn_targets=("feed_forward_w1", "feed_forward_w2", "feed_forward_w3"),
+    loader="mlx_audio_stt",
+)
+
 
 # ---------------------------------------------------------------------------
 # Profile Registries
@@ -352,6 +383,10 @@ STT_PROFILES: Dict[str, STTModelProfile] = {
     "moonshine": _MOONSHINE_PROFILE,
     "qwen3_asr": _QWEN3_ASR_PROFILE,
     "canary": _CANARY_PROFILE,
+    # voxtral_realtime MUST be checked before voxtral so the realtime variant
+    # gets matched first. The voxtral pattern also has a negative lookahead as
+    # belt-and-braces, but explicit ordering is the primary guard.
+    "voxtral_realtime": _VOXTRAL_REALTIME_PROFILE,
     "voxtral": _VOXTRAL_PROFILE,
 }
 
@@ -378,7 +413,11 @@ _STT_PATTERNS: Dict[str, List[str]] = {
     "moonshine": [r"moonshine", r"useful[-_]?sensors.*moonshine"],
     "qwen3_asr": [r"qwen3[-_]?asr", r"Qwen3[-_]?ASR"],
     "canary": [r"canary", r"nvidia.*canary"],
-    # Match regular Voxtral but NOT Voxtral Realtime (different streaming architecture)
+    # Voxtral Realtime — must be checked BEFORE the regular voxtral pattern.
+    # Dict iteration in Python 3.7+ preserves insertion order, so this works.
+    "voxtral_realtime": [r"voxtral.*realtime", r"Voxtral.*Realtime"],
+    # Match regular Voxtral but NOT Voxtral Realtime (different streaming architecture).
+    # Negative lookahead is defensive in case detection is called with a custom dict order.
     "voxtral": [r"voxtral(?!.*realtime)", r"mistral.*voxtral(?!.*realtime)", r"Voxtral(?!.*Realtime)"],
 }
 

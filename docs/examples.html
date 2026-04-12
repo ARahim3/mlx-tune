@@ -1037,6 +1037,55 @@ trainer.train()</code></pre>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/19_voxtral_stt_finetuning.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
+
+        <!-- Example 49: Voxtral Realtime Streaming STT -->
+        <div class="example-card" id="ex49">
+          <h4>49 &mdash; Voxtral Realtime Streaming STT <span class="badge badge-new">NEW v0.4.21</span></h4>
+          <p>Fine-tune Mistral's <strong>streaming</strong> Voxtral Realtime &mdash; a fundamentally different architecture from regular Voxtral with causal encoder + AdaRMSNorm decoder + additive embedding fusion. Works on 4-bit, 6-bit, and fp16 variants. Trains the decoder LoRA only (encoder frozen by default).</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Voxtral RT</span><span class="example-tag">Streaming</span><span class="example-tag">4-bit</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset
+
+# All quantizations work via the same code path
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit",  # ~2.5 GB
+)
+# Mistral-internal LoRA target naming (NOT q_proj!)
+model = FastSTTModel.get_peft_model(
+    model,
+    r=8, lora_alpha=16,
+    target_modules=["wq", "wk", "wv", "wo"],
+    finetune_encoder=False,  # causal encoder stays frozen
+    finetune_decoder=True,
+)
+
+ds = load_dataset("hf-internal-testing/librispeech_asr_dummy",
+                  "clean", split="validation").select(range(20))
+
+collator = STTDataCollator(model, processor, language="en", task="transcribe",
+                           audio_column="audio", text_column="text")
+trainer = STTSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=ds,
+    args=STTSFTConfig(
+        per_device_train_batch_size=1,  # required for Voxtral RT
+        max_steps=20,
+        learning_rate=2e-5,  # low LR &mdash; AdaRMSNorm is sensitive
+        output_dir="./voxtral_realtime_output",
+    ),
+)
+trainer.train()
+
+# Save / reload / merge all work the same way
+model.save_pretrained("./out/adapter")
+model.save_pretrained_merged("./out/merged")</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/49_voxtral_realtime_stt_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
       </div>
 
       <!-- Embedding Models -->

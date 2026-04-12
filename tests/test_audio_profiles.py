@@ -520,9 +520,12 @@ class TestAutoDetection:
 
     def test_detect_voxtral_lowercase(self):
         from mlx_tune.audio_profiles import detect_stt_model_type
-        # Regular Voxtral matches, Realtime does NOT (different streaming architecture)
+        # Regular Voxtral matches voxtral; Realtime now matches its own profile
+        # (since v0.4.21 — was None before that).
         assert detect_stt_model_type("mistral/voxtral-mini", {}) == "voxtral"
-        assert detect_stt_model_type("mistral/voxtral-realtime", {}) is None
+        assert (
+            detect_stt_model_type("mistral/voxtral-realtime", {}) == "voxtral_realtime"
+        )
 
     def test_detect_stt_unknown(self):
         from mlx_tune.audio_profiles import detect_stt_model_type
@@ -547,7 +550,14 @@ class TestRegistries:
 
     def test_stt_registry_has_all_models(self):
         from mlx_tune.audio_profiles import STT_PROFILES
-        expected = {"whisper", "moonshine", "qwen3_asr", "canary", "voxtral"}
+        expected = {
+            "whisper",
+            "moonshine",
+            "qwen3_asr",
+            "canary",
+            "voxtral",
+            "voxtral_realtime",
+        }
         assert set(STT_PROFILES.keys()) == expected
 
     def test_tts_registry_values_are_profiles(self):
@@ -576,7 +586,11 @@ class TestRegistries:
             assert profile.sample_rate > 0
             assert profile.preprocessor in ("log_mel_spectrogram", "raw_conv", "canary_mel")
             assert len(profile.lora_target_modules) > 0
-            assert profile.architecture in ("encoder_decoder", "audio_llm")
+            assert profile.architecture in (
+                "encoder_decoder",
+                "audio_llm",
+                "voxtral_realtime",
+            )
 
     def test_audio_llm_profiles_have_audio_token_id(self):
         from mlx_tune.audio_profiles import STT_PROFILES
@@ -609,6 +623,78 @@ class TestRegistries:
         assert p.architecture == "audio_llm"
         assert p.audio_token_id == 24
         assert "language_model" in p.decoder_block_path
+
+
+class TestVoxtralRealtimeProfile:
+    """Tests for the Voxtral Realtime STT profile (third architecture type)."""
+
+    def test_voxtral_realtime_profile_exists(self):
+        from mlx_tune.audio_profiles import STT_PROFILES
+        assert "voxtral_realtime" in STT_PROFILES
+        p = STT_PROFILES["voxtral_realtime"]
+        assert p.name == "voxtral_realtime"
+        assert p.sample_rate == 16000
+        assert p.n_mels == 128
+        assert p.decoder_block_path == "decoder.layers"
+        assert p.encoder_block_path == "encoder.transformer_layers"
+
+    def test_voxtral_realtime_architecture_field(self):
+        """Ensure the third architecture type is registered correctly."""
+        from mlx_tune.audio_profiles import STT_PROFILES
+        p = STT_PROFILES["voxtral_realtime"]
+        assert p.architecture == "voxtral_realtime"
+        # Confirm it's distinct from the existing two
+        assert p.architecture != "encoder_decoder"
+        assert p.architecture != "audio_llm"
+
+    def test_voxtral_realtime_lora_targets_use_w_prefix(self):
+        """Regression: Voxtral Realtime uses Mistral-internal naming
+        (wq/wk/wv/wo) NOT q_proj/k_proj/v_proj/o_proj. Future devs may try to
+        'fix' this — keep the test to prevent that."""
+        from mlx_tune.audio_profiles import STT_PROFILES
+        p = STT_PROFILES["voxtral_realtime"]
+        assert p.lora_target_modules == ("wq", "wk", "wv", "wo")
+        assert p.encoder_lora_targets == ("wq", "wk", "wv", "wo")
+        assert p.decoder_ffn_targets == (
+            "feed_forward_w1",
+            "feed_forward_w2",
+            "feed_forward_w3",
+        )
+        # Sanity: should NOT contain q_proj or gate_proj
+        assert "q_proj" not in p.lora_target_modules
+        assert "gate_proj" not in (p.decoder_ffn_targets or ())
+
+    def test_voxtral_realtime_detection_positive(self):
+        """Realtime variants should detect as voxtral_realtime, not voxtral."""
+        from mlx_tune.audio_profiles import detect_stt_model_type
+        assert (
+            detect_stt_model_type("mlx-community/Voxtral-Mini-4B-Realtime-2602-fp16")
+            == "voxtral_realtime"
+        )
+        assert (
+            detect_stt_model_type("mistralai/Voxtral-Mini-4B-Realtime-2602")
+            == "voxtral_realtime"
+        )
+        assert (
+            detect_stt_model_type("mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit")
+            == "voxtral_realtime"
+        )
+
+    def test_voxtral_realtime_detection_negative(self):
+        """Regression: regular Voxtral must NOT match voxtral_realtime."""
+        from mlx_tune.audio_profiles import detect_stt_model_type
+        assert (
+            detect_stt_model_type("mlx-community/Voxtral-Mini-3B-2507-bf16")
+            == "voxtral"
+        )
+        assert (
+            detect_stt_model_type("mistralai/Voxtral-Mini-3B-2507")
+            == "voxtral"
+        )
+        assert (
+            detect_stt_model_type("mlx-community/Voxtral-Small-24B-2507")
+            == "voxtral"
+        )
 
 
 # ---------------------------------------------------------------------------

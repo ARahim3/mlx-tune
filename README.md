@@ -50,7 +50,7 @@ Bringing the [Unsloth](https://github.com/unslothai/unsloth) experience to Mac u
 - 💾 **Leverage unified memory** (up to 512GB on Mac Studio)
 - 🔄 **Unsloth-compatible API** - your existing training scripts just work!
 - 📦 **Export anywhere** - HuggingFace format, GGUF for Ollama/llama.cpp
-- 🎙️ **Audio fine-tuning** - 5 TTS models (Orpheus, OuteTTS, Spark, Sesame, Qwen3-TTS) + 5 STT models (Whisper, Moonshine, Qwen3-ASR, NVIDIA Canary, Voxtral)
+- 🎙️ **Audio fine-tuning** - 5 TTS models (Orpheus, OuteTTS, Spark, Sesame, Qwen3-TTS) + 6 STT models (Whisper, Moonshine, Qwen3-ASR, NVIDIA Canary, Voxtral, Voxtral Realtime)
 
 ```python
 # Unsloth (CUDA)                        # MLX-Tune (Apple Silicon)
@@ -78,7 +78,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🚀 **v0.4.20** - Gemma 4 Audio fine-tuning (STT/ASR via Conformer audio tower + optional LoRA)
+> 🚀 **v0.4.21** - Voxtral Realtime STT fine-tuning (Mistral's streaming ASR — third architecture type, new-language adaptation with zero tokenizer changes)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -99,7 +99,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 | **Gemma 4 Audio** | ✅ Stable | **E2B/E4B STT/ASR via Conformer audio tower + optional audio LoRA** |
 | **MoE Fine-Tuning** | ✅ Stable | **Gemma 4 26B-A4B, Qwen3.5-35B-A3B, Phi-3.5-MoE, Mixtral, DeepSeek, 39+ architectures** |
 | **TTS Fine-Tuning** | ✅ Stable | **Orpheus, OuteTTS, Spark-TTS, Sesame/CSM, Qwen3-TTS** |
-| **STT Fine-Tuning** | ✅ Stable | **Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral** |
+| **STT Fine-Tuning** | ✅ Stable | **Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral, Voxtral Realtime (streaming)** |
 | **`convert()`** | ✅ Stable | **HF → MLX conversion (LLM, TTS, STT)** |
 | **Embedding Fine-Tuning** | ✅ Stable | **BERT, ModernBERT, Qwen3-Embedding, Harrier (InfoNCE/contrastive)** |
 | **OCR Fine-Tuning** | ✅ Stable | **DeepSeek-OCR, GLM-OCR, olmOCR, Qwen-VL, Pixtral + CER/WER metrics** |
@@ -310,7 +310,7 @@ trainer = STTSFTTrainer(
 trainer.train()
 ```
 
-See examples: [Whisper](examples/13_whisper_stt_finetuning.py), [Moonshine](examples/16_moonshine_stt_finetuning.py), [Qwen3-ASR](examples/17_qwen3_asr_finetuning.py), [Canary](examples/18_canary_stt_finetuning.py), [Voxtral](examples/19_voxtral_stt_finetuning.py).
+See examples: [Whisper](examples/13_whisper_stt_finetuning.py), [Moonshine](examples/16_moonshine_stt_finetuning.py), [Qwen3-ASR](examples/17_qwen3_asr_finetuning.py), [Canary](examples/18_canary_stt_finetuning.py), [Voxtral](examples/19_voxtral_stt_finetuning.py), [Voxtral Realtime (streaming)](examples/49_voxtral_realtime_stt_finetuning.py).
 
 ### Embedding Fine-Tuning
 
@@ -486,7 +486,7 @@ model.push_to_hub("username/my-model")
 | **VLM SFT** | `VLMSFTTrainer` | ✅ Native MLX | Vision-Language model fine-tuning |
 | **Vision GRPO** | `VLMGRPOTrainer` | ✅ Native MLX | Vision-Language GRPO reasoning |
 | **TTS SFT** | `TTSSFTTrainer` | ✅ Native MLX | Orpheus, OuteTTS, Spark-TTS, Sesame/CSM |
-| **STT SFT** | `STTSFTTrainer` | ✅ Native MLX | Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral |
+| **STT SFT** | `STTSFTTrainer` | ✅ Native MLX | Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral, Voxtral Realtime |
 | **Embedding** | `EmbeddingSFTTrainer` | ✅ Native MLX | BERT, ModernBERT, Qwen3-Embedding, Harrier (InfoNCE) |
 | **OCR SFT** | `OCRSFTTrainer` | ✅ Native MLX | DeepSeek-OCR, GLM-OCR, Qwen-VL, Pixtral (CER/WER eval) |
 | **OCR GRPO** | `OCRGRPOTrainer` | ✅ Native MLX | OCR with character-level RL rewards |
@@ -503,7 +503,7 @@ Check [`examples/`](examples/) for working code:
 - Vision model fine-tuning — Qwen3.5 (10-11)
 - **RL E2E training** — DPO (21), GRPO (22), ORPO (23), KTO (24), SimPO (25), Vision GRPO (26)
 - TTS fine-tuning — Orpheus-3B (12), OuteTTS (14), Spark-TTS (15), Qwen3-TTS (20)
-- STT fine-tuning — Whisper (13), Moonshine (16), Qwen3-ASR (17), Canary (18), Voxtral (19)
+- STT fine-tuning — Whisper (13), Moonshine (16), Qwen3-ASR (17), Canary (18), Voxtral (19), Voxtral Realtime streaming (49)
 - Embedding fine-tuning — BERT/MiniLM (27), Qwen3-Embedding (28), Harrier-0.6B (31), Harrier-270M (32)
 - **OCR fine-tuning** — Document OCR (33), VLM→OCR (34), Handwriting (35), OCR GRPO (36), Multilingual (37)
 - **MoE fine-tuning** — Qwen3.5-35B-A3B (29), Phi-3.5-MoE (30)

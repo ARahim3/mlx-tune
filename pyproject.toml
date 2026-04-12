@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-tune"
-version = "0.4.20"
+version = "0.4.21"
 description = "MLX-powered LLM/VLM/TTS/STT/Embedding/OCR fine-tuning for Apple Silicon - Unsloth-compatible API for Mac"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,9 +53,12 @@ train = [
     "wandb>=0.15.0",
 ]
 audio = [
-    "mlx-audio>=0.4.0",
+    "mlx-audio>=0.4.2",
     "soundfile>=0.12.0",
     "librosa>=0.10.0",
+    # Required for Voxtral Realtime fine-tuning (text encoding side of the
+    # Tekken tokenizer; mlx-audio ships only the decode half).
+    "mistral-common>=1.8.0",
 ]
 all = [
     "mlx-tune[dev,train,audio]",

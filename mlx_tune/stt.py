@@ -270,6 +270,36 @@ class FastSTTModel:
             if tokenizer is None:
                 tokenizer = getattr(model, "_tokenizer", None)
             hf_processor = getattr(model, "_processor", None)
+        elif profile and profile.architecture == "voxtral_realtime":
+            # Voxtral Realtime: mlx-audio attaches a decode-only TekkenTokenizer
+            # at model._tokenizer (set in post_load_hook). For training we ALSO
+            # need the encode side, which lives in `mistral_common`. Load it
+            # alongside (using the same tekken.json) and stash both on the
+            # model so the data collator can call .encode() during training.
+            #
+            # mistral_common is required for fine-tuning Voxtral Realtime —
+            # it's optional for inference but mandatory for training.
+            tokenizer = getattr(model, "_tokenizer", None)
+            hf_processor = None
+            try:
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+                # Find the resolved tekken.json path. mlx-audio's
+                # TekkenTokenizer.from_model_path stores it implicitly via
+                # `vocab` etc., but it's easier to re-find via HF cache.
+                from huggingface_hub import try_to_load_from_cache
+                tekken_cached = try_to_load_from_cache(
+                    repo_id=model_name, filename="tekken.json"
+                )
+                if tekken_cached:
+                    mc_tok = MistralTokenizer.from_file(str(tekken_cached))
+                    # The inner Tekkenizer has .encode(text, bos, eos)
+                    inner = mc_tok.instruct_tokenizer.tokenizer
+                    model._mistral_tokenizer = mc_tok
+                    model._tekkenizer_encoder = inner
+            except ImportError:
+                # mistral_common not installed — inference still works,
+                # training will raise a clear error in the data collator.
+                pass
         else:
             # Encoder-decoder models (Whisper, Canary) — try WhisperProcessor
             hf_processor = getattr(model, "_processor", None)
@@ -283,6 +313,9 @@ class FastSTTModel:
                 tokenizer = getattr(model, "_tokenizer", None)
                 if tokenizer is None:
                     tokenizer = getattr(model, "tokenizer", None)
+            elif hf_processor is None and profile and profile.architecture == "voxtral_realtime":
+                # already handled above
+                pass
             elif hf_processor is None:
                 raise ValueError(
                     f"Could not load processor for '{model_name}'. "
@@ -781,7 +814,7 @@ class STTModelWrapper:
             for module_name in target_modules:
                 if hasattr(attn_module, module_name):
                     original = getattr(attn_module, module_name)
-                    if isinstance(original, nn.Linear):
+                    if _is_linear_like(original):
                         lora_layer = _create_lora_linear(original, r, scale, dropout)
                         setattr(attn_module, module_name, lora_layer)
                         replaced += 1
@@ -794,7 +827,7 @@ class STTModelWrapper:
                 for module_name in target_modules:
                     if hasattr(cross_attn_module, module_name):
                         original = getattr(cross_attn_module, module_name)
-                        if isinstance(original, nn.Linear):
+                        if _is_linear_like(original):
                             lora_layer = _create_lora_linear(original, r, scale, dropout)
                             setattr(cross_attn_module, module_name, lora_layer)
                             replaced += 1
@@ -803,10 +836,23 @@ class STTModelWrapper:
         for mlp_name in ["mlp1", "mlp2"]:
             if mlp_name in target_modules and hasattr(block, mlp_name):
                 original = getattr(block, mlp_name)
-                if isinstance(original, nn.Linear):
+                if _is_linear_like(original):
                     lora_layer = _create_lora_linear(original, r, scale, dropout)
                     setattr(block, mlp_name, lora_layer)
                     replaced += 1
+
+        # Decoder FFN targets at block-level (e.g. Voxtral Realtime's
+        # feed_forward_w1/w2/w3 — direct children of DecoderLayer, not nested
+        # under .attention or .mlp).
+        ffn_targets = self.profile.decoder_ffn_targets
+        if ffn_targets:
+            for ffn_name in ffn_targets:
+                if hasattr(block, ffn_name):
+                    original = getattr(block, ffn_name)
+                    if _is_linear_like(original):
+                        lora_layer = _create_lora_linear(original, r, scale, dropout)
+                        setattr(block, ffn_name, lora_layer)
+                        replaced += 1
 
         return replaced
 
@@ -830,12 +876,17 @@ class STTModelWrapper:
             Transcribed text
         """
         if hasattr(self.model, "generate"):
-            result = self.model.generate(
-                audio,
-                language=language,
-                task=task,
-                **kwargs,
-            )
+            # Voxtral Realtime's generate() doesn't accept language/task; it
+            # detects language internally. Filter unsupported kwargs.
+            if self.profile and self.profile.architecture == "voxtral_realtime":
+                result = self.model.generate(audio, **kwargs)
+            else:
+                result = self.model.generate(
+                    audio,
+                    language=language,
+                    task=task,
+                    **kwargs,
+                )
             # Handle different return types from mlx-audio
             if isinstance(result, dict):
                 return result.get("text", "")
@@ -941,10 +992,16 @@ class STTModelWrapper:
         if fused_count > 0:
             print(f"Fused {fused_count} LoRA layers into base Whisper model")
 
-        # Save merged model weights
+        # Save merged model weights. Use safetensors (no kwarg limit) for large
+        # models — mx.savez() chokes at >1024 keys (nanobind vectorcall limit),
+        # which trips for any decoder-heavy model like Voxtral Realtime.
         from mlx.utils import tree_flatten
         weights = dict(tree_flatten(self.model.parameters()))
-        mx.savez(str(output_path / "weights.npz"), **weights)
+        try:
+            mx.save_safetensors(str(output_path / "weights.safetensors"), weights)
+        except Exception:
+            # Fallback to .npz for tiny models / older mlx versions
+            mx.savez(str(output_path / "weights.npz"), **weights)
 
         # Save model config
         if hasattr(self.model, "dims"):
@@ -952,6 +1009,17 @@ class STTModelWrapper:
             dims_dict = dataclasses.asdict(self.model.dims)
             with open(output_path / "config.json", "w") as f:
                 json.dump(dims_dict, f, indent=2)
+        elif hasattr(self.model, "config"):
+            # Voxtral Realtime: dataclass-based ModelConfig with nested
+            # encoder_args / decoder / audio_encoding_args.
+            try:
+                import dataclasses
+                cfg_dict = dataclasses.asdict(self.model.config)
+                with open(output_path / "config.json", "w") as f:
+                    json.dump(cfg_dict, f, indent=2)
+            except (TypeError, ValueError):
+                # Fallback: model config is not a dataclass; skip silently
+                pass
 
         # Save processor/tokenizer
         if processor and hasattr(processor, "_hf_processor") and processor._hf_processor is not None:
@@ -1022,17 +1090,32 @@ class STTModelWrapper:
             raise FileNotFoundError(f"No adapters found at {weights_path}")
 
 
+def _is_linear_like(module: Any) -> bool:
+    """True if `module` is an nn.Linear or nn.QuantizedLinear (or subclass).
+
+    QuantizedLinear is NOT a subclass of Linear in MLX, so a plain isinstance
+    check on Linear misses 4-bit/6-bit/8-bit quantized models. mlx-lm's
+    LoRALinear.from_base() supports both, so we only need to recognize them.
+    """
+    if isinstance(module, nn.Linear):
+        return True
+    QL = getattr(nn, "QuantizedLinear", None)
+    if QL is not None and isinstance(module, QL):
+        return True
+    return False
+
+
 def _create_lora_linear(
-    original: nn.Linear,
+    original: Any,
     r: int,
     scale: float,
     dropout: float,
-) -> nn.Linear:
+) -> Any:
     """
-    Replace an nn.Linear with a LoRALinear layer.
+    Replace an nn.Linear (or nn.QuantizedLinear) with a LoRALinear layer.
 
-    Uses MLX's built-in LoRALinear if available, otherwise creates
-    a custom implementation.
+    Uses mlx-lm's LoRALinear.from_base() which supports both dense and
+    quantized base layers — this is what makes 4-bit / 6-bit LoRA work.
     """
     try:
         from mlx_lm.tuner.lora import LoRALinear
@@ -1175,12 +1258,13 @@ class STTDataCollator:
             samples = [samples]
 
         profile = self.model.profile if self.model else None
-        is_audio_llm = profile and profile.architecture == "audio_llm"
+        arch = profile.architecture if profile else "encoder_decoder"
 
-        if is_audio_llm:
+        if arch == "voxtral_realtime":
+            return self._collate_voxtral_realtime(samples)
+        if arch == "audio_llm":
             return self._collate_audio_llm(samples)
-        else:
-            return self._collate_encoder_decoder(samples)
+        return self._collate_encoder_decoder(samples)
 
     def _collate_encoder_decoder(self, samples: List[Dict]) -> Dict:
         """Collate for encoder-decoder models (Whisper, Canary, Moonshine)."""
@@ -1456,6 +1540,191 @@ class STTDataCollator:
 
         return {"input_ids": input_ids, "labels": labels, **extra_keys}
 
+    def _collate_voxtral_realtime(self, samples: List[Dict]) -> Dict:
+        """Collate for Voxtral Realtime: build inputs_embeds + labels.
+
+        Forces batch_size=1 (variable embedding sequence length per sample).
+        """
+        if len(samples) > 1:
+            warnings.warn(
+                "Voxtral Realtime training only supports batch_size=1. "
+                "Using only the first sample in the batch."
+            )
+        processed = self._process_voxtral_realtime_sample(samples[0])
+        return processed
+
+    def _process_voxtral_realtime_sample(self, sample: Dict) -> Dict:
+        """Build inputs_embeds + labels for one Voxtral Realtime sample.
+
+        Mirrors the inference path in mlx_audio's voxtral_realtime.Model:
+        1. Resample audio to 16kHz
+        2. Compute mel via model._prepare_mel(...)
+        3. Run conv stem + encoder.encode_full() (no_grad) to get adapter_out
+        4. Tokenize transcript via model._tokenizer
+        5. Build prefix tokens [BOS] + [STREAMING_PAD] * (n_left + n_delay)
+        6. Build per-position embeddings:
+           - prefix:    adapter_out[:prompt_len] + tok_emb(prefix_tokens)
+           - audio span (pos < adapter_len): adapter_out[pos] + tok_emb(text_token)
+           - text only (pos >= adapter_len): tok_emb(text_token)
+        7. Labels: -100 for prefix, then text token IDs (next-token convention)
+        """
+        rt_model = self.model.model  # the mlx-audio voxtral_realtime.Model
+        config = rt_model.config
+
+        # ---- 1. Get audio array
+        audio_data = sample.get(self.audio_column)
+        if audio_data is None:
+            raise ValueError(f"Sample missing '{self.audio_column}' column")
+
+        target_sr = self.model.profile.sample_rate  # 16000
+        if isinstance(audio_data, dict):
+            audio_array = np.array(
+                audio_data.get("array", audio_data.get("data")), dtype=np.float32
+            )
+            sr = audio_data.get("sampling_rate", target_sr)
+        elif isinstance(audio_data, np.ndarray):
+            audio_array = audio_data.astype(np.float32)
+            sr = target_sr
+        else:
+            audio_array = np.array(audio_data, dtype=np.float32)
+            sr = target_sr
+
+        if sr != target_sr:
+            try:
+                from mlx_audio.stt.utils import resample_audio
+                audio_array = resample_audio(audio_array, sr, target_sr)
+            except ImportError:
+                import librosa
+                audio_array = librosa.resample(
+                    audio_array, orig_sr=sr, target_sr=target_sr
+                )
+
+        # ---- 2. Compute mel + n_delay (uses model's own helper for exact match)
+        mel, n_delay = rt_model._prepare_mel(
+            audio_array, transcription_delay_ms=config.transcription_delay_ms
+        )
+
+        # ---- 3. Run conv stem + encoder once (no LoRA gradients on encoder
+        #         since it's frozen by default; even when finetune_encoder is on
+        #         we still compute the adapter outputs without recording grads
+        #         on this branch — gradients flow only through the decoder).
+        conv_out = rt_model.encoder.conv_stem(mel)
+        sliding_window = rt_model.encoder.config.sliding_window
+        if conv_out.shape[0] <= sliding_window:
+            adapter_out = rt_model.encoder.encode_full(conv_out)
+        else:
+            # Long audio: collect all chunks, skip empty trailing chunks
+            # (downsample_and_project returns (0, encoder_dim) if the last
+            # chunk has fewer than 4 frames — shape won't concat with the
+            # projected chunks which are at decoder_dim).
+            chunks = []
+            for chunk_out in rt_model.encoder.encode_chunks(conv_out):
+                chunk_adapter = rt_model.encoder.downsample_and_project(chunk_out)
+                if chunk_adapter.shape[0] > 0:
+                    chunks.append(chunk_adapter)
+            adapter_out = mx.concatenate(chunks, axis=0) if chunks else None
+            if adapter_out is None:
+                raise ValueError("Audio encoding produced no output tokens.")
+        mx.eval(adapter_out)
+        # Stop gradient flow into the encoder branch
+        adapter_out = mx.stop_gradient(adapter_out)
+
+        n_audio_total = adapter_out.shape[0]
+
+        # ---- 4. Tokenize transcript via mistral_common's Tekkenizer.
+        # mlx-audio's TekkenTokenizer is decode-only; the encode side lives
+        # in `mistral_common`, which we load in FastSTTModel.from_pretrained
+        # and stash on the model as `_tekkenizer_encoder`.
+        text_col = self._find_text_column(sample)
+        text = sample[text_col]
+        encoder = getattr(rt_model, "_tekkenizer_encoder", None)
+        if encoder is None:
+            raise RuntimeError(
+                "Voxtral Realtime training requires `mistral_common` for text "
+                "encoding (mlx-audio's TekkenTokenizer is decode-only). "
+                "Install with: uv pip install mistral-common"
+            )
+        # Tekkenizer.encode signature: encode(text, bos, eos)
+        text_tokens = list(encoder.encode(text, bos=False, eos=False))
+
+        if not text_tokens:
+            raise ValueError(f"Empty tokenization for transcript: {text!r}")
+
+        # Append EOS so the model learns when to stop
+        eos = config.eos_token_id
+        text_tokens = text_tokens + [eos]
+
+        # ---- 5. Build prefix
+        bos = config.bos_token_id
+        pad_id = config.streaming_pad_token_id
+        n_left = config.n_left_pad_tokens
+        prompt_len = 1 + n_left + n_delay
+        prefix_token_ids = [bos] + [pad_id] * (n_left + n_delay)
+        prefix_token_ids_mx = mx.array(prefix_token_ids, dtype=mx.int32)
+
+        # Sanity: adapter_out must cover at least prompt_len positions
+        if n_audio_total < prompt_len:
+            raise ValueError(
+                f"Audio too short: adapter_out has {n_audio_total} tokens but "
+                f"prompt_len is {prompt_len}. Use a longer audio sample."
+            )
+
+        # ---- 6. Build full embedding sequence
+        # Prefix embeddings (audio + prefix tokens)
+        prefix_text_embeds = rt_model.decoder.embed_tokens(prefix_token_ids_mx)
+        prefix_embeds = adapter_out[:prompt_len] + prefix_text_embeds  # [prompt_len, dim]
+
+        # Per-position text embeddings: each text token sits at position
+        # prompt_len + i. If that position is still inside the audio span,
+        # we ADD adapter_out[pos]; otherwise we use the token embedding alone.
+        text_tokens_mx = mx.array(text_tokens, dtype=mx.int32)
+        text_token_embeds = rt_model.decoder.embed_tokens(text_tokens_mx)  # [T_text, dim]
+
+        n_text = len(text_tokens)
+        # How many text positions overlap with the audio span?
+        n_overlap = max(0, min(n_text, n_audio_total - prompt_len))
+        if n_overlap > 0:
+            audio_overlap = adapter_out[prompt_len : prompt_len + n_overlap]
+            overlap_embeds = audio_overlap + text_token_embeds[:n_overlap]
+        else:
+            overlap_embeds = None
+
+        if n_text > n_overlap:
+            tail_embeds = text_token_embeds[n_overlap:]
+        else:
+            tail_embeds = None
+
+        parts = [prefix_embeds]
+        if overlap_embeds is not None:
+            parts.append(overlap_embeds)
+        if tail_embeds is not None:
+            parts.append(tail_embeds)
+        inputs_embeds = mx.concatenate(parts, axis=0)  # [seq, dim]
+
+        # ---- 7. Build labels (causal-LM next-token convention)
+        # Position p contributes a logit for what comes at position p+1.
+        # Prefix positions: -100 (no supervision)
+        # The first text token sits at index prompt_len. The label for the
+        # logit at index prompt_len-1 should be text_tokens[0]. So we set:
+        #   labels[i] = -100              for i < prompt_len - 1
+        #   labels[prompt_len - 1] = text_tokens[0]
+        #   labels[prompt_len + j] = text_tokens[j + 1]   for j in [0, n_text-2]
+        #   labels[last] = -100  (no next-token to predict, will be sliced off)
+        seq_len = inputs_embeds.shape[0]
+        labels = [-100] * seq_len
+        # First text label goes one position before the first text input embed
+        if prompt_len - 1 >= 0:
+            labels[prompt_len - 1] = int(text_tokens[0])
+        for j in range(1, n_text):
+            pos = prompt_len + j - 1
+            if pos < seq_len:
+                labels[pos] = int(text_tokens[j])
+
+        return {
+            "inputs_embeds": inputs_embeds,
+            "labels": mx.array(labels, dtype=mx.int32),
+        }
+
 
 class STTSFTTrainer:
     """
@@ -1567,9 +1836,26 @@ class STTSFTTrainer:
         # Detect model architecture for forward pass dispatch
         _model_name = _profile.name if _profile else "whisper"
 
-        # Seq2seq / audio-LLM loss function
+        # Seq2seq / audio-LLM / voxtral_realtime loss function
         def loss_fn(model, batch):
             labels = batch["labels"]
+
+            if _arch == "voxtral_realtime":
+                # Voxtral Realtime: forward pre-built embeddings through the
+                # decoder (single sequence, no KV cache for training).
+                embeds = batch["inputs_embeds"]
+                h, _ = model.decoder.forward(embeds, start_pos=0, cache=None)
+                logits = model.decoder.logits(h)  # [seq, vocab]
+                # Compute cross entropy directly: prefix labels are -100 so the
+                # masked-mean below handles ignoring them. No reshape needed.
+                vocab_size = logits.shape[-1]
+                ce = nn.losses.cross_entropy(
+                    logits.reshape(-1, vocab_size),
+                    labels.reshape(-1),
+                    reduction="none",
+                ).reshape(labels.shape)
+                mask = (labels != -100).astype(ce.dtype)
+                return (ce * mask).sum() / mx.maximum(mask.sum(), 1)
 
             if _arch == "audio_llm":
                 # Audio-LLM models (Qwen3-ASR, Voxtral): model(input_ids, input_features=audio)

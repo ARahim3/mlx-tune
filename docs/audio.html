@@ -83,6 +83,7 @@
         <li class="sub-item"><a href="#stt-qwen3asr">Qwen3-ASR</a></li>
         <li class="sub-item"><a href="#stt-canary">Canary</a></li>
         <li class="sub-item"><a href="#stt-voxtral">Voxtral</a></li>
+        <li class="sub-item"><a href="#stt-voxtral-realtime">Voxtral Realtime</a></li>
         <li class="sub-item"><a href="#FastSTTModel">FastSTTModel API</a></li>
         <li class="sub-item"><a href="#STTSFTTrainer">STTSFTTrainer</a></li>
         <li><a href="#post-training">Post-Training</a></li>
@@ -148,6 +149,7 @@ brew install ffmpeg</code></pre>
             <tr><td><strong>Qwen3-ASR</strong></td><td>1.7B</td><td>Audio encoder</td><td>16 kHz</td><td>Audio-LLM (Qwen3)</td></tr>
             <tr><td><strong>NVIDIA Canary</strong></td><td>1B</td><td>Parakeet mel</td><td>16 kHz</td><td>Encoder-Decoder (Conformer)</td></tr>
             <tr><td><strong>Voxtral</strong></td><td>3B</td><td>Mel spectrogram</td><td>16 kHz</td><td>Audio-LLM (Llama)</td></tr>
+            <tr><td><strong>Voxtral Realtime</strong> (NEW)</td><td>4B</td><td>Causal mel + delay tokens</td><td>16 kHz</td><td>Streaming (causal encoder + AdaRMSNorm decoder)</td></tr>
           </tbody>
         </table>
         <div class="callout" style="margin-top: 1.5rem;">
@@ -534,6 +536,51 @@ trainer.train()</code></pre>
           </div>
         </div>
 
+        <!-- Voxtral Realtime -->
+        <div class="api-entry" id="stt-voxtral-realtime">
+          <h3>Voxtral Realtime <span class="badge badge-new">NEW v0.4.21</span></h3>
+          <p>Mistral's <strong>streaming</strong> ASR model &mdash; a fundamentally different architecture from regular Voxtral. Causal audio encoder (32 layers, sliding window 750) feeds an adapter MLP into a 26-layer LLM decoder with <strong>AdaRMSNorm time conditioning</strong> and <strong>additive embedding fusion</strong> (the input at each position is <code>adapter_out[pos] + decoder.embed_token(token)</code>, no audio placeholder tokens).</p>
+          <p>This is the <strong>third architecture type</strong> in mlx-tune's STT subsystem (alongside <code>encoder_decoder</code> and <code>audio_llm</code>). LoRA targets use Mistral-internal naming: <code>wq/wk/wv/wo</code> + <code>feed_forward_w1/w2/w3</code> &mdash; <strong>NOT</strong> q_proj/gate_proj.</p>
+          <div class="callout">
+            <div class="callout-title">Requires <code>mistral-common</code></div>
+            <p>mlx-audio's TekkenTokenizer is decode-only. Fine-tuning needs the encode side from <code>mistral-common</code>, which is included in the <code>[audio]</code> extras since v0.4.21. Install with <code>uv pip install 'mlx-tune[audio]' --upgrade</code>.</p>
+          </div>
+          <div class="callout">
+            <div class="callout-title">New language adaptation</div>
+            <p>The Tekken tokenizer is byte-level BPE (131K vocab) &mdash; it encodes <strong>any UTF-8 text</strong> with lossless roundtrip. The audio encoder processes mel spectrograms language-agnostically. So fine-tuning on a new language requires <strong>zero tokenizer changes</strong> &mdash; just swap the dataset. Verified E2E with Turkish (FLEURS), loss 10.1&rarr;8.8 in 10 steps. Works with Common Voice, FLEURS, VoxPopuli, or any HF dataset with an audio + text column.</p>
+          </div>
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+
+# All quantizations work via the same code path (LoRA on QuantizedLinear too)
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit",  # ~2.5 GB
+    # or: "...-2602-fp16"  (~8 GB, highest fidelity)
+    # or: "...-Realtime-6bit"
+)
+model = FastSTTModel.get_peft_model(
+    model,
+    r=8, lora_alpha=16,
+    target_modules=["wq", "wk", "wv", "wo"],  # Mistral-internal naming
+    finetune_encoder=False,  # causal encoder stays frozen
+    finetune_decoder=True,
+)
+
+collator = STTDataCollator(model, processor, language="en", task="transcribe")
+trainer = STTSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=STTSFTConfig(
+        per_device_train_batch_size=1,  # required for Voxtral RT
+        max_steps=20,
+        learning_rate=2e-5,  # low LR critical &mdash; AdaRMSNorm is sensitive
+        output_dir="./voxtral_realtime_output",
+    ),
+)
+trainer.train()</code></pre>
+          </div>
+        </div>
+
         <!-- FastSTTModel -->
         <div class="api-entry" id="FastSTTModel">
           <h3>FastSTTModel API</h3>
@@ -547,7 +594,7 @@ trainer.train()</code></pre>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
             <tbody>
-              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Whisper, Distil-Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral</td></tr>
+              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Whisper, Distil-Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral, Voxtral Realtime</td></tr>
               <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum decoder sequence length</td></tr>
             </tbody>
           </table>
@@ -734,6 +781,13 @@ FastTTSModel.convert(
             <p>Fine-tune Mistral's Voxtral (audio encoder + Llama decoder). 3B audio-LLM for speech recognition.</p>
             <div class="example-tags"><span class="example-tag">STT</span><span class="example-tag">Voxtral</span><span class="example-tag">Audio-LLM</span></div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/19_voxtral_stt_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
+          </div>
+
+          <div class="example-card">
+            <h4>49 &mdash; Voxtral Realtime Streaming STT <span class="badge badge-new">NEW</span></h4>
+            <p>Fine-tune Mistral's <strong>streaming</strong> Voxtral Realtime on LibriSpeech. Causal encoder + AdaRMSNorm decoder + additive embedding fusion. Works on all quantization variants (4bit/6bit/fp16).</p>
+            <div class="example-tags"><span class="example-tag">STT</span><span class="example-tag">Voxtral RT</span><span class="example-tag">Streaming</span><span class="example-tag">4-bit</span></div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/49_voxtral_realtime_stt_finetuning.py" target="_blank">View on GitHub &rarr;</a></p>
           </div>
         </div>
       </section>

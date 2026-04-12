@@ -17,7 +17,7 @@ Supported Training Methods:
 - OCR (Optical Character Recognition) fine-tuning
 """
 
-__version__ = "0.4.20"  # Gemma 4 Audio Fine-Tuning
+__version__ = "0.4.21"  # Voxtral Realtime STT Fine-Tuning
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (

@@ -45,8 +45,9 @@ window.MLX_SEARCH_INDEX = [
   { title: "Audio Fine-Tuning", section: "TTS & STT Overview", url: "audio.html", tags: "audio tts stt text speech voice", page: "Audio" },
   { title: "TTS Fine-Tuning", section: "Text-to-Speech", url: "audio.html#tts", tags: "tts text speech orpheus outetts spark sesame qwen3-tts", page: "Audio" },
   { title: "FastTTSModel", section: "TTS Model Loading", url: "audio.html#tts", tags: "fastttsmodel tts load orpheus outetts", page: "Audio" },
-  { title: "STT Fine-Tuning", section: "Speech-to-Text", url: "audio.html#stt", tags: "stt speech text whisper moonshine qwen3-asr canary voxtral", page: "Audio" },
-  { title: "FastSTTModel", section: "STT Model Loading", url: "audio.html#stt", tags: "faststtmodel stt load whisper moonshine", page: "Audio" },
+  { title: "STT Fine-Tuning", section: "Speech-to-Text", url: "audio.html#stt", tags: "stt speech text whisper moonshine qwen3-asr canary voxtral voxtral-realtime streaming", page: "Audio" },
+  { title: "FastSTTModel", section: "STT Model Loading", url: "audio.html#stt", tags: "faststtmodel stt load whisper moonshine voxtral", page: "Audio" },
+  { title: "Voxtral Realtime", section: "Streaming ASR", url: "audio.html#stt-voxtral-realtime", tags: "voxtral realtime streaming asr mistral causal encoder ada rms norm tekkenizer wq wk wv wo feed_forward_w1 third architecture", page: "Audio" },
   { title: "Audio Codecs", section: "SNAC / DAC / BiCodec / Mimi", url: "audio.html#codecs", tags: "codec snac dac bicodec mimi audio tokenizer", page: "Audio" },
   { title: "Gemma 4 Audio (VLM)", section: "Conformer STT via VLM pipeline", url: "audio.html#models", tags: "gemma 4 audio conformer stt asr vlm fastvisionmodel", page: "Audio" },
 
@@ -73,6 +74,7 @@ window.MLX_SEARCH_INDEX = [
   { title: "LFM2 + CPT", section: "Example 46", url: "examples.html#cpt", tags: "lfm2 cpt continual pretraining domain adaptation example 46", page: "Examples" },
   { title: "Gemma 4 Audio ASR", section: "Example 47", url: "examples.html#vlm", tags: "gemma 4 audio asr stt example 47 conformer transcribe", page: "Examples" },
   { title: "Gemma 4 Audio Understanding", section: "Example 48", url: "examples.html#vlm", tags: "gemma 4 audio understanding qa example 48 tower lora", page: "Examples" },
+  { title: "Voxtral Realtime Streaming STT", section: "Example 49", url: "examples.html#ex49", tags: "voxtral realtime streaming stt example 49 mistral librispeech 4-bit causal encoder ada rms norm", page: "Examples" },
 
   // --- Troubleshooting ---
   { title: "Troubleshooting", section: "Common Issues", url: "troubleshooting.html", tags: "troubleshoot error fix help debug issue", page: "Help" },
