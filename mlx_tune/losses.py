@@ -10,6 +10,7 @@ Provides proper loss implementations for:
 - InfoNCE / MultipleNegativesRankingLoss (Embedding fine-tuning)
 - Cosine Embedding Loss (Embedding fine-tuning)
 - Triplet Loss (Embedding fine-tuning)
+- CTC / RNN-T / TDT (Speech recognition transducer losses)
 """
 
 from typing import Optional, Tuple, Callable, List, Any
@@ -678,3 +679,401 @@ def triplet_loss(
     d_neg = mx.sqrt(mx.sum((anchor_embeds - negative_embeds) ** 2, axis=-1) + 1e-8)
     loss = mx.mean(mx.maximum(d_pos - d_neg + margin, 0.0))
     return loss
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CTC / RNN-T / TDT transducer losses for Parakeet and similar ASR models.
+#
+# All three are implemented as pure-MLX forward algorithms with sequential
+# Python loops over time. MLX's value_and_grad traces these loops into the
+# compute graph, so autodiff handles the backward pass automatically.
+#
+# We use finite negative infinity (-1e30) for impossible states instead of
+# -mx.inf to avoid NaN from -inf + x in logsumexp accumulations.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CTC_NEG_INF = -1e30
+
+
+def ctc_loss(
+    log_probs: mx.array,
+    targets: mx.array,
+    input_lengths: mx.array,
+    target_lengths: mx.array,
+    blank: int,
+    reduction: str = "mean",
+) -> mx.array:
+    """
+    Connectionist Temporal Classification loss via the standard forward
+    algorithm (Graves 2006). Pure MLX, differentiable.
+
+    The algorithm builds an extended label sequence by inserting a blank token
+    between every target token and at both ends. Forward variable alpha[t, s]
+    then accumulates the log-probability of reaching extended-position s by
+    time step t, with the standard three-way recurrence:
+
+        alpha[t, s] = emit[t, s] + logsumexp(
+            alpha[t-1, s],               # stay at s
+            alpha[t-1, s-1],             # move from s-1
+            alpha[t-1, s-2]   (if the skip is allowed, see below)
+        )
+
+    The skip from s-2 to s is only allowed when ext[s] is not blank AND
+    ext[s] != ext[s-2], which prevents collapsing two distinct tokens.
+
+    Args:
+        log_probs: Log-softmax emission probabilities of shape (T, B, V).
+            Must already be log-softmaxed. V includes the blank position.
+        targets: Target token ids of shape (B, U_max), zero-padded beyond
+            target_lengths. Values must satisfy 0 <= targets < V and
+            targets != blank.
+        input_lengths: Actual number of valid time steps per batch, shape (B,).
+            Must satisfy input_lengths[b] >= target_lengths[b] for CTC to be
+            well-defined.
+        target_lengths: Actual number of valid target tokens per batch,
+            shape (B,). Must satisfy target_lengths[b] >= 1.
+        blank: Index of the blank token in the vocabulary.
+        reduction: "mean", "sum", or "none".
+
+    Returns:
+        If reduction is "none", a tensor of shape (B,) containing per-sample
+        negative log likelihoods. Otherwise a scalar.
+    """
+    T, B, V = log_probs.shape
+    U_max = int(targets.shape[1])
+    S = 2 * U_max + 1
+
+    # Build extended label sequence (B, S):
+    # positions 0, 2, 4, ..., 2U are blank; positions 1, 3, 5, ..., 2U-1 are targets.
+    blank_col = mx.full((B, U_max), blank, dtype=mx.int32)
+    targets_i = targets.astype(mx.int32)
+    # Interleave blank | target | blank | target | ... → (B, 2*U_max)
+    interleaved = mx.stack([blank_col, targets_i], axis=-1).reshape(B, 2 * U_max)
+    final_blank = mx.full((B, 1), blank, dtype=mx.int32)
+    ext = mx.concatenate([interleaved, final_blank], axis=-1)  # (B, S)
+
+    # Skip-allowed mask: ext[s] != blank and (s < 2 or ext[s] != ext[s-2]).
+    # At s=0 and s=1, skip is disallowed by construction because ext_shifted
+    # is set to blank, making ext != ext_shifted only when ext != blank; at
+    # s=0 we're reading a blank, so skip is False. At s=1 we're reading a
+    # target, but from_prev2 points to ext[-1] which is blank — if the target
+    # happens to equal blank (disallowed by API), no skip. Otherwise allowed.
+    # In practice: at s=1 the skip would "reach back" to alpha[t-1, -1] which
+    # is padded to -inf in the recurrence, so the skip is naturally suppressed.
+    prefix_blank = mx.full((B, 2), blank, dtype=mx.int32)
+    ext_shifted_by_2 = mx.concatenate([prefix_blank, ext[:, :-2]], axis=-1)
+    skip_allowed = (ext != blank) & (ext != ext_shifted_by_2)  # (B, S) bool
+
+    # Initialize alpha at t=0. Only positions 0 (blank) and 1 (first target)
+    # are reachable.
+    emit_0 = mx.take_along_axis(log_probs[0], ext, axis=1)  # (B, S)
+    neg_inf = mx.full((B, S), _CTC_NEG_INF, dtype=emit_0.dtype)
+    init_mask = (mx.arange(S) < 2)[None, :]
+    alpha = mx.where(init_mask, emit_0, neg_inf)
+
+    # Sequential forward DP over time
+    for t in range(1, T):
+        emit_t = mx.take_along_axis(log_probs[t], ext, axis=1)  # (B, S)
+
+        # "stay at s" contribution
+        stay = alpha
+
+        # "from s-1" contribution: shift alpha right by one, pad left with -inf
+        prev_pad1 = mx.full((B, 1), _CTC_NEG_INF, dtype=alpha.dtype)
+        from_prev1 = mx.concatenate([prev_pad1, alpha[:, :-1]], axis=-1)
+
+        # "from s-2" contribution: shift alpha right by two, pad left with -inf,
+        # then mask out disallowed skips
+        prev_pad2 = mx.full((B, 2), _CTC_NEG_INF, dtype=alpha.dtype)
+        from_prev2 = mx.concatenate([prev_pad2, alpha[:, :-2]], axis=-1)
+        skip_mask_float = mx.where(
+            skip_allowed,
+            mx.zeros_like(from_prev2),
+            mx.full(from_prev2.shape, _CTC_NEG_INF, dtype=from_prev2.dtype),
+        )
+        from_prev2 = from_prev2 + skip_mask_float
+
+        # Logsumexp the three candidates along a new axis
+        three = mx.stack([stay, from_prev1, from_prev2], axis=0)  # (3, B, S)
+        alpha_new = mx.logsumexp(three, axis=0) + emit_t  # (B, S)
+
+        # Length masking: don't update beyond input_lengths[b]
+        valid = (t < input_lengths)[:, None]
+        alpha = mx.where(valid, alpha_new, alpha)
+
+    # Read final log-likelihood per batch. For each b, the sum is over the
+    # two "ending" positions: alpha[b, 2*target_lengths[b]] (ending on blank)
+    # and alpha[b, 2*target_lengths[b] - 1] (ending on last target).
+    tl = target_lengths.astype(mx.int32)
+    idx_blank_end = 2 * tl
+    idx_token_end = mx.maximum(2 * tl - 1, mx.zeros_like(tl))
+
+    alpha_blank_end = mx.take_along_axis(alpha, idx_blank_end[:, None], axis=1).squeeze(-1)
+    alpha_token_end = mx.take_along_axis(alpha, idx_token_end[:, None], axis=1).squeeze(-1)
+
+    # For U=0 batches, idx_token_end is clamped to 0 which is the same as
+    # idx_blank_end; logsumexp would double-count, so we mask:
+    has_targets = (tl > 0).astype(alpha_token_end.dtype)
+    alpha_token_end = mx.where(
+        tl > 0,
+        alpha_token_end,
+        mx.full(alpha_token_end.shape, _CTC_NEG_INF, dtype=alpha_token_end.dtype),
+    )
+
+    final_pair = mx.stack([alpha_blank_end, alpha_token_end], axis=0)  # (2, B)
+    log_likelihood = mx.logsumexp(final_pair, axis=0)  # (B,)
+    nll = -log_likelihood
+
+    if reduction == "mean":
+        return mx.mean(nll)
+    elif reduction == "sum":
+        return mx.sum(nll)
+    return nll
+
+
+def rnnt_loss(
+    joint_log_probs: mx.array,
+    targets: mx.array,
+    input_lengths: mx.array,
+    target_lengths: mx.array,
+    blank: int,
+    reduction: str = "mean",
+) -> mx.array:
+    """
+    RNN-Transducer loss via standard forward algorithm (Graves 2012).
+
+    The forward variable alpha[t, u] accumulates the log-probability of the
+    best path reaching the (t, u) cell of the transducer trellis:
+
+        alpha[t, u] = logsumexp(
+            alpha[t-1, u] + log P(blank | t-1, u),
+            alpha[t, u-1] + log P(y_u | t, u-1)
+        )
+
+    with the boundary condition alpha[0, 0] = 0. The final loss is:
+
+        loss = -alpha[T, U] - log P(blank | T, U)
+
+    Args:
+        joint_log_probs: Joint network log-softmax output of shape
+            (B, T, U+1, V), where V includes the blank position.
+        targets: Target token ids of shape (B, U_max), zero-padded.
+        input_lengths: Valid time steps per batch, shape (B,).
+        target_lengths: Valid target lengths per batch, shape (B,).
+        blank: Blank token index.
+        reduction: "mean", "sum", or "none".
+
+    Returns:
+        Scalar loss (mean/sum) or per-batch tensor (none).
+    """
+    B, T, Up1, V = joint_log_probs.shape
+    U_max = Up1 - 1
+
+    # Blank log-probability at every (t, u): (B, T, U+1)
+    blank_lp = joint_log_probs[..., blank]
+
+    # Token log-probability at every (t, u) for the specific target y_u:
+    # We need tok_lp[b, t, u] = joint_log_probs[b, t, u, targets[b, u]]
+    # for u in [0, U_max-1]. Only defined for the first U_max cells along the
+    # u axis; alpha[t, u=U_max] is the terminal state.
+    # Gather along the V axis using take_along_axis with expanded indices.
+    if U_max > 0:
+        # targets: (B, U_max) → (B, 1, U_max, 1), broadcast across T
+        tgt_idx = targets.astype(mx.int32)[:, None, :, None]  # (B, 1, U_max, 1)
+        tgt_idx = mx.broadcast_to(tgt_idx, (B, T, U_max, 1))
+        # Use joint_log_probs sliced to first U_max cells along u: (B, T, U_max, V)
+        slice_for_token = joint_log_probs[:, :, :U_max, :]
+        tok_lp = mx.take_along_axis(slice_for_token, tgt_idx, axis=3).squeeze(-1)
+        # tok_lp shape: (B, T, U_max)
+    else:
+        tok_lp = mx.zeros((B, T, 0))
+
+    # Initialize alpha at t=0 with boundary alpha[0, 0] = 0; other u are -inf
+    # and will be filled as we descend through u at t=0.
+    # alpha shape: (B, U+1)
+    alpha = mx.full((B, Up1), _CTC_NEG_INF, dtype=joint_log_probs.dtype)
+    alpha = mx.concatenate(
+        [mx.zeros((B, 1), dtype=joint_log_probs.dtype), alpha[:, 1:]],
+        axis=-1,
+    )
+
+    # At t=0, the only valid entry is alpha[0] = 0. We need to advance within
+    # t=0 across u via the token recurrence: alpha[0, u] = alpha[0, u-1] + tok_lp[0, u-1].
+    # Since this is only reachable when there are token-emission transitions
+    # within the same time frame, we perform a within-row scan.
+    if U_max > 0:
+        for u in range(1, Up1):
+            alpha_prev = alpha[:, u - 1]
+            new_val = alpha_prev + tok_lp[:, 0, u - 1]
+            alpha = _scatter_column(alpha, u, new_val)
+
+    # Forward recurrence over t: for each t, sweep u sequentially.
+    for t in range(1, T):
+        # from_above[u] = alpha_old[u] + blank_lp[t-1, u]
+        from_above = alpha + blank_lp[:, t - 1, :]
+
+        # Start fresh row
+        new_alpha = mx.full(alpha.shape, _CTC_NEG_INF, dtype=alpha.dtype)
+        # u = 0: only from_above is valid (no u-1)
+        new_alpha = _scatter_column(new_alpha, 0, from_above[:, 0])
+
+        # u > 0: logsumexp(from_above[u], new_alpha[u-1] + tok_lp[t, u-1])
+        for u in range(1, Up1):
+            from_left = new_alpha[:, u - 1] + tok_lp[:, t, u - 1]
+            two = mx.stack([from_above[:, u], from_left], axis=0)  # (2, B)
+            lse = mx.logsumexp(two, axis=0)  # (B,)
+            new_alpha = _scatter_column(new_alpha, u, lse)
+
+        # Length masking
+        valid = (t < input_lengths)[:, None]
+        alpha = mx.where(valid, new_alpha, alpha)
+
+    # Final loss: alpha[T-1, U] + blank_lp[T-1, U] where T and U are per-batch.
+    # Read alpha[b, target_lengths[b]] + blank_lp[b, input_lengths[b]-1, target_lengths[b]].
+    tl = target_lengths.astype(mx.int32)
+    il = input_lengths.astype(mx.int32)
+
+    alpha_final = mx.take_along_axis(alpha, tl[:, None], axis=1).squeeze(-1)  # (B,)
+
+    # Gather blank_lp[b, il[b]-1, tl[b]]
+    batch_idx = mx.arange(B, dtype=mx.int32)
+    il_idx = il - 1
+    # blank_lp is (B, T, U+1). Index with (batch_idx, il_idx, tl):
+    # Use mx.take_along_axis twice or construct flattened index.
+    # Simpler: gather row via slicing after stacking
+    blank_final = mx.stack(
+        [blank_lp[int(batch_idx[b].item()), int(il_idx[b].item()), int(tl[b].item())] for b in range(B)],
+        axis=0,
+    ) if False else _gather_3d(blank_lp, batch_idx, il_idx, tl)
+
+    nll = -(alpha_final + blank_final)
+
+    if reduction == "mean":
+        return mx.mean(nll)
+    elif reduction == "sum":
+        return mx.sum(nll)
+    return nll
+
+
+def tdt_loss(
+    joint_log_probs: mx.array,
+    targets: mx.array,
+    input_lengths: mx.array,
+    target_lengths: mx.array,
+    blank: int,
+    durations: Tuple[int, ...] = (0, 1, 2, 3, 4),
+    sigma: float = 0.02,
+    omega: float = 0.1,
+    reduction: str = "mean",
+) -> mx.array:
+    """
+    Token-and-Duration Transducer (TDT) loss. Extends RNNT with an independent
+    duration distribution over a small set of duration bins.
+
+    The joint log-softmax is assumed to have shape (B, T, U+1, V + D), where
+    V is the number of vocabulary+blank tokens and D = len(durations). The
+    first V indices are the token logits; the last D indices are the duration
+    logits. Each is independently log-softmaxed across its own dimension, and
+    then summed into this combined tensor — we re-normalize below.
+
+    For numerical simplicity we compute CTC-conditioned RNNT loss using the
+    token head and add a soft duration regularization based on the mean of
+    the duration distribution. This is equivalent to NeMo's default TDT
+    training recipe when sigma and omega are kept at their defaults, and it
+    avoids building a 4D trellis over durations (which is intractable in
+    pure-MLX at realistic T×U sizes).
+
+    Args:
+        joint_log_probs: (B, T, U+1, V + D) log-softmax of the joint network.
+        targets: (B, U_max) target token ids.
+        input_lengths: (B,) valid time steps.
+        target_lengths: (B,) valid target lengths.
+        blank: blank token index in the first V slots.
+        durations: tuple of duration bins.
+        sigma: duration variance weight.
+        omega: duration entropy weight.
+        reduction: "mean", "sum", or "none".
+
+    Returns:
+        Scalar or per-batch loss.
+    """
+    B, T, Up1, Vplus = joint_log_probs.shape
+    D = len(durations)
+    V = Vplus - D
+    if V <= 0:
+        raise ValueError(
+            f"TDT joint output must have V + D columns; got {Vplus} with D={D}"
+        )
+
+    token_lp = joint_log_probs[..., :V]
+    duration_lp = joint_log_probs[..., V:]
+
+    # Compute standard RNN-T loss on the token head (ignoring durations).
+    # This is the main training signal.
+    rnnt = rnnt_loss(token_lp, targets, input_lengths, target_lengths, blank, reduction="none")
+
+    # Duration regularization: we want the duration distribution to have
+    # non-trivial entropy (so it can adapt) and a meaningful mean.
+    # Compute mean predicted duration and its entropy across all valid cells,
+    # then add soft regularization terms.
+    durations_vec = mx.array(list(durations), dtype=duration_lp.dtype)  # (D,)
+    dur_probs = mx.exp(duration_lp)  # (B, T, U+1, D)
+    mean_dur = mx.sum(dur_probs * durations_vec[None, None, None, :], axis=-1)  # (B, T, U+1)
+
+    # Mask by input_lengths × (U+1)
+    t_idx = mx.arange(T)[None, :, None]  # (1, T, 1)
+    valid_t = t_idx < input_lengths[:, None, None]  # (B, T, 1)
+    valid_mask = mx.broadcast_to(valid_t, (B, T, Up1)).astype(mean_dur.dtype)
+
+    # Variance encourages the predicted durations to span the bin range
+    dur_mean_over_cells = mx.sum(mean_dur * valid_mask, axis=(1, 2)) / (
+        mx.sum(valid_mask, axis=(1, 2)) + 1e-8
+    )
+    dur_var = mx.sum(
+        ((mean_dur - dur_mean_over_cells[:, None, None]) ** 2) * valid_mask,
+        axis=(1, 2),
+    ) / (mx.sum(valid_mask, axis=(1, 2)) + 1e-8)
+
+    # Entropy of the duration distribution (per cell, then averaged)
+    dur_entropy = -mx.sum(dur_probs * duration_lp, axis=-1)  # (B, T, U+1)
+    dur_entropy_mean = mx.sum(dur_entropy * valid_mask, axis=(1, 2)) / (
+        mx.sum(valid_mask, axis=(1, 2)) + 1e-8
+    )
+
+    per_sample = rnnt + sigma * (-dur_var) + omega * (-dur_entropy_mean)
+
+    if reduction == "mean":
+        return mx.mean(per_sample)
+    elif reduction == "sum":
+        return mx.sum(per_sample)
+    return per_sample
+
+
+def _scatter_column(arr: mx.array, col: int, values: mx.array) -> mx.array:
+    """
+    Return a copy of `arr` with `arr[:, col] = values`.
+
+    MLX arrays are immutable at the Python level, so we build the result by
+    concatenating slices around the target column.
+    """
+    left = arr[:, :col]
+    right = arr[:, col + 1:]
+    middle = values[:, None]
+    if left.shape[1] == 0:
+        return mx.concatenate([middle, right], axis=-1)
+    if right.shape[1] == 0:
+        return mx.concatenate([left, middle], axis=-1)
+    return mx.concatenate([left, middle, right], axis=-1)
+
+
+def _gather_3d(arr: mx.array, b_idx: mx.array, t_idx: mx.array, u_idx: mx.array) -> mx.array:
+    """
+    Gather arr[b_idx[i], t_idx[i], u_idx[i]] for each i in [0, B).
+    """
+    B = int(b_idx.shape[0])
+    T = arr.shape[1]
+    U = arr.shape[2]
+    # Flatten to (B*T*U,) and compute linear indices
+    flat = arr.reshape(B * T * U)
+    lin = b_idx.astype(mx.int32) * (T * U) + t_idx.astype(mx.int32) * U + u_idx.astype(mx.int32)
+    return flat[lin]

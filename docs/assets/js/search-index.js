@@ -45,9 +45,12 @@ window.MLX_SEARCH_INDEX = [
   { title: "Audio Fine-Tuning", section: "TTS & STT Overview", url: "audio.html", tags: "audio tts stt text speech voice", page: "Audio" },
   { title: "TTS Fine-Tuning", section: "Text-to-Speech", url: "audio.html#tts", tags: "tts text speech orpheus outetts spark sesame qwen3-tts", page: "Audio" },
   { title: "FastTTSModel", section: "TTS Model Loading", url: "audio.html#tts", tags: "fastttsmodel tts load orpheus outetts", page: "Audio" },
-  { title: "STT Fine-Tuning", section: "Speech-to-Text", url: "audio.html#stt", tags: "stt speech text whisper moonshine qwen3-asr canary voxtral voxtral-realtime streaming", page: "Audio" },
-  { title: "FastSTTModel", section: "STT Model Loading", url: "audio.html#stt", tags: "faststtmodel stt load whisper moonshine voxtral", page: "Audio" },
+  { title: "STT Fine-Tuning", section: "Speech-to-Text", url: "audio.html#stt", tags: "stt speech text whisper moonshine qwen3-asr canary voxtral voxtral-realtime streaming parakeet tdt fastconformer", page: "Audio" },
+  { title: "FastSTTModel", section: "STT Model Loading", url: "audio.html#stt", tags: "faststtmodel stt load whisper moonshine voxtral parakeet", page: "Audio" },
   { title: "Voxtral Realtime", section: "Streaming ASR", url: "audio.html#stt-voxtral-realtime", tags: "voxtral realtime streaming asr mistral causal encoder ada rms norm tekkenizer wq wk wv wo feed_forward_w1 third architecture", page: "Audio" },
+  { title: "Parakeet TDT", section: "FastConformer + Token-and-Duration Transducer", url: "audio.html#stt-parakeet", tags: "parakeet tdt nvidia fastconformer transducer ctc rnnt rnn-t token duration lstm joint network new language vocab extension sentencepiece bengali arabic hindi thai chinese japanese korean welsh fourth architecture", page: "Audio" },
+  { title: "CTC / RNN-T / TDT Losses", section: "Transducer losses", url: "audio.html#stt-parakeet", tags: "ctc loss rnnt loss tdt loss transducer forward backward graves parakeet pure mlx", page: "Audio" },
+  { title: "Vocabulary Extension", section: "extend_vocabulary() for non-Latin scripts", url: "audio.html#stt-parakeet", tags: "extend_vocabulary parakeet char bpe sentencepiece retrain aggregate tokenizer new language bengali arabic hindi thai cjk korean japanese chinese", page: "Audio" },
   { title: "Audio Codecs", section: "SNAC / DAC / BiCodec / Mimi", url: "audio.html#codecs", tags: "codec snac dac bicodec mimi audio tokenizer", page: "Audio" },
   { title: "Gemma 4 Audio (VLM)", section: "Conformer STT via VLM pipeline", url: "audio.html#models", tags: "gemma 4 audio conformer stt asr vlm fastvisionmodel", page: "Audio" },
 
@@ -75,6 +78,10 @@ window.MLX_SEARCH_INDEX = [
   { title: "Gemma 4 Audio ASR", section: "Example 47", url: "examples.html#vlm", tags: "gemma 4 audio asr stt example 47 conformer transcribe", page: "Examples" },
   { title: "Gemma 4 Audio Understanding", section: "Example 48", url: "examples.html#vlm", tags: "gemma 4 audio understanding qa example 48 tower lora", page: "Examples" },
   { title: "Voxtral Realtime Streaming STT", section: "Example 49", url: "examples.html#ex49", tags: "voxtral realtime streaming stt example 49 mistral librispeech 4-bit causal encoder ada rms norm", page: "Examples" },
+  { title: "Parakeet TDT English", section: "Example 50", url: "examples.html#ex50", tags: "parakeet tdt nvidia fastconformer english librispeech example 50 ctc warm start joint network transducer", page: "Examples" },
+  { title: "Parakeet Welsh (new language)", section: "Example 51", url: "examples.html#ex51", tags: "parakeet tdt welsh fleurs cy_gb new language celtic latin script example 51 no vocab extension", page: "Examples" },
+  { title: "Parakeet Bengali (char vocab extension)", section: "Example 52", url: "examples.html#ex52", tags: "parakeet tdt bengali fleurs bn_in char vocab extension extend_vocabulary brahmic non-latin unicode example 52 hindi thai devanagari", page: "Examples" },
+  { title: "Parakeet Arabic (BPE vocab extension)", section: "Example 53", url: "examples.html#ex53", tags: "parakeet tdt arabic fleurs ar_eg bpe sentencepiece retrain aggregate tokenizer example 53 full weight", page: "Examples" },
 
   // --- Troubleshooting ---
   { title: "Troubleshooting", section: "Common Issues", url: "troubleshooting.html", tags: "troubleshoot error fix help debug issue", page: "Help" },

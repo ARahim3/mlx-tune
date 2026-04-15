@@ -365,6 +365,48 @@ _VOXTRAL_REALTIME_PROFILE = STTModelProfile(
     loader="mlx_audio_stt",
 )
 
+_PARAKEET_TDT_PROFILE = STTModelProfile(
+    name="parakeet_tdt",
+    # Fourth STT architecture type — NVIDIA Parakeet FastConformer + TDT transducer.
+    #
+    # We train the encoder via a new CTC head (for CTC/char-level paths) and/or
+    # via the native joint+LSTM decoder (for RNN-T and TDT paths). The decoder
+    # block path is empty because the LSTM has no nn.Linear sub-modules that we
+    # can wrap with LoRA — for full-weight fine-tuning of the decoder/joint we
+    # use the `get_full_finetune` helper in stt.py instead.
+    architecture="parakeet_tdt",
+    sample_rate=16000,
+    preprocessor="parakeet_mel",  # Parakeet's per-feature normalized log-mel
+    n_mels=128,
+    max_audio_samples=160000,  # 10s at 16kHz — matches NeMo's max_duration config
+    encoder_block_path="encoder.layers",
+    decoder_block_path="",  # No LoRA on the LSTM prediction network
+    attn_names={"self_attn": "self_attn"},
+    cross_attn_attr="",  # Conformer encoder has only self-attention
+    sot_token_id=0,  # Not used for CTC; decoder uses blank as start
+    # Default LoRA target set: self-attention projections + relative position projection.
+    # `linear_pos` is critical for relative-position attention to adapt to new languages.
+    # FastConformer uses internal naming `linear_q/k/v/linear_out/linear_pos`, not q_proj.
+    lora_target_modules=(
+        "linear_q",
+        "linear_k",
+        "linear_v",
+        "linear_out",
+        "linear_pos",
+    ),
+    encoder_lora_targets=(
+        "linear_q",
+        "linear_k",
+        "linear_v",
+        "linear_out",
+        "linear_pos",
+    ),
+    decoder_ffn_targets=None,
+    audio_token_id=None,
+    inner_model_attr=None,
+    loader="mlx_audio_stt",
+)
+
 
 # ---------------------------------------------------------------------------
 # Profile Registries
@@ -382,6 +424,11 @@ STT_PROFILES: Dict[str, STTModelProfile] = {
     "whisper": _WHISPER_PROFILE,
     "moonshine": _MOONSHINE_PROFILE,
     "qwen3_asr": _QWEN3_ASR_PROFILE,
+    # parakeet_tdt MUST come before canary so the parakeet regex matches first
+    # for repos like `nvidia/parakeet-tdt-*` (which would otherwise also match
+    # a hypothetical `nvidia/canary` pattern). Both profiles use FastConformer
+    # encoders but with different LoRA target names, so ordering matters.
+    "parakeet_tdt": _PARAKEET_TDT_PROFILE,
     "canary": _CANARY_PROFILE,
     # voxtral_realtime MUST be checked before voxtral so the realtime variant
     # gets matched first. The voxtral pattern also has a negative lookahead as
@@ -412,6 +459,14 @@ _STT_PATTERNS: Dict[str, List[str]] = {
     ],
     "moonshine": [r"moonshine", r"useful[-_]?sensors.*moonshine"],
     "qwen3_asr": [r"qwen3[-_]?asr", r"Qwen3[-_]?ASR"],
+    # Parakeet TDT — NVIDIA's FastConformer + Token-and-Duration Transducer.
+    # Must come before canary because both match `nvidia/...` patterns.
+    "parakeet_tdt": [
+        r"parakeet[-_]?tdt",
+        r"parakeet.*tdt",
+        r"nvidia.*parakeet.*tdt",
+        r"mlx-community/parakeet[-_]?tdt",
+    ],
     "canary": [r"canary", r"nvidia.*canary"],
     # Voxtral Realtime — must be checked BEFORE the regular voxtral pattern.
     # Dict iteration in Python 3.7+ preserves insertion order, so this works.

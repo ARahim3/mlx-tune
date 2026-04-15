@@ -17,7 +17,7 @@ Supported Training Methods:
 - OCR (Optical Character Recognition) fine-tuning
 """
 
-__version__ = "0.4.21"  # Voxtral Realtime STT Fine-Tuning
+__version__ = "0.4.22"  # NVIDIA Parakeet TDT Fine-Tuning
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (
@@ -65,6 +65,10 @@ from mlx_tune.losses import (
     infonce_loss,
     cosine_embedding_loss,
     triplet_loss,
+    # Transducer losses (Parakeet fine-tuning)
+    ctc_loss,
+    rnnt_loss,
+    tdt_loss,
 )
 
 # Vision Language Models
@@ -267,6 +271,10 @@ __all__ = [
     "infonce_loss",
     "cosine_embedding_loss",
     "triplet_loss",
+    # Transducer Losses (Parakeet fine-tuning)
+    "ctc_loss",
+    "rnnt_loss",
+    "tdt_loss",
     # Utilities
     "prepare_dataset",
     "prepare_preference_dataset",

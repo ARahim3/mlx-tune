@@ -84,6 +84,7 @@
         <li class="sub-item"><a href="#stt-canary">Canary</a></li>
         <li class="sub-item"><a href="#stt-voxtral">Voxtral</a></li>
         <li class="sub-item"><a href="#stt-voxtral-realtime">Voxtral Realtime</a></li>
+        <li class="sub-item"><a href="#stt-parakeet">Parakeet TDT</a></li>
         <li class="sub-item"><a href="#FastSTTModel">FastSTTModel API</a></li>
         <li class="sub-item"><a href="#STTSFTTrainer">STTSFTTrainer</a></li>
         <li><a href="#post-training">Post-Training</a></li>
@@ -149,7 +150,8 @@ brew install ffmpeg</code></pre>
             <tr><td><strong>Qwen3-ASR</strong></td><td>1.7B</td><td>Audio encoder</td><td>16 kHz</td><td>Audio-LLM (Qwen3)</td></tr>
             <tr><td><strong>NVIDIA Canary</strong></td><td>1B</td><td>Parakeet mel</td><td>16 kHz</td><td>Encoder-Decoder (Conformer)</td></tr>
             <tr><td><strong>Voxtral</strong></td><td>3B</td><td>Mel spectrogram</td><td>16 kHz</td><td>Audio-LLM (Llama)</td></tr>
-            <tr><td><strong>Voxtral Realtime</strong> (NEW)</td><td>4B</td><td>Causal mel + delay tokens</td><td>16 kHz</td><td>Streaming (causal encoder + AdaRMSNorm decoder)</td></tr>
+            <tr><td><strong>Voxtral Realtime</strong></td><td>4B</td><td>Causal mel + delay tokens</td><td>16 kHz</td><td>Streaming (causal encoder + AdaRMSNorm decoder)</td></tr>
+            <tr><td><strong>Parakeet TDT</strong> <span class="badge badge-new">NEW</span></td><td>0.6B&ndash;1.1B</td><td>Parakeet log-mel (128)</td><td>16 kHz</td><td>FastConformer + TDT transducer, streaming (CTC/RNN-T/TDT losses)</td></tr>
           </tbody>
         </table>
         <div class="callout" style="margin-top: 1.5rem;">
@@ -581,6 +583,89 @@ trainer.train()</code></pre>
           </div>
         </div>
 
+        <!-- Parakeet TDT -->
+        <div class="api-entry" id="stt-parakeet">
+          <h3>NVIDIA Parakeet TDT <span class="badge badge-new">NEW v0.4.22</span></h3>
+          <p>NVIDIA's state-of-the-art FastConformer + Token-and-Duration Transducer ASR. The fourth architecture type in mlx-tune's STT subsystem alongside <code>encoder_decoder</code>, <code>audio_llm</code>, and <code>voxtral_realtime</code>.</p>
+
+          <p>Parakeet is unusual: the decoder is a 2-layer LSTM prediction network (not LoRA-friendly), the joint network outputs <code>[B, T, U+1, V+1+D]</code> where <code>D=5</code> duration bins, and training needs transducer loss. <code>mlx-tune</code> solves this by:</p>
+          <ul>
+            <li><strong>Mounting a new CTC head</strong> on the Conformer encoder, warm-started from the pretrained joint network's output projection.</li>
+            <li><strong>Three loss functions in pure MLX</strong>: <code>ctc_loss</code> (fastest), <code>rnnt_loss</code> (Graves 2012 forward algorithm), <code>tdt_loss</code> (extends RNN-T with duration prediction).</li>
+            <li><strong>LoRA on the Conformer encoder's self-attention</strong> (<code>linear_q/k/v/linear_out/linear_pos</code>) &mdash; note the Conformer-internal naming, not <code>q_proj</code>.</li>
+            <li><strong>Automatic vocabulary extension</strong> via <code>model.extend_vocabulary()</code> for any Unicode language. Two strategies: <code>"char"</code> (per-character auto extension, zero config) or <code>"bpe"</code> (retrain SentencePiece on your corpus, merge via aggregate tokenizer).</li>
+            <li><strong>BatchNorm freeze</strong> in the Conformer conv modules to prevent running-stat drift during fine-tuning.</li>
+            <li><strong>Streaming preserved</strong>: chunked streaming inference works for both the native TDT path (<code>model.generate(audio, stream=True)</code>) on the original training languages, and the new CTC head (<code>model.stream_transcribe_ctc()</code>) for fine-tuned and new-language models.</li>
+          </ul>
+
+          <div class="callout">
+            <div class="callout-title">Language coverage</div>
+            <p>Parakeet v3's SentencePiece vocabulary covers Latin, Cyrillic, and Greek scripts well (~7,900 pieces across 25 European languages). For these scripts you can fine-tune directly with zero tokenizer changes. For non-Latin scripts (Arabic, Bengali, Devanagari, CJK, Korean, Thai, Hebrew...), call <code>model.extend_vocabulary(texts, strategy="char")</code> or <code>"bpe"</code> and mlx-tune will automatically resize the CTC head, joint output projection, and decoder embedding in lockstep.</p>
+          </div>
+
+          <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+
+# Load the 0.6B FastConformer TDT model
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/parakeet-tdt-0.6b-v3",
+    # For non-training-set languages (Welsh, Bengali, Arabic, etc.), pass
+    # warm_start_ctc_head=False to start from a fresh random head — the
+    # warm-start has an English-biased prior that hurts new-language convergence.
+)
+
+# For non-Latin languages: auto-extend the vocabulary BEFORE applying LoRA.
+# This scans `texts` for characters the pretrained SP tokenizer can't encode,
+# adds them as new tokens, and resizes the CTC head + joint output + decoder
+# embedding. Works for any Unicode language out of the box.
+#
+# added = model.extend_vocabulary(
+#     all_transcripts, strategy="char", min_count=1
+# )
+# # Or BPE retraining for better compression:
+# added = model.extend_vocabulary(
+#     all_transcripts, strategy="bpe", bpe_vocab_size=500
+# )
+
+# LoRA on the Conformer self-attention (default: q/k/v/out + linear_pos)
+model = FastSTTModel.get_peft_model(model, r=16, lora_alpha=32)
+
+collator = STTDataCollator(model, processor)
+trainer = STTSFTTrainer(
+    model=model, processor=processor,
+    data_collator=collator, train_dataset=dataset,
+    args=STTSFTConfig(
+        per_device_train_batch_size=1,
+        max_steps=150,
+        learning_rate=3e-4,
+        loss_type="ctc",  # or "rnnt" / "tdt" / "hybrid"
+        output_dir="./parakeet_output",
+    ),
+)
+trainer.train()
+
+# Transcribe via the new CTC head
+text = model.transcribe_ctc("audio.wav")
+
+# The original TDT decoder still works for languages Parakeet was trained on
+text = model.transcribe_tdt("audio.wav")
+
+# Streaming CTC via chunked inference
+for partial in model.stream_transcribe_ctc("long_audio.wav"):
+    print(partial)</code></pre>
+          </div>
+
+          <table class="api-params" style="margin-top: 1rem;">
+            <thead><tr><th>Loss type</th><th>Forward pass</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>ctc</code></td><td>encoder &rarr; new CTC head</td><td>Fastest, simplest. Joint network not touched.</td></tr>
+              <tr><td><code>rnnt</code></td><td>encoder &rarr; joint(enc, dec) slice [:V+1]</td><td>Standard RNN-T Graves 2012. Uses existing joint+LSTM.</td></tr>
+              <tr><td><code>tdt</code></td><td>encoder &rarr; joint(enc, dec) full</td><td>Matches NVIDIA's native TDT recipe with duration regularization.</td></tr>
+              <tr><td><code>hybrid</code></td><td>CTC + TDT weighted sum</td><td>Matches NVIDIA's Stage 2 recipe (<code>ctc_weight=0.3, tdt_weight=1.0</code>).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
         <!-- FastSTTModel -->
         <div class="api-entry" id="FastSTTModel">
           <h3>FastSTTModel API</h3>
@@ -594,7 +679,7 @@ trainer.train()</code></pre>
           <table class="api-params">
             <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
             <tbody>
-              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Whisper, Distil-Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral, Voxtral Realtime</td></tr>
+              <tr><td><code>model_name</code></td><td>str</td><td>HuggingFace model ID or local path. Supported: Whisper, Distil-Whisper, Moonshine, Qwen3-ASR, Canary, Voxtral, Voxtral Realtime, Parakeet TDT</td></tr>
               <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum decoder sequence length</td></tr>
             </tbody>
           </table>

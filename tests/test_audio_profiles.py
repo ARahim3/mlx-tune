@@ -557,6 +557,7 @@ class TestRegistries:
             "canary",
             "voxtral",
             "voxtral_realtime",
+            "parakeet_tdt",
         }
         assert set(STT_PROFILES.keys()) == expected
 
@@ -584,12 +585,18 @@ class TestRegistries:
         for name, profile in STT_PROFILES.items():
             assert profile.name == name
             assert profile.sample_rate > 0
-            assert profile.preprocessor in ("log_mel_spectrogram", "raw_conv", "canary_mel")
+            assert profile.preprocessor in (
+                "log_mel_spectrogram",
+                "raw_conv",
+                "canary_mel",
+                "parakeet_mel",
+            )
             assert len(profile.lora_target_modules) > 0
             assert profile.architecture in (
                 "encoder_decoder",
                 "audio_llm",
                 "voxtral_realtime",
+                "parakeet_tdt",
             )
 
     def test_audio_llm_profiles_have_audio_token_id(self):

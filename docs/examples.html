@@ -1040,9 +1040,9 @@ trainer.train()</code></pre>
 
         <!-- Example 49: Voxtral Realtime Streaming STT -->
         <div class="example-card" id="ex49">
-          <h4>49 &mdash; Voxtral Realtime Streaming STT <span class="badge badge-new">NEW v0.4.21</span></h4>
-          <p>Fine-tune Mistral's <strong>streaming</strong> Voxtral Realtime &mdash; a fundamentally different architecture from regular Voxtral with causal encoder + AdaRMSNorm decoder + additive embedding fusion. Works on 4-bit, 6-bit, and fp16 variants. Trains the decoder LoRA only (encoder frozen by default).</p>
-          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Voxtral RT</span><span class="example-tag">Streaming</span><span class="example-tag">4-bit</span></div>
+          <h4>49 &mdash; Voxtral Realtime Streaming STT</h4>
+          <p>Fine-tune Mistral's streaming Voxtral Realtime. Causal encoder + AdaRMSNorm decoder, decoder LoRA only.</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Voxtral RT</span><span class="example-tag">Streaming</span></div>
           <button class="example-toggle">View Code</button>
           <div class="example-code">
             <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
@@ -1084,6 +1084,147 @@ model.save_pretrained("./out/adapter")
 model.save_pretrained_merged("./out/merged")</code></pre>
             </div>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/49_voxtral_realtime_stt_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <!-- Example 50: Parakeet English -->
+        <div class="example-card" id="ex50">
+          <h4>50 &mdash; Parakeet TDT English (LibriSpeech)</h4>
+          <p>Fine-tune NVIDIA Parakeet TDT on English. Warm-started CTC head, LoRA encoder, baseline pipeline demo.</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Parakeet</span><span class="example-tag">CTC</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+
+# Warm-started CTC head from the pretrained joint network
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/parakeet-tdt-0.6b-v3",
+)
+model = FastSTTModel.get_peft_model(model, r=16, lora_alpha=32)
+
+trainer = STTSFTTrainer(
+    model=model, tokenizer=processor,
+    data_collator=STTDataCollator(model=model, processor=processor),
+    train_dataset=train_ds,
+    args=STTSFTConfig(max_steps=150, learning_rate=3e-4, loss_type="ctc"),
+)
+trainer.train()
+
+# Both inference paths still work
+text_ctc = model.transcribe_ctc(audio_array)   # new CTC head
+text_tdt = model.transcribe_tdt(audio_array)   # original TDT path</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/50_parakeet_english_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <!-- Example 51: Parakeet Welsh -->
+        <div class="example-card" id="ex51">
+          <h4>51 &mdash; Parakeet Welsh (new Latin-script language)</h4>
+          <p>Fine-tune Parakeet on Welsh (FLEURS <code>cy_gb</code>). Latin-script chars already in the vocab &mdash; no extension needed.</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Parakeet</span><span class="example-tag">FLEURS</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset
+
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/parakeet-tdt-0.6b-v3",
+    warm_start_ctc_head=False,  # avoid English-biased prior
+)
+model = FastSTTModel.get_peft_model(model, r=16, lora_alpha=32)
+
+# Welsh from FLEURS &mdash; same code path for any Latin / Cyrillic / Greek language
+ds = load_dataset("google/fleurs", "cy_gb", split="train[:80]",
+                  trust_remote_code=True)
+
+trainer = STTSFTTrainer(
+    model=model, tokenizer=processor,
+    data_collator=STTDataCollator(model=model, processor=processor),
+    train_dataset=train_ds,
+    args=STTSFTConfig(max_steps=100, learning_rate=3e-4, loss_type="ctc"),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/51_parakeet_welsh_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <!-- Example 52: Parakeet Bengali char vocab extension -->
+        <div class="example-card" id="ex52">
+          <h4>52 &mdash; Parakeet Bengali (char vocab extension)</h4>
+          <p>Bengali characters all encode to UNK. Auto-extends the vocab with one call, then trains. Same path works for Hindi / Thai / CJK / Korean / Hebrew.</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Parakeet</span><span class="example-tag">Vocab extension</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset
+
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/parakeet-tdt-0.6b-v3",
+    warm_start_ctc_head=False,
+)
+
+# Auto-detects ~60 missing Bengali chars and resizes the CTC head,
+# joint output projection, and decoder embedding in lockstep.
+ds = load_dataset("google/fleurs", "bn_in", split="train",
+                  trust_remote_code=True)
+texts = [ds[i]["transcription"] for i in range(len(ds))]
+added = model.extend_vocabulary(texts, strategy="char")
+print(f"Added {len(added)} new tokens")
+
+model = FastSTTModel.get_peft_model(model, r=16, lora_alpha=32)
+trainer = STTSFTTrainer(
+    model=model, tokenizer=processor,
+    data_collator=STTDataCollator(model=model, processor=processor),
+    train_dataset=train_ds,
+    args=STTSFTConfig(max_steps=150, learning_rate=3e-4, loss_type="ctc"),
+)
+trainer.train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/52_parakeet_bengali_char_extension.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <!-- Example 53: Parakeet Arabic BPE extension -->
+        <div class="example-card" id="ex53">
+          <h4>53 &mdash; Parakeet Arabic (BPE vocab extension)</h4>
+          <p>Retrain SentencePiece BPE on the target corpus and combine it with the pretrained tokenizer. Better token efficiency than char-level.</p>
+          <div class="example-tags"><span class="example-tag">FastSTTModel</span><span class="example-tag">STT</span><span class="example-tag">Parakeet</span><span class="example-tag">BPE</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastSTTModel, STTSFTTrainer, STTSFTConfig, STTDataCollator
+from datasets import load_dataset
+
+model, processor = FastSTTModel.from_pretrained(
+    "mlx-community/parakeet-tdt-0.6b-v3",
+    warm_start_ctc_head=False,
+)
+
+# Trains a fresh 500-piece BPE on the Arabic corpus and installs an
+# aggregate tokenizer over the pretrained + new SentencePiece models.
+ds = load_dataset("google/fleurs", "ar_eg", split="train",
+                  trust_remote_code=True)
+texts = [ds[i]["transcription"] for i in range(len(ds))]
+model.extend_vocabulary(texts, strategy="bpe", bpe_vocab_size=500)
+
+model = FastSTTModel.get_peft_model(model, r=16, lora_alpha=32)
+trainer = STTSFTTrainer(
+    model=model, tokenizer=processor,
+    data_collator=STTDataCollator(model=model, processor=processor),
+    train_dataset=train_ds,
+    args=STTSFTConfig(max_steps=150, learning_rate=3e-4, loss_type="ctc"),
+)
+trainer.train()
+
+# Aux BPE model is persisted alongside the adapters
+model.save_pretrained("./parakeet_arabic_finetuned/adapters")</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/53_parakeet_arabic_bpe_fulltune.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
       </div>

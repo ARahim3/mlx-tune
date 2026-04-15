@@ -100,6 +100,29 @@ def _require_mlx_audio():
         )
 
 
+def _set_batchnorm_eval(module: Any) -> int:
+    """
+    Walk a module tree and call .eval() on every nn.BatchNorm instance.
+
+    Parakeet's Conformer convolution sub-modules contain nn.BatchNorm layers
+    whose running_mean / running_var are not part of trainable_parameters()
+    but DO update as a side effect of __call__ when the module is in training
+    mode. That drift corrupts the pretrained encoder's acoustic features, so
+    we explicitly freeze them before training.
+
+    Returns the number of BatchNorm modules that were set to eval.
+    """
+    count = 0
+    BN = getattr(nn, "BatchNorm", None)
+    if BN is None:
+        return 0
+    for _name, sub in module.named_modules() if hasattr(module, "named_modules") else []:
+        if isinstance(sub, BN):
+            sub.eval()
+            count += 1
+    return count
+
+
 # Whisper constants
 WHISPER_SAMPLE_RATE = 16000
 WHISPER_N_SAMPLES = 480000  # 30 seconds at 16kHz
@@ -132,6 +155,7 @@ class FastSTTModel:
         load_in_8bit: bool = False,
         token: Optional[str] = None,
         trust_remote_code: bool = False,
+        warm_start_ctc_head: bool = True,
         **kwargs,
     ) -> Tuple["STTModelWrapper", Any]:
         """
@@ -300,6 +324,46 @@ class FastSTTModel:
                 # mistral_common not installed — inference still works,
                 # training will raise a clear error in the data collator.
                 pass
+        elif profile and profile.architecture == "parakeet_tdt":
+            # Parakeet TDT: load SentencePiece tokenizer from the HF cache and
+            # verify it matches the model's built-in vocabulary list. Attach
+            # both to the model so the data collator can encode text during
+            # training. The CTC head and BatchNorm freeze happen below after
+            # the wrapper is constructed.
+            try:
+                import sentencepiece as spm
+            except ImportError as e:
+                raise ImportError(
+                    "Parakeet fine-tuning requires the `sentencepiece` package. "
+                    "Install with: uv pip install sentencepiece"
+                ) from e
+            from huggingface_hub import try_to_load_from_cache, hf_hub_download
+            sp_path = try_to_load_from_cache(
+                repo_id=model_name, filename="tokenizer.model"
+            )
+            if not sp_path:
+                try:
+                    sp_path = hf_hub_download(
+                        repo_id=model_name, filename="tokenizer.model"
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Could not locate tokenizer.model for {model_name}: {e}"
+                    )
+            sp = spm.SentencePieceProcessor()
+            sp.load(str(sp_path))
+            # Consistency check against the model's built-in vocabulary list
+            model_vocab = getattr(model, "vocabulary", None)
+            if model_vocab is not None:
+                if sp.get_piece_size() != len(model_vocab):
+                    raise RuntimeError(
+                        f"SentencePiece vocab size ({sp.get_piece_size()}) does not "
+                        f"match model.vocabulary length ({len(model_vocab)})"
+                    )
+            model._sp_tokenizer = sp
+            model._sp_tokenizer_path = str(sp_path)
+            tokenizer = sp
+            hf_processor = None
         else:
             # Encoder-decoder models (Whisper, Canary) — try WhisperProcessor
             hf_processor = getattr(model, "_processor", None)
@@ -338,6 +402,74 @@ class FastSTTModel:
             max_seq_length=max_seq_length,
             profile=profile,
         )
+
+        # Parakeet TDT post-load setup: attach CTC head, SP tokenizer, freeze BN
+        if profile and profile.architecture == "parakeet_tdt":
+            # Determine encoder hidden size and vocab size from the model
+            d_model = int(model.encoder_config.d_model)
+            vocab_size = len(model.vocabulary)
+            wrapper.vocab_size = vocab_size
+            wrapper.blank_id = vocab_size  # blank is the extra slot past the vocab
+
+            # Attach CTC head DIRECTLY to the model so it's part of the mlx
+            # module tree. Sharing the same nn.Module between the wrapper and
+            # the model keeps `wrapper.ctc_head` ergonomic without losing
+            # trainable_parameters() visibility.
+            #
+            # CRITICAL: We WARM-START the CTC head from Parakeet's pretrained
+            # joint network weights. A randomly initialized head causes CTC
+            # loss to collapse to a trivial "always predict blank" solution
+            # during fine-tuning. The joint network was trained alongside the
+            # encoder with hybrid TDT+CTC loss, so composing
+            #
+            #   joint.joint_net[2] ∘ joint.enc
+            #
+            # gives a decent linear approximation of the encoder->vocab path
+            # that lets the CTC head start producing meaningful alignments
+            # from step 1. The ReLU activation between the two linears is
+            # ignored (linearization is an approximation), and we use the
+            # blank bias from the original projection unchanged.
+            ctc_head = nn.Linear(d_model, vocab_size + 1, bias=True)
+            mx.eval(ctc_head.parameters())
+
+            if warm_start_ctc_head:
+                try:
+                    j_enc = model.joint.enc.weight          # (joint_hidden, 1024)
+                    j_enc_b = model.joint.enc.bias          # (joint_hidden,)
+                    j_out = model.joint.joint_net[2].weight  # (V+1+D, joint_hidden)
+                    j_out_b = model.joint.joint_net[2].bias  # (V+1+D,)
+                    # Take the first V+1 output rows (vocab + blank), drop durations
+                    j_out_v = j_out[: vocab_size + 1]
+                    j_out_b_v = j_out_b[: vocab_size + 1]
+                    # Compose: effective_W @ enc = j_out_v @ (j_enc @ enc + j_enc_b)
+                    #        = (j_out_v @ j_enc) @ enc + j_out_v @ j_enc_b
+                    effective_W = j_out_v @ j_enc                      # (V+1, 1024)
+                    effective_b = j_out_v @ j_enc_b + j_out_b_v        # (V+1,)
+                    ctc_head.weight = effective_W
+                    ctc_head.bias = effective_b
+                    mx.eval(ctc_head.parameters())
+                    print(f"  Parakeet: CTC head warm-started from joint network")
+                except Exception as e:
+                    warnings.warn(
+                        f"Could not warm-start CTC head from joint network: {e}. "
+                        "Falling back to random init."
+                    )
+            else:
+                print(f"  Parakeet: CTC head random init (warm_start_ctc_head=False)")
+
+            model.ctc_head = ctc_head
+            wrapper.ctc_head = ctc_head
+
+            wrapper.sp_tokenizer = model._sp_tokenizer
+            wrapper.sp_tokenizer_path = model._sp_tokenizer_path
+            wrapper.extended_chars = []
+            wrapper.aux_sp_tokenizer = None
+            wrapper.aux_sp_tokenizer_path = None
+            # Freeze BatchNorm running stats so they don't drift during training
+            bn_count = _set_batchnorm_eval(model.encoder)
+            print(f"  Parakeet: vocab_size={vocab_size}, blank={vocab_size}, "
+                  f"CTC head out_dim={vocab_size + 1}")
+            print(f"  Parakeet: froze {bn_count} BatchNorm modules in encoder.conv")
 
         print(f"STT model loaded: {model_name}")
         arch = profile.architecture if profile else "encoder_decoder"
@@ -411,6 +543,94 @@ class FastSTTModel:
             use_dora=use_dora,
         )
 
+        return model
+
+    @staticmethod
+    def get_full_finetune(
+        model: "STTModelWrapper",
+        train_encoder: bool = True,
+        train_decoder: bool = False,
+        train_joint: bool = True,
+        train_ctc_head: bool = True,
+    ) -> "STTModelWrapper":
+        """
+        Enable full-weight fine-tuning (no LoRA wrapping) on a Parakeet
+        model. Unlike `get_peft_model`, this trains the raw weights of
+        whichever submodules the user selects. Recommended for serious
+        new-language adaptation with 50+ hours of data and matches
+        NVIDIA's NeMo fine-tuning recipe.
+
+        Args:
+            model: STTModelWrapper from from_pretrained()
+            train_encoder: unfreeze the Conformer encoder (all 24 blocks)
+            train_decoder: unfreeze the LSTM prediction network (rare;
+                the LSTM doesn't have nn.Linear submodules that LoRA
+                can target, but full-weight SGD works)
+            train_joint: unfreeze the joint network (3 small Linears,
+                ~1.3M params; matches NeMo's default for RNN-T/TDT loss)
+            train_ctc_head: unfreeze the new CTC head (always True for
+                CTC-based training paths)
+
+        Returns:
+            The wrapper with the selected submodules unfrozen and
+            `lora_enabled = False`. Call the trainer as usual.
+        """
+        if not isinstance(model, STTModelWrapper):
+            raise TypeError(
+                f"Expected STTModelWrapper, got {type(model)}. "
+                "Use FastSTTModel.from_pretrained() first."
+            )
+        profile = model.profile
+        if profile is None or profile.architecture != "parakeet_tdt":
+            raise ValueError(
+                "get_full_finetune currently only supports parakeet_tdt models."
+            )
+
+        inner = model.model
+        inner.freeze()
+
+        parts = []
+        if train_encoder:
+            inner.encoder.unfreeze()
+            parts.append("encoder")
+        if train_decoder:
+            inner.decoder.unfreeze()
+            parts.append("decoder")
+        if train_joint:
+            inner.joint.unfreeze()
+            parts.append("joint")
+        if train_ctc_head:
+            model.ctc_head.unfreeze()
+            parts.append("ctc_head")
+
+        # Re-freeze BatchNorm running stats after full unfreeze
+        _set_batchnorm_eval(inner.encoder)
+
+        # Store a minimal lora_config so the trainer can route through its
+        # existing branch without needing LoRA application.
+        model.lora_config = {
+            "r": 0,
+            "lora_alpha": 0,
+            "target_modules": [],
+            "finetune_encoder": False,
+            "finetune_decoder": False,
+            "finetune_joint": False,
+            "fine_tune_type": "full",
+            "full_train_encoder": train_encoder,
+            "full_train_decoder": train_decoder,
+            "full_train_joint": train_joint,
+            "full_train_ctc_head": train_ctc_head,
+        }
+        model.lora_enabled = True  # trainer gate
+        model._lora_applied = True  # skip LoRA application
+
+        from mlx.utils import tree_flatten
+        trainable = tree_flatten(inner.trainable_parameters())
+        n_params = sum(v.size for _, v in trainable)
+        print(
+            f"Full fine-tune enabled on: {'+'.join(parts)}, "
+            f"{len(trainable)} parameter groups, {n_params:,} trainable params"
+        )
         return model
 
     @staticmethod
@@ -667,9 +887,24 @@ class STTModelWrapper:
         use_gradient_checkpointing: Union[bool, str] = "unsloth",
         random_state: int = 3407,
         use_dora: bool = False,
+        finetune_joint: bool = False,
         **kwargs,
     ):
         """Configure LoRA parameters for encoder-decoder model."""
+        # Parakeet TDT has no LoRA-friendly decoder (the decoder is a 2-layer
+        # LSTM prediction network with no nn.Linear submodules). Silently
+        # force finetune_decoder=False for this architecture so users can
+        # pass the default (True) without surprises.
+        is_parakeet = (
+            self.profile is not None and self.profile.architecture == "parakeet_tdt"
+        )
+        if is_parakeet and finetune_decoder:
+            print(
+                "  Note: parakeet_tdt has no LoRA-able decoder (LSTM prediction "
+                "network). Setting finetune_decoder=False."
+            )
+            finetune_decoder = False
+
         self.lora_config = {
             "r": r,
             "target_modules": target_modules or ["query", "key", "value", "out"],
@@ -678,6 +913,7 @@ class STTModelWrapper:
             "bias": bias,
             "finetune_encoder": finetune_encoder,
             "finetune_decoder": finetune_decoder,
+            "finetune_joint": finetune_joint,
             "use_gradient_checkpointing": use_gradient_checkpointing,
             "random_state": random_state,
             "use_dora": use_dora,
@@ -691,6 +927,8 @@ class STTModelWrapper:
             parts.append("encoder")
         if finetune_decoder:
             parts.append("decoder")
+        if is_parakeet and finetune_joint:
+            parts.append("joint")
         print(
             f"LoRA configuration set: rank={r}, alpha={lora_alpha}, "
             f"targets={'+'.join(parts)}, modules={target_modules}"
@@ -769,11 +1007,41 @@ class STTModelWrapper:
 
         self._lora_applied = True
 
+        # Parakeet: the CTC head (and optionally the joint network) must also be
+        # trainable. They are NOT LoRA-wrapped — they're full-weight.
+        is_parakeet = (
+            self.profile is not None and self.profile.architecture == "parakeet_tdt"
+        )
+        if is_parakeet:
+            # Unfreeze the CTC head — it's always trainable under Parakeet
+            if hasattr(self, "ctc_head") and self.ctc_head is not None:
+                self.ctc_head.unfreeze()
+
+            # Optional joint network fine-tuning (full-weight). Under CTC-only
+            # training this does nothing because `model.joint` isn't in the
+            # forward pass — we print a warning in that case.
+            if self.lora_config.get("finetune_joint", False):
+                if hasattr(self.model, "joint"):
+                    self.model.joint.unfreeze()
+                    print(
+                        "  Joint network: unfrozen for full-weight training "
+                        "(3 linear layers, ~1.3M params)"
+                    )
+
         # Count trainable parameters
         from mlx.utils import tree_flatten
         trainable = tree_flatten(self.model.trainable_parameters())
         lora_params = [k for k, _ in trainable if "lora" in k.lower()]
         print(f"LoRA applied: {len(lora_params)} trainable parameter groups ({total_replaced} layers replaced)")
+        if is_parakeet:
+            # Also count the parakeet-specific trainables (CTC head, optional joint)
+            head_params = sum(1 for k, _ in trainable if "ctc_head" in k)
+            joint_params = sum(1 for k, _ in trainable if "joint" in k)
+            if head_params or joint_params:
+                print(
+                    f"  Parakeet extras: CTC head params={head_params}, "
+                    f"joint params={joint_params}"
+                )
 
         return True
 
@@ -875,6 +1143,11 @@ class STTModelWrapper:
         Returns:
             Transcribed text
         """
+        # Parakeet: default to CTC greedy on the fine-tuned head. Users who
+        # want to compare against the native TDT path can call transcribe_tdt.
+        if self.profile and self.profile.architecture == "parakeet_tdt":
+            return self.transcribe_ctc(audio, **kwargs)
+
         if hasattr(self.model, "generate"):
             # Voxtral Realtime's generate() doesn't accept language/task; it
             # detects language internally. Filter unsupported kwargs.
@@ -898,6 +1171,689 @@ class STTModelWrapper:
             warnings.warn("Model does not have generate() method")
             return ""
 
+    def transcribe_ctc(
+        self,
+        audio: Union[str, np.ndarray, mx.array],
+        **kwargs,
+    ) -> str:
+        """
+        Parakeet-specific CTC greedy decoding via the fine-tuned CTC head.
+
+        Runs the Conformer encoder, applies the CTC head, takes argmax over
+        the vocab+blank output, then collapses repeats and drops blanks.
+        Decodes the token sequence via the (possibly extended) tokenizer.
+        """
+        if self.profile is None or self.profile.architecture != "parakeet_tdt":
+            raise ValueError(
+                "transcribe_ctc only works for parakeet_tdt models"
+            )
+        from mlx_audio.stt.models.parakeet.audio import log_mel_spectrogram
+        from mlx_audio.stt.utils import load_audio
+
+        # Load audio if it's a path
+        if isinstance(audio, (str, Path)):
+            audio_mx = load_audio(
+                str(audio), self.profile.sample_rate, dtype=mx.float32
+            )
+        elif isinstance(audio, np.ndarray):
+            audio_mx = mx.array(audio.astype(np.float32))
+        elif isinstance(audio, mx.array):
+            audio_mx = audio.astype(mx.float32)
+        else:
+            raise TypeError(f"Unsupported audio type: {type(audio)}")
+
+        # Compute mel spectrogram
+        mel = log_mel_spectrogram(audio_mx, self.model.preprocessor_config)
+        if mel.ndim == 3:
+            pass  # already batched
+        else:
+            mel = mel[None, :, :]
+        T_mel = mel.shape[1]
+        lengths = mx.array([T_mel], dtype=mx.int32)
+
+        # Encoder forward
+        self.model.eval()
+        enc_out, enc_lens = self.model.encoder(mel, lengths)
+        enc_T = int(enc_lens[0])
+
+        # CTC head forward
+        logits = self.model.ctc_head(enc_out)  # (1, T', V+1)
+        predictions = mx.argmax(logits[0, :enc_T], axis=-1)  # (T',)
+        mx.eval(predictions)
+        pred_list = [int(x) for x in predictions]
+
+        # Collapse repeats and drop blanks
+        blank_id = int(self.blank_id)
+        collapsed: List[int] = []
+        prev = -1
+        for token in pred_list:
+            if token == blank_id:
+                prev = -1
+                continue
+            if token != prev:
+                collapsed.append(token)
+                prev = token
+
+        # Decode via SP + extended chars
+        text = self._decode_token_ids(collapsed)
+        return text
+
+    def transcribe_tdt(
+        self,
+        audio: Union[str, np.ndarray, mx.array],
+        **kwargs,
+    ) -> str:
+        """
+        Parakeet's native TDT decoding — pass-through to model.generate().
+
+        This is the original NVIDIA decoding path, using the joint network
+        and LSTM prediction network. It is untouched by CTC-only fine-tuning,
+        so it continues to produce the same outputs for original languages
+        even after adaptation.
+        """
+        if self.profile is None or self.profile.architecture != "parakeet_tdt":
+            raise ValueError(
+                "transcribe_tdt only works for parakeet_tdt models"
+            )
+        # mlx-audio's Parakeet.generate() expects either a str path or an
+        # mx.array (not a numpy array). Convert numpy inputs here.
+        if isinstance(audio, np.ndarray):
+            audio = mx.array(audio.astype(np.float32))
+        result = self.model.generate(audio, **kwargs)
+        if hasattr(result, "text"):
+            return result.text
+        return str(result)
+
+    def stream_transcribe_ctc(
+        self,
+        audio: Union[str, np.ndarray, mx.array],
+        chunk_duration: float = 5.0,
+        overlap_duration: float = 1.0,
+        **kwargs,
+    ):
+        """
+        Streaming CTC transcription for Parakeet, chunk-by-chunk with overlap.
+
+        Mirrors Parakeet's native stream_generate but uses the fine-tuned
+        CTC head instead of the TDT decoder, so it works for newly-adapted
+        languages. Yields partial text as chunks are processed.
+        """
+        if self.profile is None or self.profile.architecture != "parakeet_tdt":
+            raise ValueError(
+                "stream_transcribe_ctc only works for parakeet_tdt models"
+            )
+        from mlx_audio.stt.utils import load_audio
+
+        sr = self.profile.sample_rate
+        if isinstance(audio, (str, Path)):
+            audio_arr = load_audio(str(audio), sr, dtype=mx.float32)
+        elif isinstance(audio, np.ndarray):
+            audio_arr = mx.array(audio.astype(np.float32))
+        else:
+            audio_arr = audio.astype(mx.float32)
+
+        total = int(audio_arr.shape[0])
+        chunk = int(chunk_duration * sr)
+        step = int((chunk_duration - overlap_duration) * sr)
+
+        accumulated = ""
+        prev_tail = ""
+        for start in range(0, total, step):
+            end = min(start + chunk, total)
+            seg = audio_arr[start:end]
+            text = self.transcribe_ctc(seg)
+            # Simple de-duplication: if the new text starts with the tail of
+            # the previous chunk, drop the overlap.
+            if prev_tail and text.startswith(prev_tail):
+                text = text[len(prev_tail):]
+            accumulated = accumulated + text
+            prev_tail = text[-min(len(text), 40):]  # small tail window
+            yield accumulated
+            if end >= total:
+                break
+
+    def _decode_token_ids(self, ids: List[int]) -> str:
+        """
+        Decode a list of token ids back to text, respecting both the base
+        SentencePiece tokenizer and any extended character/BPE tokens added
+        via `extend_vocabulary`.
+        """
+        # BPE extension path — use the aggregate decode closure
+        if getattr(self, "extension_strategy", None) == "bpe" and hasattr(
+            self, "_decode_token_ids_extended"
+        ):
+            return self._decode_token_ids_extended(ids)
+
+        # Char extension path (or no extension)
+        sp = self.sp_tokenizer
+        base_size = sp.get_piece_size()
+        extended = getattr(self, "extended_chars", [])
+        parts: List[str] = []
+        sp_buffer: List[int] = []
+
+        def flush_buffer():
+            if sp_buffer:
+                parts.append(sp.decode(sp_buffer))
+                sp_buffer.clear()
+
+        # Layout: [0..base_size-1] = SP, [base_size] = blank (skipped earlier),
+        # [base_size+1..base_size+N] = extended chars
+        for idx in ids:
+            if idx == self.blank_id:
+                continue
+            if idx < base_size:
+                sp_buffer.append(idx)
+                continue
+            # Extended char position
+            ext_index = idx - (base_size + 1)
+            if 0 <= ext_index < len(extended):
+                flush_buffer()
+                parts.append(extended[ext_index])
+        flush_buffer()
+        return "".join(parts)
+
+    # ------------------------------------------------------------------
+    # Parakeet vocabulary extension
+    #
+    # Parakeet v3's SentencePiece BPE vocabulary covers Latin, Cyrillic, and
+    # Greek scripts. To fine-tune on a language that uses other scripts
+    # (Arabic, Bengali, Devanagari, CJK, Hebrew, Thai, ...), we need to
+    # extend the output vocabulary with new tokens and resize three model
+    # layers: the CTC head (for the CTC loss path), the decoder embedding
+    # (for TDT / RNN-T paths), and the joint network's output projection.
+    #
+    # Two strategies are supported:
+    #   - "char"  : add every missing Unicode character from the dataset as
+    #               a single-character token (fully automated, works for
+    #               any language with zero user effort)
+    #   - "bpe"   : train a new SentencePiece BPE model on the new-language
+    #               corpus, then combine it with the original via an
+    #               aggregate tokenizer (better token efficiency, needs
+    #               sufficient text to train SentencePiece)
+    # ------------------------------------------------------------------
+
+    def extend_vocabulary(
+        self,
+        texts: List[str],
+        strategy: str = "char",
+        min_count: int = 1,
+        max_new_tokens: int = 8000,
+        bpe_vocab_size: int = 1000,
+        bpe_model_prefix: str = "aux_bpe",
+        verbose: bool = True,
+    ) -> List[str]:
+        """
+        Automatically extend the Parakeet vocabulary to cover characters or
+        subwords found in `texts`.
+
+        Args:
+            texts: Training transcripts (or any representative corpus).
+            strategy: "char" (default, fully automatic) or "bpe" (trains a
+                new SentencePiece model on your corpus and combines it with
+                the pretrained tokenizer via an aggregate wrapper).
+            min_count: For "char" strategy, only add chars occurring at least
+                this many times. Filters typos and rare chars.
+            max_new_tokens: Safety cap on how many new tokens to add. For CJK
+                (Chinese, Japanese, Korean) you may need to raise this.
+            bpe_vocab_size: For "bpe" strategy, how many new BPE pieces to
+                learn. Typical range: 500-2000. Too small = poor coverage,
+                too large = slow training.
+            bpe_model_prefix: Filename prefix for the trained SP model.
+            verbose: Print progress.
+
+        Returns:
+            List of newly added tokens (characters for "char", pieces for
+            "bpe"). Empty if no new tokens were needed.
+        """
+        if self.profile is None or self.profile.architecture != "parakeet_tdt":
+            raise ValueError(
+                "extend_vocabulary is currently only supported for Parakeet models."
+            )
+        if strategy == "char":
+            return self._extend_vocab_char(
+                texts, min_count=min_count, max_new_tokens=max_new_tokens, verbose=verbose
+            )
+        elif strategy == "bpe":
+            return self._extend_vocab_bpe(
+                texts,
+                bpe_vocab_size=bpe_vocab_size,
+                bpe_model_prefix=bpe_model_prefix,
+                verbose=verbose,
+            )
+        else:
+            raise ValueError(
+                f"Unknown extension strategy {strategy!r}. "
+                "Use 'char' (automatic) or 'bpe' (retrain SentencePiece)."
+            )
+
+    def _extend_vocab_char(
+        self,
+        texts: List[str],
+        min_count: int = 1,
+        max_new_tokens: int = 8000,
+        verbose: bool = True,
+    ) -> List[str]:
+        """
+        Character-level vocabulary extension. Detects every Unicode character
+        that the current tokenizer encodes as UNK, adds each as a new
+        single-character token, and resizes the CTC head / joint output /
+        decoder embedding in lockstep.
+
+        The new tokens occupy ids `[blank + 1, blank + 2, ..., blank + N]`.
+        Blank stays at its original position (equal to `vocab_size`), so
+        existing code paths that reference `self.blank_id` keep working.
+        """
+        import unicodedata
+        sp = self.sp_tokenizer
+        unk_id = sp.unk_id()
+
+        # 1. Count all characters in the dataset
+        counts: Dict[str, int] = {}
+        for text in texts:
+            norm = unicodedata.normalize("NFC", text)
+            for ch in norm:
+                if ch.isspace():
+                    continue
+                cat = unicodedata.category(ch)
+                if cat.startswith("C"):  # control, format, etc.
+                    continue
+                counts[ch] = counts.get(ch, 0) + 1
+
+        # 2. Identify characters the SP tokenizer cannot encode
+        # (returns UNK or empty). Filter by min_count.
+        missing: List[str] = []
+        for ch, cnt in counts.items():
+            if cnt < min_count:
+                continue
+            ids = sp.encode(ch, out_type=int)
+            if not ids or unk_id in ids:
+                missing.append(ch)
+
+        if not missing:
+            if verbose:
+                print("extend_vocabulary: no missing characters — vocabulary is sufficient")
+            return []
+
+        # 3. Sort by frequency (most frequent first) and cap
+        missing.sort(key=lambda c: -counts[c])
+        if len(missing) > max_new_tokens:
+            if verbose:
+                print(
+                    f"extend_vocabulary: {len(missing)} missing chars exceeds "
+                    f"max_new_tokens={max_new_tokens}, keeping top-K by frequency"
+                )
+            missing = missing[:max_new_tokens]
+
+        if verbose:
+            preview = "".join(missing[:30])
+            print(f"extend_vocabulary: adding {len(missing)} new characters")
+            print(f"  Most-frequent preview: {preview}")
+
+        # 4. Resize CTC head, joint output projection, and decoder embedding
+        self._install_char_extension(missing)
+
+        if verbose:
+            print(
+                f"  CTC head output dim: {self.ctc_head.weight.shape[0]}, "
+                f"joint output dim: {self.model.joint.joint_net[2].weight.shape[0]}, "
+                f"decoder embed rows: {self.model.decoder.prediction['embed'].weight.shape[0]}"
+            )
+
+        return missing
+
+    def _install_char_extension(self, new_chars: List[str]):
+        """
+        Resize the CTC head, joint output projection, and decoder embedding
+        to accommodate `new_chars`, then install an extended tokenizer
+        wrapper on the wrapper for encode/decode.
+
+        Invariants preserved:
+          - First `vocab_size + 1` rows of CTC head / joint output unchanged
+          - First `vocab_size + 1` rows of decoder embedding unchanged
+          - Blank stays at position `blank_id` (== old vocab_size)
+          - New tokens start at position `blank_id + 1`
+        """
+        N = len(new_chars)
+        if N == 0:
+            return
+
+        old_blank = self.blank_id
+        old_out_dim = old_blank + 1  # V + 1 (vocab + blank)
+        new_total = old_out_dim + N
+
+        # ---- Resize CTC head ----
+        old_ctc = self.ctc_head
+        in_dim = old_ctc.weight.shape[1]
+        new_ctc = nn.Linear(in_dim, new_total, bias=old_ctc.bias is not None)
+        mx.eval(new_ctc.parameters())
+        # Copy old rows + new random rows (small scale)
+        new_rows_w = mx.random.normal(
+            (N, in_dim), dtype=old_ctc.weight.dtype
+        ) * 0.02
+        new_ctc.weight = mx.concatenate([old_ctc.weight, new_rows_w], axis=0)
+        if old_ctc.bias is not None:
+            new_rows_b = mx.zeros((N,), dtype=old_ctc.bias.dtype)
+            new_ctc.bias = mx.concatenate([old_ctc.bias, new_rows_b], axis=0)
+        mx.eval(new_ctc.parameters())
+        self.model.ctc_head = new_ctc
+        self.ctc_head = new_ctc
+
+        # ---- Resize joint output projection ----
+        old_joint_out = self.model.joint.joint_net[2]
+        joint_hidden = old_joint_out.weight.shape[1]
+        old_joint_out_dim = old_joint_out.weight.shape[0]  # V+1+D
+        # We add N rows AT POSITION old_blank+1, but keeping the blank at
+        # the same index and duration bins at the END. Since new tokens
+        # sit BETWEEN blank and duration bins, we need to splice:
+        #   [vocab (V), blank (1), NEW (N), durations (D)]
+        # The original had [vocab (V), blank (1), durations (D)].
+        old_tokens_blank = old_joint_out.weight[:old_out_dim]
+        old_tokens_blank_b = old_joint_out.bias[:old_out_dim]
+        old_durations = old_joint_out.weight[old_out_dim:]
+        old_durations_b = old_joint_out.bias[old_out_dim:]
+        new_joint_rows = mx.random.normal(
+            (N, joint_hidden), dtype=old_joint_out.weight.dtype
+        ) * 0.02
+        new_joint_rows_b = mx.zeros(
+            (N,), dtype=old_joint_out.bias.dtype
+        )
+        merged_w = mx.concatenate(
+            [old_tokens_blank, new_joint_rows, old_durations], axis=0
+        )
+        merged_b = mx.concatenate(
+            [old_tokens_blank_b, new_joint_rows_b, old_durations_b], axis=0
+        )
+        new_joint_out = nn.Linear(
+            joint_hidden, old_joint_out_dim + N, bias=True
+        )
+        mx.eval(new_joint_out.parameters())
+        new_joint_out.weight = merged_w
+        new_joint_out.bias = merged_b
+        mx.eval(new_joint_out.parameters())
+        self.model.joint.joint_net[2] = new_joint_out
+        self.model.joint._num_classes = old_joint_out_dim + N
+
+        # ---- Resize decoder embedding ----
+        old_embed = self.model.decoder.prediction["embed"]
+        emb_dim = old_embed.weight.shape[1]
+        old_emb_rows = old_embed.weight.shape[0]  # V + 1 (includes blank pad)
+        new_embed = nn.Embedding(old_emb_rows + N, emb_dim)
+        mx.eval(new_embed.parameters())
+        new_emb_rows = mx.random.normal(
+            (N, emb_dim), dtype=old_embed.weight.dtype
+        ) * 0.02
+        new_embed.weight = mx.concatenate(
+            [old_embed.weight, new_emb_rows], axis=0
+        )
+        mx.eval(new_embed.parameters())
+        self.model.decoder.prediction["embed"] = new_embed
+
+        # ---- Update bookkeeping and install extended tokenizer ----
+        self.extended_chars = list(new_chars)
+        self.extension_strategy = "char"
+        self.vocab_size = old_blank + N  # new vocab size (non-blank slots)
+        # blank_id stays the same — blank still lives at old position
+
+        # Build a simple character-to-id map
+        self._extended_char_to_id: Dict[str, int] = {
+            ch: old_out_dim + i for i, ch in enumerate(new_chars)
+        }
+
+        # Install a custom encode function that handles mixed SP + new chars
+        import unicodedata as _unicodedata
+        _sp = self.sp_tokenizer  # capture into closure
+
+        def _encode_text(text: str) -> List[int]:
+            """
+            Encode text using SentencePiece for known chars and direct
+            per-char lookup for extended chars. Flushes the SP buffer on
+            each extended-char boundary to maintain order.
+            """
+            norm = _unicodedata.normalize("NFC", text)
+            result: List[int] = []
+            buf: List[str] = []
+            for ch in norm:
+                if ch in self._extended_char_to_id:
+                    if buf:
+                        span = "".join(buf)
+                        result.extend(_sp.encode(span, out_type=int))
+                        buf = []
+                    result.append(self._extended_char_to_id[ch])
+                else:
+                    buf.append(ch)
+            if buf:
+                result.extend(_sp.encode("".join(buf), out_type=int))
+            return result
+
+        self._encode_text = _encode_text
+
+    def _extend_vocab_bpe(
+        self,
+        texts: List[str],
+        bpe_vocab_size: int = 1000,
+        bpe_model_prefix: str = "aux_bpe",
+        verbose: bool = True,
+    ) -> List[str]:
+        """
+        Train a new SentencePiece BPE model on `texts` and combine it with
+        the existing Parakeet tokenizer via an aggregate wrapper. Adds
+        `bpe_vocab_size` new tokens to the vocabulary and resizes the three
+        output layers.
+
+        NOTE: SentencePiece needs enough text to converge. With <100 lines
+        of transcripts, BPE training is noisy and you may want to fall back
+        to `strategy='char'`. We raise ValueError when text is too short.
+        """
+        import sentencepiece as spm
+        import tempfile
+        import os as _os
+
+        if len(texts) < 30:
+            raise ValueError(
+                f"BPE extension needs at least 30 text lines; got {len(texts)}. "
+                "Use strategy='char' for smaller datasets."
+            )
+
+        # Write corpus to a temp file for the SP trainer
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            for text in texts:
+                if text.strip():
+                    f.write(text.strip() + "\n")
+            corpus_path = f.name
+
+        output_dir = tempfile.mkdtemp(prefix="mlx_tune_bpe_")
+        output_prefix = _os.path.join(output_dir, bpe_model_prefix)
+
+        try:
+            # Train the auxiliary SentencePiece BPE model
+            spm.SentencePieceTrainer.train(
+                input=corpus_path,
+                model_prefix=output_prefix,
+                vocab_size=bpe_vocab_size,
+                character_coverage=1.0,
+                model_type="bpe",
+                normalization_rule_name="nmt_nfkc",
+                bos_id=-1,
+                eos_id=-1,
+                pad_id=-1,
+                unk_id=0,
+            )
+        finally:
+            try:
+                _os.unlink(corpus_path)
+            except OSError:
+                pass
+
+        aux_sp_path = output_prefix + ".model"
+        aux_sp = spm.SentencePieceProcessor()
+        aux_sp.load(aux_sp_path)
+        actual_bpe_size = aux_sp.get_piece_size()
+
+        if verbose:
+            print(f"extend_vocabulary: trained BPE with {actual_bpe_size} pieces")
+
+        # Install the BPE extension (resize layers + aggregate tokenizer)
+        self._install_bpe_extension(
+            aux_sp_path=aux_sp_path, n_new_tokens=actual_bpe_size
+        )
+
+        if verbose:
+            print(
+                f"  CTC head output dim: {self.ctc_head.weight.shape[0]}, "
+                f"joint output dim: {self.model.joint.joint_net[2].weight.shape[0]}, "
+                f"decoder embed rows: {self.model.decoder.prediction['embed'].weight.shape[0]}"
+            )
+
+        # Return the list of BPE pieces (for introspection)
+        return [aux_sp.id_to_piece(i) for i in range(actual_bpe_size)]
+
+    def _install_bpe_extension(self, aux_sp_path: str, n_new_tokens: int):
+        """
+        Resize CTC head / joint output / decoder embedding by `n_new_tokens`,
+        then install an aggregate tokenizer that combines the pretrained
+        SentencePiece with the newly-trained BPE model.
+
+        Encode path: try the aux BPE first; if it produces fewer UNKs than
+        the pretrained SP, use the aux result. Otherwise fall back to SP.
+        Decode path: dispatch by id range — < old_blank = pretrained SP,
+        > old_blank = aux BPE (subtract offset).
+        """
+        import sentencepiece as spm
+        N = int(n_new_tokens)
+        if N <= 0:
+            return
+
+        # Resize heads via the same helper mechanism used for char extension,
+        # but store strategy = "bpe" and create a different encoder closure.
+        # We reuse the resize logic manually.
+
+        old_blank = self.blank_id
+        old_out_dim = old_blank + 1
+        new_total = old_out_dim + N
+
+        old_ctc = self.ctc_head
+        in_dim = old_ctc.weight.shape[1]
+        new_ctc = nn.Linear(in_dim, new_total, bias=old_ctc.bias is not None)
+        mx.eval(new_ctc.parameters())
+        new_rows_w = mx.random.normal(
+            (N, in_dim), dtype=old_ctc.weight.dtype
+        ) * 0.02
+        new_ctc.weight = mx.concatenate([old_ctc.weight, new_rows_w], axis=0)
+        if old_ctc.bias is not None:
+            new_rows_b = mx.zeros((N,), dtype=old_ctc.bias.dtype)
+            new_ctc.bias = mx.concatenate([old_ctc.bias, new_rows_b], axis=0)
+        mx.eval(new_ctc.parameters())
+        self.model.ctc_head = new_ctc
+        self.ctc_head = new_ctc
+
+        old_joint_out = self.model.joint.joint_net[2]
+        joint_hidden = old_joint_out.weight.shape[1]
+        old_joint_out_dim = old_joint_out.weight.shape[0]
+        old_tokens_blank = old_joint_out.weight[:old_out_dim]
+        old_tokens_blank_b = old_joint_out.bias[:old_out_dim]
+        old_durations = old_joint_out.weight[old_out_dim:]
+        old_durations_b = old_joint_out.bias[old_out_dim:]
+        new_joint_rows = mx.random.normal(
+            (N, joint_hidden), dtype=old_joint_out.weight.dtype
+        ) * 0.02
+        new_joint_rows_b = mx.zeros((N,), dtype=old_joint_out.bias.dtype)
+        merged_w = mx.concatenate(
+            [old_tokens_blank, new_joint_rows, old_durations], axis=0
+        )
+        merged_b = mx.concatenate(
+            [old_tokens_blank_b, new_joint_rows_b, old_durations_b], axis=0
+        )
+        new_joint_out = nn.Linear(joint_hidden, old_joint_out_dim + N, bias=True)
+        mx.eval(new_joint_out.parameters())
+        new_joint_out.weight = merged_w
+        new_joint_out.bias = merged_b
+        mx.eval(new_joint_out.parameters())
+        self.model.joint.joint_net[2] = new_joint_out
+        self.model.joint._num_classes = old_joint_out_dim + N
+
+        old_embed = self.model.decoder.prediction["embed"]
+        emb_dim = old_embed.weight.shape[1]
+        old_emb_rows = old_embed.weight.shape[0]
+        new_embed = nn.Embedding(old_emb_rows + N, emb_dim)
+        mx.eval(new_embed.parameters())
+        new_emb_rows = mx.random.normal(
+            (N, emb_dim), dtype=old_embed.weight.dtype
+        ) * 0.02
+        new_embed.weight = mx.concatenate([old_embed.weight, new_emb_rows], axis=0)
+        mx.eval(new_embed.parameters())
+        self.model.decoder.prediction["embed"] = new_embed
+
+        # Load auxiliary SP and attach it to the wrapper
+        aux_sp = spm.SentencePieceProcessor()
+        aux_sp.load(aux_sp_path)
+        self.aux_sp_tokenizer = aux_sp
+        self.aux_sp_tokenizer_path = aux_sp_path
+        self.extended_chars = []  # BPE extension uses aux SP, not char list
+        self.extension_strategy = "bpe"
+        self.vocab_size = old_blank + N
+
+        # Build aggregate encoder closure. For each input text, try to
+        # encode with the aux BPE; if that yields zero UNKs, use it and
+        # shift ids to the [old_out_dim, old_out_dim + N - 1] range. If
+        # the aux BPE has UNKs, fall back to the pretrained SP for that
+        # span. In practice the aux is trained for the new language so
+        # its coverage is high for target-language text.
+        sp = self.sp_tokenizer
+        sp_unk = sp.unk_id()
+        aux_unk = aux_sp.unk_id()
+
+        def _encode_text(text: str) -> List[int]:
+            # Try aux BPE first
+            aux_ids = aux_sp.encode(text, out_type=int)
+            aux_unk_count = sum(1 for i in aux_ids if i == aux_unk)
+            # Also encode with pretrained SP as a baseline
+            sp_ids = sp.encode(text, out_type=int)
+            sp_unk_count = sum(1 for i in sp_ids if i == sp_unk)
+            # Prefer whichever has fewer UNKs; tie-breaker: shorter sequence
+            if aux_unk_count < sp_unk_count or (
+                aux_unk_count == sp_unk_count and len(aux_ids) <= len(sp_ids)
+            ):
+                return [old_out_dim + i for i in aux_ids]
+            return sp_ids
+
+        self._encode_text = _encode_text
+
+        # Override decode to also handle the aux range
+        old_decode = self._decode_token_ids
+
+        def _decode_extended(ids: List[int]) -> str:
+            parts: List[str] = []
+            sp_buffer: List[int] = []
+            aux_buffer: List[int] = []
+
+            def flush_sp():
+                if sp_buffer:
+                    parts.append(sp.decode(sp_buffer))
+                    sp_buffer.clear()
+
+            def flush_aux():
+                if aux_buffer:
+                    parts.append(aux_sp.decode(aux_buffer))
+                    aux_buffer.clear()
+
+            for idx in ids:
+                if idx == self.blank_id:
+                    continue
+                if idx < old_out_dim - 1:  # pretrained SP range
+                    flush_aux()
+                    sp_buffer.append(idx)
+                elif idx >= old_out_dim:  # aux BPE range
+                    flush_sp()
+                    aux_buffer.append(idx - old_out_dim)
+                # idx == old_out_dim - 1 is blank, already skipped above
+            flush_sp()
+            flush_aux()
+            return "".join(parts)
+
+        self._decode_token_ids_extended = _decode_extended
+
     def save_pretrained(self, output_dir: str, **kwargs):
         """Save LoRA adapters and configuration."""
         output_path = Path(output_dir)
@@ -915,18 +1871,27 @@ class STTModelWrapper:
             )
 
             # Save adapter config
+            _r = int(self.lora_config.get("r", 0) or 0)
+            _alpha = int(self.lora_config.get("lora_alpha", 0) or 0)
+            _scale = (_alpha / _r) if _r > 0 else 0.0
+            _fine_tune_type = self.lora_config.get("fine_tune_type", "lora")
             adapter_config = {
                 "model_name": self.model_name,
                 "model_type": "stt",
-                "fine_tune_type": "lora",
+                "fine_tune_type": _fine_tune_type,
                 "lora_parameters": {
-                    "rank": self.lora_config["r"],
-                    "alpha": self.lora_config["lora_alpha"],
+                    "rank": _r,
+                    "alpha": _alpha,
                     "dropout": self.lora_config.get("lora_dropout", 0.0),
-                    "scale": self.lora_config["lora_alpha"] / self.lora_config["r"],
+                    "scale": _scale,
                     "target_modules": self.lora_config.get("target_modules", []),
                     "finetune_encoder": self.lora_config.get("finetune_encoder", True),
                     "finetune_decoder": self.lora_config.get("finetune_decoder", True),
+                    "finetune_joint": self.lora_config.get("finetune_joint", False),
+                    "full_train_encoder": self.lora_config.get("full_train_encoder", False),
+                    "full_train_decoder": self.lora_config.get("full_train_decoder", False),
+                    "full_train_joint": self.lora_config.get("full_train_joint", False),
+                    "full_train_ctc_head": self.lora_config.get("full_train_ctc_head", False),
                 },
                 "whisper_config": {
                     "n_audio_layer": self.n_audio_layer,
@@ -937,6 +1902,26 @@ class STTModelWrapper:
                     "max_seq_length": self.max_seq_length,
                 },
             }
+
+            # Parakeet-specific state: CTC head dim, extended chars, aux BPE
+            if self.profile is not None and self.profile.architecture == "parakeet_tdt":
+                adapter_config["parakeet_config"] = {
+                    "vocab_size": int(self.vocab_size),
+                    "blank_id": int(self.blank_id),
+                    "ctc_head_out_dim": int(self.ctc_head.weight.shape[0]),
+                    "extended_chars": list(getattr(self, "extended_chars", [])),
+                    "extension_strategy": getattr(self, "extension_strategy", None),
+                    "aux_sp_included": getattr(self, "aux_sp_tokenizer", None) is not None,
+                }
+                # If we have an aux SP model, copy its binary file into the adapter dir
+                aux_path = getattr(self, "aux_sp_tokenizer_path", None)
+                if aux_path:
+                    import shutil
+                    try:
+                        shutil.copy(aux_path, str(output_path / "aux_sentencepiece.model"))
+                    except Exception as e:
+                        warnings.warn(f"Could not copy aux SP model: {e}")
+
             with open(output_path / "adapter_config.json", "w") as f:
                 json.dump(adapter_config, f, indent=2)
 
@@ -1051,9 +2036,26 @@ class STTModelWrapper:
 
         # Load adapter config
         config_path = adapter_dir / "adapter_config.json"
+        parakeet_cfg = None
         if config_path.exists():
             with open(config_path) as f:
                 adapter_config = json.load(f)
+
+            # Parakeet: replay vocab extension BEFORE applying LoRA so the
+            # resized CTC head / joint / embed dimensions match what was saved.
+            parakeet_cfg = adapter_config.get("parakeet_config")
+            if parakeet_cfg and self.profile is not None and self.profile.architecture == "parakeet_tdt":
+                extended_chars = parakeet_cfg.get("extended_chars", [])
+                strategy = parakeet_cfg.get("extension_strategy")
+                if strategy == "bpe" and (adapter_dir / "aux_sentencepiece.model").exists():
+                    # BPE-extended vocab: re-install the aux tokenizer from disk
+                    self._install_bpe_extension(
+                        aux_sp_path=str(adapter_dir / "aux_sentencepiece.model"),
+                        n_new_tokens=parakeet_cfg.get("ctc_head_out_dim", self.vocab_size + 1) - (self.vocab_size + 1),
+                    )
+                elif extended_chars:
+                    # Char-extended vocab: just add the characters back
+                    self._install_char_extension(extended_chars)
 
             # Restore LoRA config for re-application
             lora_params = adapter_config.get("lora_parameters", {})
@@ -1065,6 +2067,7 @@ class STTModelWrapper:
                     target_modules=lora_params.get("target_modules", []),
                     finetune_encoder=lora_params.get("finetune_encoder", True),
                     finetune_decoder=lora_params.get("finetune_decoder", True),
+                    finetune_joint=lora_params.get("finetune_joint", False),
                 )
 
         # Load weights
@@ -1160,6 +2163,11 @@ class STTSFTConfig:
         task: str = "transcribe",
         max_audio_length: float = 30.0,
         n_mels: int = 80,
+        # Parakeet-specific training config
+        loss_type: str = "ctc",
+        ctc_weight: float = 0.3,
+        tdt_weight: float = 1.0,
+        ctc_head_warmup_steps: int = 0,
         **kwargs,
     ):
         self.per_device_train_batch_size = per_device_train_batch_size
@@ -1178,6 +2186,18 @@ class STTSFTConfig:
         self.task = task
         self.max_audio_length = max_audio_length
         self.n_mels = n_mels
+
+        # Parakeet-specific: loss selection and hybrid weights.
+        # loss_type must be one of "ctc" | "rnnt" | "tdt" | "hybrid".
+        # For non-parakeet architectures this field is ignored.
+        if loss_type not in {"ctc", "rnnt", "tdt", "hybrid"}:
+            raise ValueError(
+                f"loss_type must be one of ctc/rnnt/tdt/hybrid, got {loss_type!r}"
+            )
+        self.loss_type = loss_type
+        self.ctc_weight = ctc_weight
+        self.tdt_weight = tdt_weight
+        self.ctc_head_warmup_steps = ctc_head_warmup_steps
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -1264,6 +2284,8 @@ class STTDataCollator:
             return self._collate_voxtral_realtime(samples)
         if arch == "audio_llm":
             return self._collate_audio_llm(samples)
+        if arch == "parakeet_tdt":
+            return self._collate_parakeet_tdt(samples)
         return self._collate_encoder_decoder(samples)
 
     def _collate_encoder_decoder(self, samples: List[Dict]) -> Dict:
@@ -1336,6 +2358,160 @@ class STTDataCollator:
                 result[key] = processed[0][key]
 
         return result
+
+    def _collate_parakeet_tdt(self, samples: List[Dict]) -> Dict:
+        """
+        Collate for Parakeet TDT: builds (mel, input_lengths, targets, target_lengths).
+
+        Parakeet uses variable-length audio with the FastConformer encoder's
+        internal length tracking, so we do NOT pad_or_trim. We compute the
+        parakeet log-mel spectrogram for each sample, stack with zero-padding
+        along T, and record actual mel lengths. Targets are SentencePiece
+        token ids with -100 padding.
+
+        For v1 we enforce batch_size=1 so we don't need to handle ragged mel
+        tensors inside MLX; Parakeet's CTC/TDT loss are already per-sample.
+
+        Raises ValueError if the audio after `max_audio_samples` clamping is
+        too short to hold the transcript (CTC requires T_enc >= 2*U+1).
+        Users should pre-filter their dataset to avoid this.
+        """
+        if len(samples) > 1:
+            # For safety we still do the right thing: process only the first
+            # sample and warn. This mirrors how voxtral_realtime enforces B=1.
+            warnings.warn(
+                "Parakeet TDT training forces batch_size=1 (variable audio length). "
+                "Extra samples will be dropped from the batch.",
+                UserWarning,
+            )
+            samples = samples[:1]
+
+        processed = [self._process_parakeet_sample(s) for s in samples]
+
+        # CTC feasibility check: T_enc = (mel_frames / subsampling_factor).
+        # For Parakeet v3 the subsampling factor is 8. CTC needs T_enc >= 2*U+1.
+        subsampling = 8
+        for p in processed:
+            t_enc_est = p["input_length"] // subsampling
+            u = len(p["tokens"])
+            if t_enc_est < 2 * u + 1:
+                raise ValueError(
+                    f"Parakeet CTC infeasibility: encoder will produce ~{t_enc_est} "
+                    f"frames but the transcript has {u} tokens (needs >= "
+                    f"{2 * u + 1}). Pre-filter your dataset to drop samples where "
+                    f"the audio is too short for the text, or raise "
+                    f"profile.max_audio_samples. Offending text: "
+                    f"{self.model.sp_tokenizer.decode(p['tokens'])[:80]!r}"
+                )
+        # processed[i] = {"mel": (T, 128), "input_length": int, "tokens": [...]}
+
+        mel_list = [p["mel"] for p in processed]
+        lengths_list = [int(p["input_length"]) for p in processed]
+        token_lists = [p["tokens"] for p in processed]
+
+        max_T = max(m.shape[0] for m in mel_list)
+        n_mels = mel_list[0].shape[1]
+        padded_mel = mx.zeros((len(mel_list), max_T, n_mels), dtype=mel_list[0].dtype)
+        for i, m in enumerate(mel_list):
+            t = m.shape[0]
+            # Build by concatenation since MLX arrays are immutable at the
+            # Python level. For B=1 this is trivial.
+            prefix = padded_mel[:i]
+            tail = padded_mel[i + 1:]
+            row = mx.concatenate(
+                [m, mx.zeros((max_T - t, n_mels), dtype=m.dtype)], axis=0
+            )[None, :, :]
+            padded_mel = mx.concatenate([prefix, row, tail], axis=0)
+
+        max_U = max(len(t) for t in token_lists)
+        padded_targets = []
+        target_lengths = []
+        for tokens in token_lists:
+            pad_len = max_U - len(tokens)
+            padded_targets.append(list(tokens) + [0] * pad_len)
+            target_lengths.append(len(tokens))
+
+        return {
+            "mel": padded_mel,
+            "input_lengths": mx.array(lengths_list, dtype=mx.int32),
+            "targets": mx.array(padded_targets, dtype=mx.int32),
+            "target_lengths": mx.array(target_lengths, dtype=mx.int32),
+        }
+
+    def _process_parakeet_sample(self, sample: Dict) -> Dict:
+        """
+        Process a single audio+text sample for Parakeet fine-tuning.
+
+        Returns a dict with:
+          - "mel": (T, 128) mx.array
+          - "input_length": int (number of mel frames)
+          - "tokens": list[int] SentencePiece token ids
+        """
+        from mlx_audio.stt.models.parakeet.audio import log_mel_spectrogram
+
+        # Load and resample audio
+        audio_data = sample.get(self.audio_column)
+        if audio_data is None:
+            raise ValueError(f"Sample missing '{self.audio_column}' column")
+
+        target_sr = self.model.profile.sample_rate
+
+        if isinstance(audio_data, dict):
+            audio_array = np.array(
+                audio_data.get("array", audio_data.get("data")), dtype=np.float32
+            )
+            sr = audio_data.get("sampling_rate", target_sr)
+        elif isinstance(audio_data, np.ndarray):
+            audio_array = audio_data.astype(np.float32)
+            sr = target_sr
+        else:
+            audio_array = np.array(audio_data, dtype=np.float32)
+            sr = target_sr
+
+        if sr != target_sr:
+            try:
+                from mlx_audio.stt.utils import resample_audio
+                audio_array = resample_audio(audio_array, sr, target_sr)
+            except ImportError:
+                import librosa
+                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=target_sr)
+
+        # Cap audio at profile.max_audio_samples to avoid runaway T
+        max_samples = self.model.profile.max_audio_samples
+        if max_samples > 0 and len(audio_array) > max_samples:
+            audio_array = audio_array[:max_samples]
+
+        # Compute Parakeet log-mel spectrogram.
+        # log_mel_spectrogram returns (1, T, n_mels) already batched.
+        audio_mx = mx.array(audio_array)
+        mel_batched = log_mel_spectrogram(audio_mx, self.model.model.preprocessor_config)
+        if mel_batched.ndim == 3 and mel_batched.shape[0] == 1:
+            mel = mel_batched[0]  # (T, 128)
+        else:
+            mel = mel_batched
+        input_length = mel.shape[0]
+
+        # Encode text
+        text_col = self._find_text_column(sample)
+        text = sample[text_col]
+        if not isinstance(text, str):
+            text = str(text)
+
+        # Use the extended tokenizer on the wrapper if vocab extension is active;
+        # otherwise fall back to raw SentencePiece.
+        if hasattr(self.model, "_encode_text"):
+            tokens = self.model._encode_text(text)
+        else:
+            tokens = list(self.model.sp_tokenizer.encode(text, out_type=int))
+
+        if len(tokens) == 0:
+            raise ValueError(f"Empty tokenization for text: {text!r}")
+
+        return {
+            "mel": mel,
+            "input_length": input_length,
+            "tokens": tokens,
+        }
 
     def _process_sample(self, sample: Dict) -> Tuple[mx.array, List[int], List[int]]:
         """Process a single sample into audio features, decoder_input_ids, and labels."""
@@ -1754,6 +2930,12 @@ class STTSFTTrainer:
         self.data_collator = data_collator
         self.train_dataset = train_dataset
 
+        # Keep a reference to the config object so parakeet-specific fields
+        # (loss_type, ctc_weight, tdt_weight, ctc_head_warmup_steps) are
+        # reachable from the training loop.
+        self.args = args
+        self.config = args  # alias for convenience
+
         # Parse training args
         if args is not None:
             self.learning_rate = getattr(args, "learning_rate", 1e-5)
@@ -1814,6 +2996,14 @@ class STTSFTTrainer:
         # Set training mode
         train_model.train()
 
+        # Parakeet: re-freeze BatchNorm after train(). `model.train()` toggles
+        # training=True on every module including the Conformer conv BNs,
+        # which would re-enable running stat updates. We want those frozen
+        # for the entire fine-tune run so the pretrained encoder's feature
+        # statistics are preserved.
+        if _arch == "parakeet_tdt":
+            _set_batchnorm_eval(train_model.encoder)
+
         # Optimizer
         optimizer = optim.Adam(learning_rate=self.learning_rate)
 
@@ -1836,9 +3026,87 @@ class STTSFTTrainer:
         # Detect model architecture for forward pass dispatch
         _model_name = _profile.name if _profile else "whisper"
 
-        # Seq2seq / audio-LLM / voxtral_realtime loss function
+        # Parakeet-specific training configuration (loss_type etc.)
+        _loss_type = getattr(self.config, "loss_type", "ctc")
+        _ctc_weight = float(getattr(self.config, "ctc_weight", 0.3))
+        _tdt_weight = float(getattr(self.config, "tdt_weight", 1.0))
+
+        # Seq2seq / audio-LLM / voxtral_realtime / parakeet_tdt loss function
         def loss_fn(model, batch):
-            labels = batch["labels"]
+            labels = batch.get("labels")
+
+            if _arch == "parakeet_tdt":
+                from mlx_tune.losses import ctc_loss, rnnt_loss, tdt_loss
+
+                mel = batch["mel"]
+                input_lengths = batch["input_lengths"]
+                targets = batch["targets"]
+                target_lengths = batch["target_lengths"]
+                blank = int(self.wrapper.vocab_size)
+
+                # Run the Conformer encoder. It returns (features, subsampled_lengths).
+                # features has shape (B, T', d_model); subsampled_lengths is (B,)
+                # reporting the actual number of valid frames after 8x subsampling.
+                enc_out, enc_lengths = model.encoder(mel, input_lengths.astype(mx.int32))
+                enc_lengths_i32 = enc_lengths.astype(mx.int32)
+
+                if _loss_type == "ctc":
+                    logits = model.ctc_head(enc_out)  # (B, T', V+1)
+                    log_probs = nn.log_softmax(logits, axis=-1)
+                    log_probs_tbv = mx.transpose(log_probs, (1, 0, 2))  # (T', B, V+1)
+                    return ctc_loss(
+                        log_probs_tbv,
+                        targets,
+                        enc_lengths_i32,
+                        target_lengths,
+                        blank=blank,
+                    )
+
+                # RNN-T / TDT / hybrid all need the joint network output.
+                # Build the decoder input: [blank, y_1, ..., y_{U-1}] so the
+                # pred at position u corresponds to predicting y_u.
+                B_ = int(targets.shape[0])
+                blank_col = mx.full((B_, 1), blank, dtype=mx.int32)
+                pred_input = mx.concatenate([blank_col, targets], axis=1)  # (B, U+1)
+
+                dec_out, _ = model.decoder(pred_input)  # (B, U+1, pred_hidden)
+                joint_out = model.joint(enc_out, dec_out)  # (B, T', U+1, V+D+1)
+                V_plus_1 = blank + 1
+
+                if _loss_type == "rnnt":
+                    rnnt_logits = joint_out[..., :V_plus_1]
+                    rnnt_lp = nn.log_softmax(rnnt_logits, axis=-1)
+                    return rnnt_loss(
+                        rnnt_lp, targets, enc_lengths_i32, target_lengths, blank=blank
+                    )
+
+                # TDT and hybrid use the full (tokens + durations) joint output
+                tok_part = joint_out[..., :V_plus_1]
+                dur_part = joint_out[..., V_plus_1:]
+                tok_lp = nn.log_softmax(tok_part, axis=-1)
+                dur_lp = nn.log_softmax(dur_part, axis=-1)
+                full_lp = mx.concatenate([tok_lp, dur_lp], axis=-1)
+
+                if _loss_type == "tdt":
+                    return tdt_loss(
+                        full_lp,
+                        targets,
+                        enc_lengths_i32,
+                        target_lengths,
+                        blank=blank,
+                    )
+
+                # hybrid = ctc_weight * ctc + tdt_weight * tdt
+                tdt_val = tdt_loss(
+                    full_lp, targets, enc_lengths_i32, target_lengths, blank=blank
+                )
+                ctc_logits = model.ctc_head(enc_out)
+                ctc_lp = nn.log_softmax(ctc_logits, axis=-1)
+                ctc_lp_tbv = mx.transpose(ctc_lp, (1, 0, 2))
+                ctc_val = ctc_loss(
+                    ctc_lp_tbv, targets, enc_lengths_i32, target_lengths, blank=blank
+                )
+                return _ctc_weight * ctc_val + _tdt_weight * tdt_val
 
             if _arch == "voxtral_realtime":
                 # Voxtral Realtime: forward pre-built embeddings through the
