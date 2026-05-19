@@ -489,7 +489,7 @@ class FastSTTModel:
         finetune_encoder: bool = True,
         finetune_decoder: bool = True,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_dora: bool = False,
         **kwargs,
@@ -884,7 +884,7 @@ class STTModelWrapper:
         finetune_encoder: bool = True,
         finetune_decoder: bool = True,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_dora: bool = False,
         finetune_joint: bool = False,
@@ -2290,6 +2290,8 @@ class STTDataCollator:
 
     def _collate_encoder_decoder(self, samples: List[Dict]) -> Dict:
         """Collate for encoder-decoder models (Whisper, Canary, Moonshine)."""
+        from mlx_tune._perf import bucket_length
+
         all_mels = []
         all_labels = []
         all_decoder_inputs = []
@@ -2300,8 +2302,9 @@ class STTDataCollator:
             all_labels.append(labels)
             all_decoder_inputs.append(decoder_input_ids)
 
-        # Pad decoder sequences to same length
-        max_dec_len = max(len(ids) for ids in all_decoder_inputs)
+        # Pad decoder sequences to same length, rounded up to the next bucket
+        # so `mx.compile`'s per-shape cache hits across batches.
+        max_dec_len = bucket_length(max(len(ids) for ids in all_decoder_inputs))
         tok = self.processor.tokenizer
         if hasattr(tok, "eot"):
             eot = tok.eot
@@ -2331,13 +2334,15 @@ class STTDataCollator:
 
     def _collate_audio_llm(self, samples: List[Dict]) -> Dict:
         """Collate for audio-LLM models (Qwen3-ASR, Voxtral)."""
+        from mlx_tune._perf import bucket_length
+
         processed = [self._process_audio_llm_sample(s) for s in samples]
 
         all_input_ids = [p["input_ids"] for p in processed]
         all_labels = [p["labels"] for p in processed]
 
-        # Pad sequences
-        max_len = max(len(ids) for ids in all_input_ids)
+        # Pad sequences to bucket length (compile cache hit).
+        max_len = bucket_length(max(len(ids) for ids in all_input_ids))
         pad_id = 0
 
         padded_ids = []
@@ -2411,17 +2416,20 @@ class STTDataCollator:
 
         max_T = max(m.shape[0] for m in mel_list)
         n_mels = mel_list[0].shape[1]
-        padded_mel = mx.zeros((len(mel_list), max_T, n_mels), dtype=mel_list[0].dtype)
-        for i, m in enumerate(mel_list):
-            t = m.shape[0]
-            # Build by concatenation since MLX arrays are immutable at the
-            # Python level. For B=1 this is trivial.
-            prefix = padded_mel[:i]
-            tail = padded_mel[i + 1:]
-            row = mx.concatenate(
-                [m, mx.zeros((max_T - t, n_mels), dtype=m.dtype)], axis=0
-            )[None, :, :]
-            padded_mel = mx.concatenate([prefix, row, tail], axis=0)
+        # Pad each row independently then stack — O(B), not O(B²). The previous
+        # version rebuilt the full padded tensor on every iteration; harmless
+        # at the current B=1 enforcement, but a trap if B>1 ever lands.
+        padded_rows = [
+            (
+                m
+                if m.shape[0] == max_T
+                else mx.concatenate(
+                    [m, mx.zeros((max_T - m.shape[0], n_mels), dtype=m.dtype)], axis=0
+                )
+            )
+            for m in mel_list
+        ]
+        padded_mel = mx.stack(padded_rows, axis=0)
 
         max_U = max(len(t) for t in token_lists)
         padded_targets = []
@@ -2975,13 +2983,22 @@ class STTSFTTrainer:
         from mlx.utils import tree_map
         from tqdm import tqdm
 
+        from mlx_tune._perf import (
+            compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+
         print("=" * 70)
         print("Starting STT Fine-Tuning (Whisper)")
         print("=" * 70)
 
+        configure_wired_limit()
+
         # Ensure LoRA is applied
         if self.wrapper and self.wrapper.lora_enabled and not self.wrapper._lora_applied:
             self.wrapper._apply_lora()
+        if self.wrapper:
+            enable_grad_checkpoint(self.wrapper)
 
         # For audio-LLM wrapper models (Qwen3-ASR, Voxtral), use inner model
         # directly so MLX's tree_map works correctly with optimizer
@@ -3176,19 +3193,42 @@ class STTSFTTrainer:
 
         loss_and_grad_fn = nn.value_and_grad(train_model, loss_fn)
 
+        # Compiled step (mlx-lm pattern). We skip compile for `parakeet_tdt`
+        # (variable mel length per batch + Python-side T-loop in CTC/RNNT
+        # scans would cause recompile thrash) and `voxtral_realtime` (heavy
+        # custom logic — leave for a follow-up audit). Other STT archs use
+        # `shapeless=True` since target token lengths vary per batch.
+        _compile_enabled = _arch not in ("parakeet_tdt", "voxtral_realtime")
         grad_accum = self.gradient_accumulation_steps
+        state = make_step_state(train_model, optimizer)
+
+        def step_fn(batch, prev_grad, do_update):
+            loss, grad = loss_and_grad_fn(train_model, batch)
+            if prev_grad is not None:
+                grad = tree_map(lambda a, g: a + g, prev_grad, grad)
+            if do_update:
+                if grad_accum > 1:
+                    grad = tree_map(lambda g: g / grad_accum, grad)
+                optimizer.update(train_model, grad)
+                return loss, None
+            return loss, grad
+
+        step_fn = compiled_step(step_fn, state, enabled=_compile_enabled)
+
         progress = tqdm(range(total_steps), desc="Training")
         total_loss = 0.0
-        step = 0
+        step_counter = 0
         micro_step = 0
-        accum_loss = 0.0
+        # Loss accumulator stays on-device — single host sync per macro-step
+        # at logging time, instead of one .item() per micro-step.
+        accum_loss_arr = mx.zeros((), dtype=mx.float32)
         accumulated_grads = None
         epoch = 0
 
-        while step < total_steps:
+        while step_counter < total_steps:
             epoch += 1
             for i in range(0, max(dataset_len, 1), self.batch_size):
-                if step >= total_steps:
+                if step_counter >= total_steps:
                     break
 
                 # Get batch
@@ -3206,37 +3246,24 @@ class STTSFTTrainer:
                 else:
                     batch = self.train_dataset[i]
 
-                loss, grads = loss_and_grad_fn(train_model, batch)
-                mx.eval(loss)
+                do_update = (micro_step + 1) >= grad_accum
+                loss, accumulated_grads = step_fn(batch, accumulated_grads, do_update)
 
-                # Accumulate gradients
-                if accumulated_grads is None:
-                    accumulated_grads = grads
-                else:
-                    accumulated_grads = tree_map(
-                        lambda a, g: a + g, accumulated_grads, grads
-                    )
-                accum_loss += loss.item()
+                accum_loss_arr = accum_loss_arr + loss.astype(mx.float32)
+                mx.eval(state, accum_loss_arr, accumulated_grads)
                 micro_step += 1
 
-                # Update weights every grad_accum micro-steps
-                if micro_step >= grad_accum:
-                    averaged_grads = tree_map(
-                        lambda g: g / grad_accum, accumulated_grads
-                    )
-                    optimizer.update(train_model, averaged_grads)
-                    mx.eval(train_model, optimizer.state)
-
-                    loss_val = accum_loss / grad_accum
+                if do_update:
+                    loss_val = float(accum_loss_arr.item()) / grad_accum
                     total_loss += loss_val
-                    step += 1
+                    step_counter += 1
                     micro_step = 0
-                    accum_loss = 0.0
+                    accum_loss_arr = mx.zeros((), dtype=mx.float32)
                     accumulated_grads = None
 
                     progress.update(1)
-                    if step % self.logging_steps == 0:
-                        avg_loss = total_loss / step
+                    if step_counter % self.logging_steps == 0:
+                        avg_loss = total_loss / step_counter
                         progress.set_postfix(
                             {"loss": f"{loss_val:.4f}", "avg_loss": f"{avg_loss:.4f}"}
                         )
@@ -3249,7 +3276,7 @@ class STTSFTTrainer:
             self.wrapper.save_pretrained(str(adapter_dir))
             self.wrapper._adapter_path = adapter_dir
 
-        avg_loss = total_loss / max(step, 1)
+        avg_loss = total_loss / max(step_counter, 1)
         print(f"\nTraining complete! Average loss: {avg_loss:.4f}")
 
         return _TrainerStats({"train_loss": avg_loss, "train_runtime": 0})

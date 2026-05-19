@@ -93,6 +93,15 @@ class SFTConfig:
         use_native_training: bool = True,  # Use native MLX training vs subprocess
         grad_checkpoint: bool = False,  # Enable gradient checkpointing
         num_layers: Optional[int] = None,  # Number of layers to apply LoRA to
+        # Validation cost knobs (Session 38)
+        # mlx-lm hardcoded val_batches=25 / steps_per_eval=max(save_steps, 100) — at
+        # ctx=4096 a single eval costs ~26s, so the validation pass can be 5-10% of
+        # short-run wall time. Defaults below preserve correctness but cut the cost:
+        # 5 val batches is plenty for a moving-average signal, and steps_per_eval=200
+        # halves how often eval runs vs the previous default. Set val_batches=0 to
+        # skip validation entirely.
+        val_batches: int = 5,
+        steps_per_eval: Optional[int] = None,
         # HuggingFace dataset integration (Unsloth-compatible)
         hf_dataset: Optional[Union[Dict[str, Any], Any]] = None,  # HFDatasetConfig or dict
         **kwargs
@@ -120,6 +129,8 @@ class SFTConfig:
         self.use_native_training = use_native_training
         self.grad_checkpoint = grad_checkpoint
         self.num_layers = num_layers
+        self.val_batches = val_batches
+        self.steps_per_eval = steps_per_eval
         self.hf_dataset = hf_dataset
 
         # Store any additional kwargs
@@ -240,6 +251,11 @@ class SFTTrainer:
         self.lr_scheduler_type = getattr(args, 'lr_scheduler_type', 'cosine') if args else 'cosine'
         self.num_layers = getattr(args, 'num_layers', None) if args else None
         self.weight_decay = getattr(args, 'weight_decay', 0.01) if args else 0.01
+        # Validation cost knobs (Session 38). val_batches default lowered from 25 → 5;
+        # steps_per_eval falls back to max(save_steps, 200) (was max(save_steps, 100))
+        # so validation runs half as often on short runs.
+        self.val_batches = getattr(args, 'val_batches', 5) if args else 5
+        self.steps_per_eval = getattr(args, 'steps_per_eval', None) if args else None
 
         self.model = model
         # Get tokenizer from model if not provided
@@ -576,12 +592,23 @@ class SFTTrainer:
 
         # Step 6: Create training args
         adapter_file = str(self.adapter_path / "adapters.safetensors")
+        # Resolve validation knobs (Session 38).
+        # val_batches: 0 means skip validation; ≥1 controls how many batches per eval.
+        # steps_per_eval: None → default heuristic max(save_steps, 200). Previously this
+        # was max(save_steps, 100); the bump halves eval frequency on short runs where
+        # save_steps < 100, cutting wall-time without changing the train signal.
+        val_batches = max(0, int(self.val_batches))
+        steps_per_eval = (
+            int(self.steps_per_eval)
+            if self.steps_per_eval is not None
+            else max(self.save_steps, 200)
+        )
         training_args = TrainingArgs(
             batch_size=self.batch_size,
             iters=self.iters,
-            val_batches=25,
+            val_batches=val_batches,
             steps_per_report=self.logging_steps,
-            steps_per_eval=max(self.save_steps, 100),
+            steps_per_eval=steps_per_eval,
             steps_per_save=self.save_steps,
             max_seq_length=self.max_seq_length,
             adapter_file=adapter_file,
@@ -631,14 +658,31 @@ class SFTTrainer:
         # MLXModelWrapper wraps the actual model
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
 
+        # Force a Python GC sweep before entering the training loop. Setup
+        # creates transient Python objects (JSONL serialization buffers,
+        # dataset_args namespace, the user's Python sample dicts kept alive
+        # by `self.train_dataset`) that aren't needed during training. mlx-lm
+        # CLI dodges this by living in its own short-lived process; when we
+        # run inline, those refs survive into the loop and appear to fragment
+        # the unified-memory allocator under long-ctx pressure (observed:
+        # SFTTrainer iter-70 OOM at ctx=4096 no-GC, while direct mlx-lm at
+        # the same config completes 100 iters cleanly). One sweep at this
+        # boundary is harmless on short runs and load-bearing on long ones.
+        import gc
+        gc.collect()
+
         # Step 9: Run training
         try:
             print("Starting training loop...")
+            # If user opted out of validation (val_batches=0), skip eval entirely
+            # by passing val_dataset=None. mlx-lm's `evaluate()` would otherwise
+            # iterate 0 batches and emit a NaN val loss — visible noise for no benefit.
+            effective_val_set = valid_set if val_batches > 0 else None
             mlx_train(
                 model=actual_model,
                 optimizer=optimizer,
                 train_dataset=train_set,
-                val_dataset=valid_set,
+                val_dataset=effective_val_set,
                 args=training_args,
             )
 

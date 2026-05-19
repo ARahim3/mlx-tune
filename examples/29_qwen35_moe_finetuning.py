@@ -58,6 +58,7 @@ def main():
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
+        # Required: Qwen3.5-35B-A3B-4bit barely fits without GC even at ctx=2048.
         use_gradient_checkpointing="unsloth",
         random_state=3407,
     )

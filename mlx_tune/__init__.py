@@ -17,7 +17,7 @@ Supported Training Methods:
 - OCR (Optical Character Recognition) fine-tuning
 """
 
-__version__ = "0.4.25"  # Add: Arcee Trinity-Nano / AFMoE fine-tuning (SFT, GRPO, CPT) + CPT quantized-lm_head fix
+__version__ = "0.5.0"  # Perf cycle (Sessions 35-38): fused log-prob, KV-cached GRPO sampling, @mx.compile + collator bucketing, GC propagation, prompt-prefix KV-cache share (DPO/ORPO/SimPO 1.5-1.9× per-sample at bs=1), GRPO prompt-cache across N completions, DPO fixed-reference logprobs, SFT val_batches knob, off-by-one length-mask fix
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (

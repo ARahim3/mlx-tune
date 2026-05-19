@@ -39,6 +39,9 @@ from mlx_tune.losses import (
     generate_with_log_probs,
     compute_reference_logprobs,
     compute_log_probs_with_lengths,
+    common_prefix_length,
+    build_shared_prompt_cache,
+    fork_prompt_cache,
 )
 
 
@@ -126,6 +129,15 @@ class DPOConfig:
         beta: float = 0.1,  # KL penalty coefficient
         loss_type: str = "sigmoid",  # sigmoid, hinge, ipo, kto_pair
         label_smoothing: float = 0.0,
+        # Session 38: pre-compute reference logprobs from the base (pre-LoRA)
+        # model once at trainer init and reuse for every step. Standard DPO
+        # uses a frozen reference π_ref; the prior implementation used
+        # `stop_gradient(log_pi)`, which drifts as the policy trains. The
+        # fixed reference is more aligned with the published DPO algorithm
+        # and prevents the implicit-reference drift at small cost (one
+        # forward per pair, no gradient). Set False to keep the legacy
+        # stop-grad reference (no init-time cost, slightly faster start).
+        precompute_ref_logprobs: bool = True,
         # Training args
         output_dir: str = "./dpo_outputs",
         learning_rate: float = 5e-7,
@@ -143,6 +155,7 @@ class DPOConfig:
         self.beta = beta
         self.loss_type = loss_type
         self.label_smoothing = label_smoothing
+        self.precompute_ref_logprobs = precompute_ref_logprobs
         self.output_dir = output_dir
         self.learning_rate = learning_rate
         self.per_device_train_batch_size = per_device_train_batch_size
@@ -454,6 +467,7 @@ class DPOTrainer:
         self.beta = args.beta
         self.loss_type = args.loss_type
         self.label_smoothing = args.label_smoothing
+        self.precompute_ref_logprobs = getattr(args, 'precompute_ref_logprobs', True)
         self.output_dir = Path(args.output_dir)
         self.learning_rate = args.learning_rate
         self.batch_size = args.per_device_train_batch_size
@@ -485,7 +499,15 @@ class DPOTrainer:
         print(f"  Using proper DPO loss: {self.use_native}")
 
     def _tokenize_preference_pair(self, sample: Dict) -> Dict:
-        """Tokenize a preference pair (prompt + chosen, prompt + rejected)."""
+        """Tokenize a preference pair (prompt + chosen, prompt + rejected).
+
+        Also records the actual shared-prefix length in tokens via
+        `common_prefix_length`. This drives the prompt-prefix KV-cache
+        sharing path in `dpo_loss` (Session 38). The literal-prompt encode
+        wouldn't survive BPE-merge differences across the prompt/response
+        boundary, so we always derive prompt_length from the tokenised
+        prefix that's verifiably shared.
+        """
         prompt = sample.get('prompt', '')
         chosen = sample.get('chosen', '')
         rejected = sample.get('rejected', '')
@@ -508,6 +530,7 @@ class DPOTrainer:
             'rejected_ids': rejected_ids,
             'chosen_length': len(chosen_ids),
             'rejected_length': len(rejected_ids),
+            'prompt_length': common_prefix_length(chosen_ids, rejected_ids),
         }
 
     def _prepare_dpo_batches(self):
@@ -543,17 +566,59 @@ class DPOTrainer:
 
     def _train_native(self):
         """Train using native MLX with proper DPO loss."""
-        print("\n[Using Native DPO Training with Proper Loss]")
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
 
-        # Apply LoRA if needed
-        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
-            print("Applying LoRA adapters...")
-            self.model._apply_lora()
+        print("\n[Using Native DPO Training with Proper Loss]")
 
         # Prepare data
         print("Preparing preference data...")
         tokenized_data = self._prepare_dpo_batches()
         print(f"✓ Prepared {len(tokenized_data)} preference pairs")
+
+        # Session 38: pre-compute reference log-probs against the base model
+        # BEFORE applying LoRA. At step 0 LoRA's B factor is initialised to
+        # zero so a fresh LoRA-applied model is mathematically identical to
+        # the base, but computing the reference here keeps the path explicit
+        # and robust to future LoRA-init changes. The reference stays frozen
+        # for the rest of training — that's the standard DPO formulation.
+        if self.precompute_ref_logprobs:
+            print("Pre-computing reference log-probs from base model (one-time)...")
+            actual_for_ref = self.model.model if hasattr(self.model, 'model') else self.model
+            if hasattr(actual_for_ref, 'eval'):
+                actual_for_ref.eval()
+            ref_pad_id = self.tokenizer.pad_token_id or 0
+            for sample in tokenized_data:
+                cl = sample['chosen_length']
+                rl = sample['rejected_length']
+                max_len = max(cl, rl)
+                chosen_padded = sample['chosen_ids'] + [ref_pad_id] * (max_len - cl)
+                rejected_padded = sample['rejected_ids'] + [ref_pad_id] * (max_len - rl)
+                chosen_arr = mx.array([chosen_padded])
+                rejected_arr = mx.array([rejected_padded])
+                # No grad — these are reference values, frozen for the rest
+                # of training. mx.stop_gradient also disconnects the autograd
+                # graph so the precomputed values never participate in
+                # backward through the policy model.
+                chosen_ref = mx.stop_gradient(
+                    compute_log_probs_with_lengths(actual_for_ref, chosen_arr, mx.array([cl]))
+                )
+                rejected_ref = mx.stop_gradient(
+                    compute_log_probs_with_lengths(actual_for_ref, rejected_arr, mx.array([rl]))
+                )
+                mx.eval(chosen_ref, rejected_ref)
+                sample['ref_chosen_logp'] = float(chosen_ref.item())
+                sample['ref_rejected_logp'] = float(rejected_ref.item())
+            print(f"✓ Reference log-probs cached for {len(tokenized_data)} pairs")
+
+        # Apply LoRA if needed (after ref computation so ref is from the base model)
+        if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
+            print("Applying LoRA adapters...")
+            self.model._apply_lora()
+        enable_grad_checkpoint(self.model)
 
         # Get actual model and switch to training mode
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
@@ -569,25 +634,80 @@ class DPOTrainer:
         # Training loop
         print(f"\nStarting training for {self.iters} iterations...")
 
-        # Define loss and grad function
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
-
-            loss, ntoks = compute_dpo_loss(
-                model=model,
-                chosen_ids=chosen_ids,
-                rejected_ids=rejected_ids,
-                chosen_lengths=chosen_lengths,
-                rejected_lengths=rejected_lengths,
-                beta=self.beta,
-                label_smoothing=self.label_smoothing,
-            )
-            return loss
-
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
-
-        total_loss = 0.0
         bs = max(1, self.batch_size)
+        # Session 38: at batch_size=1 we want the prompt-prefix shared-KV-cache
+        # path (`compute_log_probs_pair_shared_prefix`). That path branches on
+        # Python-int prompt_length/chosen/rejected lengths so it doesn't fit
+        # inside `mx.compile`'s shape cache — `.item()` would bake the value
+        # into the trace and stale results across steps. For B==1 we therefore
+        # bypass `compiled_step` and stay eager; the prompt-share saving on
+        # long-prompt data is far larger than the compile-fusion saving (the
+        # latter was ~10-25% at 16-64 steps; this is ~30-50%). For B>1 the
+        # compiled path is still wired (no shared prefix opportunity there).
+        use_shared_prefix = (bs == 1)
+
+        if use_shared_prefix:
+            print("  Prompt-prefix KV-cache sharing: ON (batch_size=1) — compile bypassed")
+
+            def loss_fn(model, batch_data, prompt_length, chosen_len_py, rejected_len_py, ref_logps):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                ref_chosen, ref_rejected = ref_logps
+                loss, _ = compute_dpo_loss(
+                    model=model,
+                    chosen_ids=chosen_ids,
+                    rejected_ids=rejected_ids,
+                    chosen_lengths=chosen_lengths,
+                    rejected_lengths=rejected_lengths,
+                    beta=self.beta,
+                    label_smoothing=self.label_smoothing,
+                    reference_chosen_logprobs=ref_chosen,
+                    reference_rejected_logprobs=ref_rejected,
+                    prompt_length=prompt_length,
+                    chosen_length_py=chosen_len_py,
+                    rejected_length_py=rejected_len_py,
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+
+            def step_fn(batch_data, prompt_length, chosen_len_py, rejected_len_py, ref_logps):
+                loss, grads = loss_and_grad(
+                    actual_model, batch_data, prompt_length, chosen_len_py, rejected_len_py, ref_logps
+                )
+                optimizer.update(actual_model, grads)
+                return loss
+        else:
+            def loss_fn(model, batch_data, ref_logps):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                ref_chosen, ref_rejected = ref_logps
+                loss, _ = compute_dpo_loss(
+                    model=model,
+                    chosen_ids=chosen_ids,
+                    rejected_ids=rejected_ids,
+                    chosen_lengths=chosen_lengths,
+                    rejected_lengths=rejected_lengths,
+                    beta=self.beta,
+                    label_smoothing=self.label_smoothing,
+                    reference_chosen_logprobs=ref_chosen,
+                    reference_rejected_logprobs=ref_rejected,
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+            state = make_step_state(actual_model, optimizer)
+
+            def step_fn(batch_data, ref_logps):
+                loss, grads = loss_and_grad(actual_model, batch_data, ref_logps)
+                optimizer.update(actual_model, grads)
+                return loss
+
+            step_fn = compiled_step(step_fn, state)
+
+        # State for mx.eval — for B==1 we still keep the model + optimizer state
+        # on-device so the evaluation barrier flushes everything together.
+        state = make_step_state(actual_model, optimizer)
+
+        total_loss_arr = mx.zeros((), dtype=mx.float32)  # on-device accumulator
         for step in range(self.iters):
             # Gather batch of samples
             batch_samples = [
@@ -595,10 +715,13 @@ class DPOTrainer:
                 for i in range(bs)
             ]
 
-            # Pad all sequences to common max length within batch
+            # Pad all sequences to common max length within batch, rounded
+            # up to the next bucket so `mx.compile`'s per-shape cache hits
+            # (B>1 path) or so cache-fork buffer sizes stay consistent (B==1).
             max_len = max(
                 max(s['chosen_length'], s['rejected_length']) for s in batch_samples
             )
+            max_len = bucket_length(max_len)
             pad_id = self.tokenizer.pad_token_id or 0
 
             chosen_ids = mx.array([self._pad_to_length(s['chosen_ids'], max_len, pad_id) for s in batch_samples])
@@ -608,18 +731,37 @@ class DPOTrainer:
 
             batch_data = (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths)
 
-            # Compute loss and gradients
-            loss, grads = loss_and_grad(actual_model, batch_data)
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
+            # Assemble the reference log-probs tuple. When precompute is on,
+            # use the cached per-sample values; otherwise pass (None, None)
+            # so dpo_loss falls back to its stop_gradient(log_pi) reference.
+            if self.precompute_ref_logprobs and 'ref_chosen_logp' in batch_samples[0]:
+                ref_chosen = mx.array([s['ref_chosen_logp'] for s in batch_samples])
+                ref_rejected = mx.array([s['ref_rejected_logp'] for s in batch_samples])
+                ref_logps = (ref_chosen, ref_rejected)
+            else:
+                ref_logps = (None, None)
 
-            total_loss += loss.item()
+            if use_shared_prefix:
+                # B==1: hand the shared-prefix branch Python-int copies of the
+                # lengths so it can decide without forcing a host sync.
+                s0 = batch_samples[0]
+                loss = step_fn(
+                    batch_data,
+                    int(s0['prompt_length']),
+                    int(s0['chosen_length']),
+                    int(s0['rejected_length']),
+                    ref_logps,
+                )
+            else:
+                loss = step_fn(batch_data, ref_logps)
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
-            # Logging
+            # Logging — single host sync per logging_steps interval, not per step.
             if (step + 1) % self.logging_steps == 0:
-                avg_loss = total_loss / self.logging_steps
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
                 print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | batch_size: {bs}")
-                total_loss = 0.0
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
 
             # Save checkpoint
             if (step + 1) % self.save_steps == 0:
@@ -750,7 +892,12 @@ class ORPOTrainer:
         print(f"  Native training: {self.use_native}")
 
     def _tokenize_preference_pair(self, sample: Dict) -> Dict:
-        """Tokenize a preference pair."""
+        """Tokenize a preference pair.
+
+        Records prompt_length = common token prefix between chosen and
+        rejected (Session 38 — enables prompt-prefix KV-cache sharing in
+        `orpo_loss`).
+        """
         prompt = sample.get('prompt', '')
         chosen = sample.get('chosen', '')
         rejected = sample.get('rejected', '')
@@ -768,6 +915,7 @@ class ORPOTrainer:
             'rejected_ids': rejected_ids,
             'chosen_length': len(chosen_ids),
             'rejected_length': len(rejected_ids),
+            'prompt_length': common_prefix_length(chosen_ids, rejected_ids),
         }
 
     def _pad_to_length(self, ids: List[int], length: int, pad_id: int = 0) -> List[int]:
@@ -788,10 +936,17 @@ class ORPOTrainer:
 
     def _train_native(self):
         """Train with native ORPO loss."""
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
+
         print("\n[Using Native ORPO Training with Proper Loss]")
 
         if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
             self.model._apply_lora()
+        enable_grad_checkpoint(self.model)
 
         # Prepare data
         tokenized_data = []
@@ -809,17 +964,57 @@ class ORPOTrainer:
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
-            loss, _ = compute_orpo_loss(
-                model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, self.beta
-            )
-            return loss
-
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
-
-        total_loss = 0.0
         bs = max(1, self.batch_size)
+        use_shared_prefix = (bs == 1)
+        # See DPOTrainer._train_native for rationale. Session 38 prompt-prefix
+        # share is the bigger lever on ORPO too — at ctx=4096 ORPO holds two
+        # full forwards' worth of activations; halving the prompt forward
+        # cost is a direct ~30-50% wall-time cut on long-prompt data, which
+        # comfortably dominates the compile-fusion win we'd otherwise get.
+
+        if use_shared_prefix:
+            print("  Prompt-prefix KV-cache sharing: ON (batch_size=1) — compile bypassed")
+
+            def loss_fn(model, batch_data, prompt_length, chosen_len_py, rejected_len_py):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                loss, _ = compute_orpo_loss(
+                    model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths,
+                    self.beta,
+                    prompt_length=prompt_length,
+                    chosen_length_py=chosen_len_py,
+                    rejected_length_py=rejected_len_py,
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+
+            def step_fn(batch_data, prompt_length, chosen_len_py, rejected_len_py):
+                loss, grads = loss_and_grad(
+                    actual_model, batch_data, prompt_length, chosen_len_py, rejected_len_py
+                )
+                optimizer.update(actual_model, grads)
+                return loss
+        else:
+            def loss_fn(model, batch_data):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                loss, _ = compute_orpo_loss(
+                    model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths, self.beta
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+            state_compile = make_step_state(actual_model, optimizer)
+
+            def step_fn(batch_data):
+                loss, grads = loss_and_grad(actual_model, batch_data)
+                optimizer.update(actual_model, grads)
+                return loss
+
+            step_fn = compiled_step(step_fn, state_compile)
+
+        state = make_step_state(actual_model, optimizer)
+
+        total_loss_arr = mx.zeros((), dtype=mx.float32)
         for step in range(self.iters):
             # Gather batch of samples
             batch_samples = [
@@ -830,6 +1025,7 @@ class ORPOTrainer:
             max_len = max(
                 max(s['chosen_length'], s['rejected_length']) for s in batch_samples
             )
+            max_len = bucket_length(max_len)
             pad_id = self.tokenizer.pad_token_id or 0
 
             chosen_ids = mx.array([self._pad_to_length(s['chosen_ids'], max_len, pad_id) for s in batch_samples])
@@ -837,15 +1033,23 @@ class ORPOTrainer:
             chosen_lengths = mx.array([s['chosen_length'] for s in batch_samples])
             rejected_lengths = mx.array([s['rejected_length'] for s in batch_samples])
 
-            loss, grads = loss_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
-
-            total_loss += loss.item()
+            if use_shared_prefix:
+                s0 = batch_samples[0]
+                loss = step_fn(
+                    (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths),
+                    int(s0['prompt_length']),
+                    int(s0['chosen_length']),
+                    int(s0['rejected_length']),
+                )
+            else:
+                loss = step_fn((chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
             if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f} | batch_size: {bs}")
-                total_loss = 0.0
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
+                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | batch_size: {bs}")
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
 
         # Save adapters and config
         _save_adapters_and_config(self.model, self.adapter_path)
@@ -993,10 +1197,17 @@ class GRPOTrainer:
             log probs, apply policy gradient loss weighted by advantages,
             update model via optimizer.
         """
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
+
         print("\n[Using Native GRPO Training with Policy Gradient]")
 
         if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
             self.model._apply_lora()
+        enable_grad_checkpoint(self.model)
 
         # Prepare prompts and ground truth answers
         prompts = []
@@ -1031,7 +1242,18 @@ class GRPOTrainer:
 
         loss_and_grad = nn.value_and_grad(actual_model, pg_loss_fn)
 
-        total_loss = 0.0
+        # Compiled step (Phase 2 only — generation phase is dynamic and can't
+        # be `mx.compile`d). `shapeless=True` because completion lengths vary.
+        state = make_step_state(actual_model, optimizer)
+
+        def step_fn(sequences, seq_lengths, advantages):
+            loss, grads = loss_and_grad(actual_model, sequences, seq_lengths, advantages)
+            optimizer.update(actual_model, grads)
+            return loss
+
+        step_fn = compiled_step(step_fn, state)
+
+        total_loss_arr = mx.zeros((), dtype=mx.float32)  # on-device accumulator
         total_reward = 0.0
         for step in range(self.iters):
             prompt_idx = step % len(prompts)
@@ -1040,15 +1262,32 @@ class GRPOTrainer:
 
             prompt_ids = mx.array(self.tokenizer.encode(prompt))
 
+            # Session 38: build a shared prompt KV cache once per prompt and
+            # fork it for each of the N generations. With this, the prompt
+            # forward runs once instead of N times. Saving scales with
+            # prompt_len / total_tokens — significant for reasoning prompts
+            # (1k+ tokens, short completions). Falls back to per-generation
+            # full prompt forward when the helper can't build a cache (e.g.
+            # mock models in tests).
+            shared_prompt_cache = build_shared_prompt_cache(actual_model, prompt_ids)
+
             # ---- Phase 1: Generate completions and compute rewards (no gradients) ----
             completions_data = []
             rewards = []
 
             for _ in range(self.num_generations):
+                # Fork the shared cache per generation so writes from one
+                # completion don't leak into the next.
+                fork = (
+                    fork_prompt_cache(actual_model, shared_prompt_cache)
+                    if shared_prompt_cache is not None
+                    else None
+                )
                 gen_ids, _ = generate_with_log_probs(
                     actual_model, self.tokenizer, prompt_ids,
                     max_tokens=self.max_completion_length,
                     temperature=self.temperature,
+                    prompt_cache=fork,
                 )
                 mx.eval(gen_ids)
 
@@ -1075,12 +1314,11 @@ class GRPOTrainer:
 
             # Skip update if all rewards are equal (std=0)
             if std_reward.item() < 1e-8:
-                total_loss += 0.0
                 if (step + 1) % self.logging_steps == 0:
-                    avg_loss = total_loss / self.logging_steps
+                    avg_loss = float(total_loss_arr.item()) / self.logging_steps
                     avg_rew = total_reward / self.logging_steps
                     print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | Reward: {avg_rew:.3f} (skipped, equal rewards)")
-                    total_loss = 0.0
+                    total_loss_arr = mx.zeros((), dtype=mx.float32)
                     total_reward = 0.0
                 continue
 
@@ -1088,8 +1326,9 @@ class GRPOTrainer:
             mx.eval(advantages)
 
             # ---- Phase 2: Compute policy gradient loss with gradient tracking ----
-            # Pad sequences to same length for batched processing
-            max_len = max(c['length'] for c in completions_data)
+            # Pad sequences to same length for batched processing, rounded
+            # up to the next bucket so `mx.compile`'s per-shape cache hits.
+            max_len = bucket_length(max(c['length'] for c in completions_data))
             pad_id = getattr(self.tokenizer, 'pad_token_id', None) or 0
 
             padded_seqs = []
@@ -1103,17 +1342,15 @@ class GRPOTrainer:
             sequences = mx.array(padded_seqs)
             seq_lengths = mx.array(lengths)
 
-            loss, grads = loss_and_grad(actual_model, sequences, seq_lengths, advantages)
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
-
-            total_loss += loss.item()
+            loss = step_fn(sequences, seq_lengths, advantages)
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
             if (step + 1) % self.logging_steps == 0:
-                avg_loss = total_loss / self.logging_steps
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
                 avg_rew = total_reward / self.logging_steps
                 print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | Reward: {avg_rew:.3f}")
-                total_loss = 0.0
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
                 total_reward = 0.0
 
             # Save checkpoint
@@ -1235,10 +1472,17 @@ class KTOTrainer:
             warnings.warn("KTO requires native training. Using SFT approximation.", UserWarning)
             return {"status": "fallback"}
 
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
+
         print("\n[Using Native KTO Training with Proper Loss]")
 
         if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
             self.model._apply_lora()
+        enable_grad_checkpoint(self.model)
 
         actual_model = self.model.model if hasattr(self.model, 'model') else self.model
         if hasattr(self.model, 'train'):
@@ -1279,7 +1523,17 @@ class KTOTrainer:
 
         loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
 
-        total_loss = 0.0
+        # Compiled step. `shapeless=True` because seq length is per-batch max.
+        state = make_step_state(actual_model, optimizer)
+
+        def step_fn(batch_data):
+            loss, grads = loss_and_grad(actual_model, batch_data)
+            optimizer.update(actual_model, grads)
+            return loss
+
+        step_fn = compiled_step(step_fn, state)
+
+        total_loss_arr = mx.zeros((), dtype=mx.float32)
         bs = max(1, self.batch_size)
         for step in range(self.iters):
             # Gather batch of samples
@@ -1289,20 +1543,19 @@ class KTOTrainer:
             ]
             pad_id = self.tokenizer.pad_token_id or 0
 
-            max_len = max(s['length'] for s in batch_samples)
+            max_len = bucket_length(max(s['length'] for s in batch_samples))
             input_ids = mx.array([s['ids'] + [pad_id] * (max_len - len(s['ids'])) for s in batch_samples])
             lengths = mx.array([s['length'] for s in batch_samples])
             labels = mx.array([s['label'] for s in batch_samples])
 
-            loss, grads = loss_and_grad(actual_model, (input_ids, lengths, labels))
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
-
-            total_loss += loss.item()
+            loss = step_fn((input_ids, lengths, labels))
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
             if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f} | batch_size: {bs}")
-                total_loss = 0.0
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
+                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | batch_size: {bs}")
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
 
             if (step + 1) % self.save_steps == 0:
                 _save_adapters_and_config(self.model, self.adapter_path)
@@ -1393,6 +1646,7 @@ class SimPOTrainer:
             'rejected_ids': rejected_ids,
             'chosen_length': len(chosen_ids),
             'rejected_length': len(rejected_ids),
+            'prompt_length': common_prefix_length(chosen_ids, rejected_ids),
         }
 
     def _pad(self, ids, length, pad_id=0):
@@ -1408,10 +1662,17 @@ class SimPOTrainer:
             warnings.warn("SimPO requires native training. Using SFT approximation.", UserWarning)
             return {"status": "fallback"}
 
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
+
         print("\n[Using Native SimPO Training with Proper Loss]")
 
         if hasattr(self.model, '_apply_lora') and not getattr(self.model, '_lora_applied', False):
             self.model._apply_lora()
+        enable_grad_checkpoint(self.model)
 
         tokenized_data = []
         for sample in self.train_dataset:
@@ -1428,18 +1689,53 @@ class SimPOTrainer:
         lr_schedule = optim.cosine_decay(self.learning_rate, self.iters)
         optimizer = optim.AdamW(learning_rate=lr_schedule)
 
-        def loss_fn(model, batch_data):
-            chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
-            loss, _ = compute_simpo_loss(
-                model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths,
-                self.beta, self.gamma
-            )
-            return loss
-
-        loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
-
-        total_loss = 0.0
         bs = max(1, self.batch_size)
+        use_shared_prefix = (bs == 1)  # See DPOTrainer for rationale (Session 38)
+
+        if use_shared_prefix:
+            print("  Prompt-prefix KV-cache sharing: ON (batch_size=1) — compile bypassed")
+
+            def loss_fn(model, batch_data, prompt_length, chosen_len_py, rejected_len_py):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                loss, _ = compute_simpo_loss(
+                    model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths,
+                    self.beta, self.gamma,
+                    prompt_length=prompt_length,
+                    chosen_length_py=chosen_len_py,
+                    rejected_length_py=rejected_len_py,
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+
+            def step_fn(batch_data, prompt_length, chosen_len_py, rejected_len_py):
+                loss, grads = loss_and_grad(
+                    actual_model, batch_data, prompt_length, chosen_len_py, rejected_len_py
+                )
+                optimizer.update(actual_model, grads)
+                return loss
+        else:
+            def loss_fn(model, batch_data):
+                chosen_ids, rejected_ids, chosen_lengths, rejected_lengths = batch_data
+                loss, _ = compute_simpo_loss(
+                    model, chosen_ids, rejected_ids, chosen_lengths, rejected_lengths,
+                    self.beta, self.gamma
+                )
+                return loss
+
+            loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
+            state_compile = make_step_state(actual_model, optimizer)
+
+            def step_fn(batch_data):
+                loss, grads = loss_and_grad(actual_model, batch_data)
+                optimizer.update(actual_model, grads)
+                return loss
+
+            step_fn = compiled_step(step_fn, state_compile)
+
+        state = make_step_state(actual_model, optimizer)
+
+        total_loss_arr = mx.zeros((), dtype=mx.float32)
         for step in range(self.iters):
             # Gather batch of samples
             batch_samples = [
@@ -1449,6 +1745,7 @@ class SimPOTrainer:
             max_len = max(
                 max(s['chosen_length'], s['rejected_length']) for s in batch_samples
             )
+            max_len = bucket_length(max_len)
             pad_id = self.tokenizer.pad_token_id or 0
 
             chosen_ids = mx.array([self._pad(s['chosen_ids'], max_len, pad_id) for s in batch_samples])
@@ -1456,15 +1753,23 @@ class SimPOTrainer:
             chosen_lengths = mx.array([s['chosen_length'] for s in batch_samples])
             rejected_lengths = mx.array([s['rejected_length'] for s in batch_samples])
 
-            loss, grads = loss_and_grad(actual_model, (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
-
-            total_loss += loss.item()
+            if use_shared_prefix:
+                s0 = batch_samples[0]
+                loss = step_fn(
+                    (chosen_ids, rejected_ids, chosen_lengths, rejected_lengths),
+                    int(s0['prompt_length']),
+                    int(s0['chosen_length']),
+                    int(s0['rejected_length']),
+                )
+            else:
+                loss = step_fn((chosen_ids, rejected_ids, chosen_lengths, rejected_lengths))
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
             if (step + 1) % self.logging_steps == 0:
-                print(f"  Step {step + 1}/{self.iters} | Loss: {total_loss / self.logging_steps:.4f} | batch_size: {bs}")
-                total_loss = 0.0
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
+                print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f} | batch_size: {bs}")
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
 
         # Save adapters and config
         _save_adapters_and_config(self.model, self.adapter_path)

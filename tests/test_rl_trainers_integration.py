@@ -28,7 +28,10 @@ class SmallLanguageModel(nn.Module):
         self.layers = [nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)]
         self.output = nn.Linear(hidden_size, vocab_size)
 
-    def __call__(self, x):
+    def __call__(self, x, cache=None, **_kwargs):
+        # `cache` and other kwargs are accepted (and ignored) so this mock
+        # model is compatible with mlx_lm.stream_generate, which passes
+        # cache= during generation.
         h = self.embedding(x)
         for layer in self.layers:
             h = mx.maximum(layer(h), 0)  # ReLU
@@ -36,7 +39,12 @@ class SmallLanguageModel(nn.Module):
 
 
 class MockTokenizer:
-    """Mock tokenizer for testing."""
+    """Mock tokenizer for testing.
+
+    Extra attributes (chat_template, get_vocab, eos_token_ids) satisfy
+    mlx_lm.TokenizerWrapper, which mlx_lm.stream_generate constructs
+    internally — used by GRPOTrainer's sampling phase.
+    """
 
     def __init__(self, vocab_size: int = 100):
         self.vocab_size = vocab_size
@@ -46,6 +54,13 @@ class MockTokenizer:
         self.pad_token = "<pad>"
         self.eos_token = "</s>"
         self.name_or_path = "mock-tokenizer"
+        # mlx_lm.TokenizerWrapper requirements
+        self.chat_template = None
+        self.eos_token_ids = [1]
+
+    def get_vocab(self):
+        # Just enough for TokenizerWrapper's think-token lookup; no real vocab.
+        return {}
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """Simple encoding: hash characters to vocab indices."""

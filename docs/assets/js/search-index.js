@@ -87,10 +87,23 @@ window.MLX_SEARCH_INDEX = [
   { title: "Parakeet Bengali (char vocab extension)", section: "Example 52", url: "examples.html#ex52", tags: "parakeet tdt bengali fleurs bn_in char vocab extension extend_vocabulary brahmic non-latin unicode example 52 hindi thai devanagari", page: "Examples" },
   { title: "Parakeet Arabic (BPE vocab extension)", section: "Example 53", url: "examples.html#ex53", tags: "parakeet tdt arabic fleurs ar_eg bpe sentencepiece retrain aggregate tokenizer example 53 full weight", page: "Examples" },
 
+  // --- Performance ---
+  { title: "Performance", section: "What to expect on M4 Pro 48 GB", url: "performance.html", tags: "performance speed memory benchmark how fast it/s peak gb m4 pro apple silicon reference table", page: "Performance" },
+  { title: "What to expect", section: "Training speed and memory reference", url: "performance.html#what-to-expect", tags: "what to expect training speed memory benchmark sft dpo orpo grpo embedding peak gb it/s ms per sample m4 pro 48gb", page: "Performance" },
+  { title: "Smaller Macs", section: "Scaling down memory budgets", url: "performance.html#smaller-macs", tags: "smaller macs 16gb 24gb mac mini memory budget scale down context length", page: "Performance" },
+  { title: "DPO/ORPO prompt sharing", section: "Batch size 1 fast path", url: "performance.html#prompt-share-note", tags: "dpo orpo prompt prefix kv cache share batch size 1 fast path long prompt", page: "Performance" },
+  { title: "Performance knobs", section: "Tuning options", url: "performance.html#knobs", tags: "performance knobs tuning options gradient checkpointing validation reference model env vars", page: "Performance" },
+  { title: "Gradient checkpointing", section: "use_gradient_checkpointing", url: "performance.html#grad-checkpoint", tags: "gradient checkpointing use_gradient_checkpointing unsloth activation memory long context oom", page: "Performance" },
+  { title: "SFT validation cost", section: "val_batches knob", url: "performance.html#validation", tags: "val_batches steps_per_eval validation cost skip eval sft training", page: "Performance" },
+  { title: "DPO reference model", section: "precompute_ref_logprobs", url: "performance.html#dpo-reference", tags: "dpo precompute_ref_logprobs frozen reference model pi_ref stop_gradient", page: "Performance" },
+  { title: "Environment variables", section: "MLX_TUNE_* env vars", url: "performance.html#env-vars", tags: "environment variables MLX_TUNE_DISABLE_COMPILE MLX_TUNE_BUCKET_SIZE eager disable compile bucket", page: "Performance" },
+  { title: "What's automatic", section: "Automatic optimizations", url: "performance.html#automatic", tags: "automatic optimizations under the hood fused log prob kv cache compile bucketing", page: "Performance" },
+
   // --- Troubleshooting ---
   { title: "Troubleshooting", section: "Common Issues", url: "troubleshooting.html", tags: "troubleshoot error fix help debug issue", page: "Help" },
   { title: "Model Not Found", section: "HuggingFace errors", url: "troubleshooting.html#model-not-found", tags: "model not found 404 huggingface gated token", page: "Help" },
-  { title: "Out of Memory", section: "OOM errors", url: "troubleshooting.html#oom", tags: "oom out memory killed crash ram unified", page: "Help" },
+  { title: "Out of Memory", section: "OOM errors", url: "troubleshooting.html#oom", tags: "oom out memory killed crash ram unified gradient checkpointing", page: "Help" },
+  { title: "Performance & Tuning", section: "Env vars and loss-shift note", url: "troubleshooting.html#perf-tuning", tags: "performance tuning env var MLX_TUNE_DISABLE_COMPILE MLX_TUNE_BUCKET_SIZE loss shift off-by-one", page: "Help" },
   { title: "GGUF Export", section: "Export issues", url: "troubleshooting.html#gguf", tags: "gguf export quantized limitation ollama llama.cpp", page: "Help" },
   { title: "NaN Loss", section: "Training produces NaN", url: "troubleshooting.html#nan", tags: "nan loss training gradient explode infinity", page: "Help" },
 

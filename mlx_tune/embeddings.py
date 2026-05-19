@@ -216,7 +216,7 @@ class EmbeddingModelWrapper:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         **kwargs,
     ):
@@ -334,15 +334,13 @@ class EmbeddingModelWrapper:
         if self.pooling_strategy == "cls":
             return last_hidden_state[:, 0, :]
         elif self.pooling_strategy == "last_token":
-            # For decoder-based models (Qwen3-Embedding, Harrier, etc.)
-            seq_lengths = attention_mask.sum(axis=1).astype(mx.int32) - 1
-            batch_size = last_hidden_state.shape[0]
-            # Gather last valid token for each sequence
-            result = []
-            for i in range(batch_size):
-                idx = seq_lengths[i].item()
-                result.append(last_hidden_state[i, idx, :])
-            return mx.stack(result)
+            # For decoder-based models (Qwen3-Embedding, Harrier, etc.).
+            # Vectorized gather — no per-sample .item() sync.
+            seq_lengths = attention_mask.sum(axis=1).astype(mx.int32) - 1  # (B,)
+            B, _, D = last_hidden_state.shape
+            idx = mx.broadcast_to(seq_lengths[:, None, None], (B, 1, D))
+            gathered = mx.take_along_axis(last_hidden_state, idx, axis=1)
+            return gathered.squeeze(1)
         else:
             # Mean pooling (default)
             mask_expanded = attention_mask[:, :, None].astype(last_hidden_state.dtype)
@@ -582,7 +580,7 @@ class FastEmbeddingModel:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         **kwargs,
     ) -> Any:
@@ -749,7 +747,14 @@ class EmbeddingDataCollator:
         self.max_seq_length = max_seq_length
 
     def _tokenize_texts(self, texts: List[str]) -> Dict[str, mx.array]:
-        """Tokenize a list of texts into padded tensors."""
+        """Tokenize a list of texts and pad to the next bucket length.
+
+        Bucketing keeps `mx.compile`'s per-shape cache small — without it,
+        every batch with a unique sequence length triggers a recompile.
+        """
+        from mlx_tune._perf import bucket_length
+        import numpy as np
+
         encoded = self.tokenizer(
             texts,
             padding=True,
@@ -757,9 +762,21 @@ class EmbeddingDataCollator:
             max_length=self.max_seq_length,
             return_tensors="np",
         )
+        ids = encoded["input_ids"]
+        mask = encoded["attention_mask"]
+        cur_len = ids.shape[1]
+        target_len = min(bucket_length(cur_len), self.max_seq_length)
+        if target_len > cur_len:
+            try:
+                pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
+            except (TypeError, ValueError):
+                pad_id = 0
+            pad_w = target_len - cur_len
+            ids = np.pad(ids, ((0, 0), (0, pad_w)), constant_values=pad_id)
+            mask = np.pad(mask, ((0, 0), (0, pad_w)), constant_values=0)
         return {
-            "input_ids": mx.array(encoded["input_ids"]),
-            "attention_mask": mx.array(encoded["attention_mask"]),
+            "input_ids": mx.array(ids),
+            "attention_mask": mx.array(mask),
         }
 
     def __call__(self, samples: Union[List[Dict], Dict]) -> Dict[str, mx.array]:
@@ -899,13 +916,22 @@ class EmbeddingSFTTrainer:
         from mlx_tune.losses import infonce_loss, cosine_embedding_loss, triplet_loss
         from tqdm import tqdm
 
+        from mlx_tune._perf import (
+            compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+
         print("=" * 70)
         print("Starting Embedding Fine-Tuning")
         print("=" * 70)
 
+        configure_wired_limit()
+
         # Ensure LoRA is applied
         if self.wrapper and self.wrapper.lora_enabled and not self.wrapper._lora_applied:
             self.wrapper._apply_lora()
+        if self.wrapper:
+            enable_grad_checkpoint(self.wrapper)
 
         train_model = self.actual_model
         train_model.train()
@@ -917,12 +943,13 @@ class EmbeddingSFTTrainer:
             if pooling_strategy == "cls":
                 return hidden[:, 0, :]
             elif pooling_strategy == "last_token":
-                seq_lengths = mask.sum(axis=1).astype(mx.int32) - 1
-                result = []
-                for i in range(hidden.shape[0]):
-                    idx = seq_lengths[i].item()
-                    result.append(hidden[i, idx, :])
-                return mx.stack(result)
+                # Vectorized gather of the last valid token per row — no
+                # per-sample .item() syncs inside value_and_grad.
+                seq_lengths = mask.sum(axis=1).astype(mx.int32) - 1  # (B,)
+                B, _, D = hidden.shape
+                idx = mx.broadcast_to(seq_lengths[:, None, None], (B, 1, D))
+                gathered = mx.take_along_axis(hidden, idx, axis=1)
+                return gathered.squeeze(1)
             else:
                 mask_exp = mask[:, :, None].astype(hidden.dtype)
                 return (hidden * mask_exp).sum(axis=1) / mx.maximum(mask_exp.sum(axis=1), 1e-9)
@@ -1007,6 +1034,26 @@ class EmbeddingSFTTrainer:
         # Optimizer
         optimizer = optim.Adam(learning_rate=self.learning_rate)
 
+        # Compiled step (mlx-lm pattern). `shapeless=True` because anchor /
+        # positive / negative texts have variable seq length within a batch.
+        # Closures over Python ints (grad_accum) are fine — they're folded
+        # into the trace at compile time.
+        grad_accum_local = self.gradient_accumulation_steps
+        state = make_step_state(train_model, optimizer)
+
+        def step(batch, prev_grad, do_update):
+            loss, grad = loss_and_grad_fn(train_model, batch)
+            if prev_grad is not None:
+                grad = tree_map(lambda a, g: a + g, prev_grad, grad)
+            if do_update:
+                if grad_accum_local > 1:
+                    grad = tree_map(lambda g: g / grad_accum_local, grad)
+                optimizer.update(train_model, grad)
+                return loss, None
+            return loss, grad
+
+        step = compiled_step(step, state)
+
         # Determine total steps
         dataset_len = len(self.train_dataset) if hasattr(self.train_dataset, "__len__") else 0
         if self.max_steps:
@@ -1029,16 +1076,16 @@ class EmbeddingSFTTrainer:
         grad_accum = self.gradient_accumulation_steps
         progress = tqdm(range(total_steps), desc="Training")
         total_loss = 0.0
-        step = 0
+        step_counter = 0
         micro_step = 0
-        accum_loss = 0.0
+        accum_loss_arr = mx.zeros((), dtype=mx.float32)  # on-device accumulator
         accumulated_grads = None
         epoch = 0
 
-        while step < total_steps:
+        while step_counter < total_steps:
             epoch += 1
             for i in range(0, max(dataset_len, 1), self.batch_size):
-                if step >= total_steps:
+                if step_counter >= total_steps:
                     break
 
                 # Get batch
@@ -1056,44 +1103,30 @@ class EmbeddingSFTTrainer:
                 else:
                     batch = self.train_dataset[i]
 
-                loss, grads = loss_and_grad_fn(train_model, batch)
-                mx.eval(loss)
+                do_update = (micro_step + 1) >= grad_accum
+                loss, accumulated_grads = step(batch, accumulated_grads, do_update)
 
-                # Accumulate gradients
-                if accumulated_grads is None:
-                    accumulated_grads = grads
-                else:
-                    accumulated_grads = tree_map(
-                        lambda a, g: a + g, accumulated_grads, grads
-                    )
-                accum_loss += loss.item()
+                accum_loss_arr = accum_loss_arr + loss.astype(mx.float32)
+                mx.eval(state, accum_loss_arr, accumulated_grads)
                 micro_step += 1
 
-                # Update weights every grad_accum micro-steps
-                if micro_step >= grad_accum:
-                    averaged_grads = tree_map(
-                        lambda g: g / grad_accum, accumulated_grads
-                    )
-                    optimizer.update(train_model, averaged_grads)
-                    mx.eval(train_model, optimizer.state)
-
-                    loss_val = accum_loss / grad_accum
+                if do_update:
+                    loss_val = float(accum_loss_arr.item()) / grad_accum
                     total_loss += loss_val
-                    step += 1
+                    step_counter += 1
                     micro_step = 0
-                    accum_loss = 0.0
+                    accum_loss_arr = mx.zeros((), dtype=mx.float32)
                     accumulated_grads = None
 
                     progress.update(1)
-                    if step % self.logging_steps == 0:
-                        avg_loss = total_loss / step
+                    if step_counter % self.logging_steps == 0:
+                        avg_loss = total_loss / step_counter
                         progress.set_postfix(
                             {"loss": f"{loss_val:.4f}", "avg_loss": f"{avg_loss:.4f}"}
                         )
 
-                    # Save checkpoint
-                    if self.save_steps and step % self.save_steps == 0 and self.wrapper:
-                        ckpt_dir = Path(self.output_dir) / f"checkpoint-{step}"
+                    if self.save_steps and step_counter % self.save_steps == 0 and self.wrapper:
+                        ckpt_dir = Path(self.output_dir) / f"checkpoint-{step_counter}"
                         self.wrapper.save_pretrained(str(ckpt_dir))
 
         progress.close()
@@ -1104,7 +1137,7 @@ class EmbeddingSFTTrainer:
             self.wrapper.save_pretrained(str(adapter_dir))
             self.wrapper._adapter_path = adapter_dir
 
-        avg_loss = total_loss / max(step, 1)
+        avg_loss = total_loss / max(step_counter, 1)
         print(f"\nTraining complete! Average loss: {avg_loss:.4f}")
 
         return _TrainerStats({"train_loss": avg_loss, "train_runtime": 0})

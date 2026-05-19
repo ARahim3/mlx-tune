@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Performance &mdash; mlx-tune Docs</title>
+  <meta name="description" content="Training speed and memory you can expect from mlx-tune on Apple Silicon, plus the knobs that let you trade memory for speed.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%25' y='73%25' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='900' font-size='22' fill='%23e6edf3'>m</text></svg>">
+  <meta property="og:title" content="Performance - mlx-tune Docs">
+  <meta property="og:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png?v=2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/prism-dark.css">
+  <link rel="stylesheet" href="assets/css/style.css">
+  <style>
+    /* Keep model identifiers on one line so the table stays readable. */
+    .perf-table td.model { white-space: nowrap; }
+    .perf-table th.num, .perf-table td.num { text-align: right; white-space: nowrap; }
+    .perf-table { width: 100%; }
+  </style>
+</head>
+<body>
+
+  <nav class="top-nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-logo"><img src="assets/img/logo.png" alt="mlx-tune"></a>
+      <ul class="nav-links">
+        <li><a href="index.html">Home</a></li>
+        <li><a href="llm.html">LLM</a></li>
+        <li><a href="vlm.html">VLM</a></li>
+        <li><a href="ocr.html">OCR</a></li>
+        <li><a href="audio.html">Audio</a></li>
+        <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="performance.html" class="active">Performance</a></li>
+        <li><a href="examples.html">Examples</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      </ul>
+      <div class="nav-right">
+        <button class="search-trigger" aria-label="Search docs">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="5"/><path d="M10.5 10.5L15 15"/></svg>
+          Search
+          <kbd>⌘K</kbd>
+        </button>
+        <a href="https://github.com/ARahim3/mlx-tune" class="github-link" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" fill="currentColor"/></svg></a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+        <button class="mobile-toggle" aria-label="Menu">&#9776;</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Search Modal -->
+  <div class="search-overlay" role="dialog" aria-label="Search documentation">
+    <div class="search-modal">
+      <div class="search-input-wrap">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="5"/><path d="M10.5 10.5L15 15"/></svg>
+        <input type="text" class="search-input" placeholder="Search docs..." autocomplete="off" spellcheck="false">
+        <span class="search-esc">esc</span>
+      </div>
+      <div class="search-results"></div>
+      <div class="search-footer">
+        <span class="search-footer-item"><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span class="search-footer-item"><kbd>&crarr;</kbd> open</span>
+        <span class="search-footer-item"><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Back to Top -->
+  <button class="back-to-top" aria-label="Back to top">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 13V3M3 7l5-5 5 5"/></svg>
+  </button>
+
+  <div class="page-wrapper">
+    <main class="content full-width">
+
+      <h1>Performance</h1>
+      <p style="color:var(--text-secondary);font-size:1.05rem;">Training speed and memory you can expect, plus the knobs you can use when defaults don&rsquo;t fit your workload.</p>
+
+      <h2 id="what-to-expect">What to expect on M4 Pro 48 GB</h2>
+      <p>These numbers come from our own runs on an M4 Pro 48 GB Mac. They&rsquo;re rough indicators, not benchmarks &mdash; treat them as &ldquo;starting expectations.&rdquo; Your numbers will move with model size, quantization, context length, batch size, dataset shape, and macOS version. All rows below use LoRA rank 8&ndash;16.</p>
+
+      <table class="perf-table">
+        <thead>
+          <tr>
+            <th>Workload</th>
+            <th>Model</th>
+            <th class="num">Context</th>
+            <th class="num">Batch</th>
+            <th class="num">Speed</th>
+            <th class="num">Peak GB</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>SFT</strong></td>
+            <td class="model">Qwen3&ndash;0.6B&ndash;bf16</td>
+            <td class="num">1024</td><td class="num">1</td>
+            <td class="num">~2.2 it/s</td><td class="num">2.6</td>
+            <td>16 LoRA layers (q, v), no checkpointing</td>
+          </tr>
+          <tr>
+            <td><strong>SFT</strong></td>
+            <td class="model">Qwen3&ndash;0.6B&ndash;bf16</td>
+            <td class="num">4096</td><td class="num">1</td>
+            <td class="num">~0.28 it/s</td><td class="num">18</td>
+            <td>full LoRA, no checkpointing</td>
+          </tr>
+          <tr>
+            <td><strong>DPO</strong></td>
+            <td class="model">Qwen3.5&ndash;0.8B&ndash;MLX&ndash;4bit</td>
+            <td class="num">512</td><td class="num">1</td>
+            <td class="num">~540 ms/sample</td><td class="num">~1</td>
+            <td>shares the prompt forward between chosen &amp; rejected</td>
+          </tr>
+          <tr>
+            <td><strong>DPO</strong></td>
+            <td class="model">Qwen3.5&ndash;0.8B&ndash;MLX&ndash;4bit</td>
+            <td class="num">512</td><td class="num">2</td>
+            <td class="num">~810 ms/sample</td><td class="num">~1.2</td>
+            <td>batched (prompt-share applies only at batch size 1)</td>
+          </tr>
+          <tr>
+            <td><strong>ORPO</strong></td>
+            <td class="model">Qwen3.5&ndash;0.8B&ndash;MLX&ndash;4bit</td>
+            <td class="num">512</td><td class="num">1</td>
+            <td class="num">~430 ms/sample</td><td class="num">~1</td>
+            <td>shares the prompt forward between chosen &amp; rejected</td>
+          </tr>
+          <tr>
+            <td><strong>ORPO</strong></td>
+            <td class="model">Qwen3&ndash;0.6B&ndash;bf16</td>
+            <td class="num">4096</td><td class="num">1</td>
+            <td class="num">~0.09 it/s</td><td class="num">9.2</td>
+            <td>set <code>use_gradient_checkpointing="unsloth"</code></td>
+          </tr>
+          <tr>
+            <td><strong>ORPO</strong></td>
+            <td class="model">Qwen3&ndash;0.6B&ndash;bf16</td>
+            <td class="num">2048</td><td class="num">1</td>
+            <td class="num">~0.41 it/s</td><td class="num">16.8</td>
+            <td>no checkpointing needed</td>
+          </tr>
+          <tr>
+            <td><strong>GRPO</strong></td>
+            <td class="model">Qwen3&ndash;0.6B&ndash;bf16</td>
+            <td class="num">4096</td><td class="num">1</td>
+            <td class="num">~0.11 it/s</td><td class="num">5.3</td>
+            <td>4 generations &times; 256 tokens per step</td>
+          </tr>
+          <tr>
+            <td><strong>GRPO</strong></td>
+            <td class="model">Qwen3.5&ndash;0.8B&ndash;4bit</td>
+            <td class="num">~128&ndash;512</td><td class="num">1</td>
+            <td class="num">~4.8 s/iter</td><td class="num">15.9</td>
+            <td>4 generations &times; 128 tokens per step</td>
+          </tr>
+          <tr>
+            <td><strong>Embedding</strong></td>
+            <td class="model">MiniLM&ndash;L6&ndash;v2&ndash;bf16 (22M)</td>
+            <td class="num">128</td><td class="num">32</td>
+            <td class="num">~25 ms/step</td><td class="num">&lt;0.5</td>
+            <td>InfoNCE contrastive</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout" style="margin-top:1.5rem;">
+        <div class="callout-title">How to read this</div>
+        <p style="margin:0;">
+          <strong>it/s</strong> is full step time &mdash; forward, backward, optimizer, and per-step overhead. <strong>ms/sample</strong> divides wall time by the total samples processed across the run, which is the fair number when comparing batch sizes. <strong>Peak GB</strong> is the high-water mark over the whole run via <code>mx.get_peak_memory()</code> &mdash; not the steady-state working set.
+        </p>
+      </div>
+
+      <h3 id="smaller-macs">Scaling down to smaller Macs</h3>
+      <p>As a rule of thumb, halving the available memory means halving the context length you can comfortably train at, for the same model class. If you&rsquo;re on 24 GB, the M4 Pro 48 GB rows above should run at roughly half the maximum context; on 16 GB, around a quarter. Below 16 GB, stick to 4-bit models in the 0.5&ndash;1B range at context length 1024 or shorter.</p>
+
+      <h3 id="prompt-share-note">A note on DPO/ORPO at batch size 1</h3>
+      <p>At <code>per_device_train_batch_size=1</code>, the trainer forwards the prompt once and reuses the result for both the chosen and rejected branches. The saving scales with how much of the sequence is prompt vs. response &mdash; the rows above are at roughly equal prompt and response length. With very short prompts the speedup is modest; with very long prompts (multi-turn or reasoning data), it gets larger.</p>
+
+      <h2 id="knobs">Performance knobs</h2>
+      <p>Most things are already on by default. These are the levers worth knowing about when defaults don&rsquo;t fit.</p>
+
+      <h3 id="grad-checkpoint">Gradient checkpointing</h3>
+      <p>Trades roughly 2&times; backward time for about half the activation memory. Off by default because most short-context runs don&rsquo;t need it. Turn it on when you hit OOM at long context or with a large model:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">model = FastLanguageModel.get_peft_model(
+    model, r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    use_gradient_checkpointing="unsloth",  # opt in for ctx >= 4096 or 7B+
+)</code></pre>
+      </div>
+      <p>This flag is now respected by every trainer (not just SFT &mdash; it used to silently no-op for DPO, ORPO, KTO, SimPO, GRPO, CPT, and the audio/embedding/VLM trainers).</p>
+
+      <h3 id="validation">SFT validation cost</h3>
+      <p>The default is light &mdash; 5 validation batches per evaluation pass, evaluated every <code>max(save_steps, 200)</code> steps. Set <code>val_batches=0</code> to skip evaluation entirely on benchmarking or short runs:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">SFTConfig(
+    val_batches=5,        # default; set 0 to skip eval
+    steps_per_eval=200,   # default = max(save_steps, 200)
+)</code></pre>
+      </div>
+
+      <h3 id="dpo-reference">DPO reference model</h3>
+      <p>DPO now uses a frozen reference policy by default &mdash; the chosen/rejected log-probabilities of the base model are computed once at the start and reused for the whole run. This matches the standard DPO formulation. If you want the older behaviour (using the policy itself with <code>stop_gradient</code> as a stand-in reference), opt out:</p>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">DPOConfig(
+    precompute_ref_logprobs=True,   # default; False for legacy stop-grad reference
+)</code></pre>
+      </div>
+
+      <h3 id="env-vars">Environment variables</h3>
+      <p>Two escape hatches for debugging or A/B testing:</p>
+      <table>
+        <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>MLX_TUNE_DISABLE_COMPILE=1</code></td><td>Disable <code>@mx.compile</code> globally and run trainers eagerly. Useful for narrowing down a compile-related issue or comparing eager vs. compiled wall time.</td></tr>
+          <tr><td><code>MLX_TUNE_BUCKET_SIZE=N</code></td><td>Override the default 64-token padding bucket used by collators. Set to <code>1</code> to effectively disable bucketing.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="automatic">What&rsquo;s automatic</h2>
+      <p>You don&rsquo;t need to think about any of this &mdash; it&rsquo;s already happening underneath. Mentioned here so you know what you&rsquo;re getting:</p>
+      <ul style="color:var(--text-secondary);line-height:1.9;">
+        <li><strong>Memory-friendly log-probs.</strong> Preference and policy losses avoid materializing a full <code>(batch, length, vocab)</code> log-softmax tensor &mdash; matters most on large-vocabulary models like Qwen3 (V&asymp;152k) and Llama 3+ (V&asymp;128k).</li>
+        <li><strong>KV-cached GRPO generation.</strong> Each rollout reuses the prompt cache instead of re-forwarding the prefix every step.</li>
+        <li><strong>Shared prompt cache across GRPO rollouts.</strong> The prompt forward runs once per prompt, then forks for each of the N completions in the group.</li>
+        <li><strong><code>@mx.compile</code> step wrappers</strong> with eager fallback &mdash; if a trace fails for any reason, training continues without it.</li>
+        <li><strong>Length bucketing</strong> in collators &mdash; consecutive batches hit the same compile-cache slot instead of triggering a recompile per shape.</li>
+        <li><strong>Gradient checkpointing propagation</strong> &mdash; <code>use_gradient_checkpointing</code> now actually works for every trainer (see above).</li>
+        <li><strong>Prompt-prefix sharing for DPO/ORPO/SimPO</strong> at batch size 1 &mdash; the prompt is forwarded once and reused for both branches.</li>
+        <li><strong>Wired memory limit</strong> set at the start of every training run, matching mlx-lm&rsquo;s training-time configuration.</li>
+        <li><strong>RNN-T loss refactor</strong> for Parakeet TDT &mdash; ~1.5&times; faster backward pass, bit-identical with the prior implementation.</li>
+      </ul>
+
+      <footer class="footer">
+        <p>Community project, not affiliated with Unsloth AI or Apple.</p>
+        <p><a href="https://github.com/ARahim3/mlx-tune">GitHub</a> &middot; <a href="https://pypi.org/project/mlx-tune/">PyPI</a> &middot; Apache 2.0 License</p>
+      </footer>
+    </main>
+  </div>
+
+  <script src="assets/js/prism.min.js"></script>
+  <script src="assets/js/prism-python.min.js"></script>
+  <script src="assets/js/prism-bash.min.js"></script>
+  <script src="assets/js/search-index.js"></script>
+  <script src="assets/js/main.js"></script>
+</body>
+</html>

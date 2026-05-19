@@ -70,7 +70,8 @@ def main():
         lora_alpha=16,  # LoRA scaling factor
         lora_dropout=0.05,  # Dropout for regularization
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        # use_gradient_checkpointing defaults to False — opt in with "unsloth"
+        # only when you OOM (e.g. ctx≥4096 or large model on tight-RAM Mac).
     )
     print("✓ LoRA configured!")
     print(f"   LoRA Rank: {model.lora_config['r']}")

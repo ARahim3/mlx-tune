@@ -49,6 +49,7 @@ def main():
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
+        # ctx=4096 + long reasoning chains — keep GC on for activation memory.
         use_gradient_checkpointing="unsloth",
     )
 

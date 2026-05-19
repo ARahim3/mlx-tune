@@ -51,6 +51,7 @@ def main():
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
+        # Required: Phi-3.5-MoE 41.9B-A6.6B 4-bit needs GC for activation memory.
         use_gradient_checkpointing="unsloth",
         random_state=3407,
     )

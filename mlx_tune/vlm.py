@@ -181,6 +181,7 @@ class FastVisionModel:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_rslora: bool = False,
         loftq_config: Optional[Any] = None,
@@ -222,6 +223,7 @@ class FastVisionModel:
             "finetune_attention_modules": finetune_attention_modules,
             "finetune_mlp_modules": finetune_mlp_modules,
             "target_modules": target_modules,
+            "use_gradient_checkpointing": use_gradient_checkpointing,
         }
         model.lora_enabled = True
 
@@ -1254,19 +1256,15 @@ class _VLMTrainerShim:
         else:
             loss_mask = mx.ones_like(loss)
 
-        # Mask prompt tokens (train on completions only)
+        # Mask prompt tokens (train on completions only).
+        # Vectorized: cumsum of (label == assistant_id) along the seq dim. Once
+        # we hit the assistant role marker for a row, every later position has
+        # cumsum >= 1, so the mask flips on. No Python iteration, no .tolist()
+        # sync inside value_and_grad. Equivalent to the previous per-row scan
+        # (the role-marker token itself is included in the completion).
         if self.train_on_completions and self.assistant_id is not None:
-            mask_rows = []
-            for i in range(shift_labels.shape[0]):
-                labels_list = shift_labels[i].tolist()
-                in_completion = False
-                mask_row = []
-                for tok in labels_list:
-                    if tok == self.assistant_id:
-                        in_completion = True
-                    mask_row.append(1.0 if in_completion else 0.0)
-                mask_rows.append(mask_row)
-            completion_mask = mx.array(mask_rows, dtype=loss.dtype)
+            is_role = (shift_labels == self.assistant_id).astype(loss.dtype)
+            completion_mask = (mx.cumsum(is_role, axis=-1) > 0).astype(loss.dtype)
             loss_mask = loss_mask * completion_mask
 
         loss = (loss * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1)
@@ -1379,9 +1377,21 @@ class VLMSFTTrainer:
         import mlx.optimizers as optim
         from tqdm import tqdm
 
+        from mlx_tune._perf import configure_wired_limit, enable_grad_checkpoint
+
         print("=" * 70)
         print("Starting VLM Fine-Tuning")
         print("=" * 70)
+
+        # Lift wired-memory ceiling so MLX can hold more model in non-pageable
+        # memory (matches mlx-lm's tuner behaviour). No-op on non-Metal.
+        configure_wired_limit()
+        # Wire gradient checkpointing if `use_gradient_checkpointing` was set
+        # on the wrapper's lora_config. Walks down to `language_model.layers`
+        # (mlx-vlm convention) and checkpoints the LM block class — vision
+        # encoder layers are much smaller so we leave them unwrapped.
+        if self.wrapper is not None:
+            enable_grad_checkpoint(self.wrapper)
 
         # Ensure model is in training mode
         self.actual_model.train()
@@ -1450,13 +1460,22 @@ class VLMSFTTrainer:
         from mlx.utils import tree_map
         from tqdm import tqdm
 
+        # Note: `@mx.compile` is intentionally NOT applied to the VLM step.
+        # Image dimensions (and therefore vision-token counts after spatial
+        # crop / grid sampling) vary per batch, and the vision branch contains
+        # ops that derive Python ints from array shapes — `shapeless=True`
+        # rejects the trace at first call. Re-evaluate once mlx-vlm exposes a
+        # bucketed image-resize hook.
+
         grad_accum = self.gradient_accumulation_steps
         progress = tqdm(range(total_steps), desc="Training")
         total_loss = 0.0
         step = 0
         epoch = 0
         micro_step = 0
-        accum_loss = 0.0
+        # Loss accumulator stays on-device — no .item() inside the
+        # micro-step loop (was a host sync per micro-step).
+        accum_loss_arr = mx.zeros((), dtype=mx.float32)
 
         # For gradient accumulation, we compute loss+grad manually
         loss_and_grad_fn = nn.value_and_grad(trainer.model, trainer.loss_fn)
@@ -1473,16 +1492,18 @@ class VLMSFTTrainer:
                 batch = self.data_collator(batch_samples)
 
                 loss, grads = loss_and_grad_fn(trainer.model, batch)
-                mx.eval(loss)
 
-                # Accumulate gradients
+                # Accumulate gradients and loss. We still mx.eval the running
+                # tree per micro-step so activations don't pile up, but keep
+                # the loss accumulator on-device — no .item() per micro-step.
                 if accumulated_grads is None:
                     accumulated_grads = grads
                 else:
                     accumulated_grads = tree_map(
                         lambda a, g: a + g, accumulated_grads, grads
                     )
-                accum_loss += loss.item()
+                accum_loss_arr = accum_loss_arr + loss.astype(mx.float32)
+                mx.eval(accumulated_grads, accum_loss_arr)
                 micro_step += 1
 
                 # Update weights every grad_accum micro-steps
@@ -1494,11 +1515,12 @@ class VLMSFTTrainer:
                     trainer.optimizer.update(trainer.model, averaged_grads)
                     mx.eval(trainer.model, trainer.optimizer.state)
 
-                    loss_val = accum_loss / grad_accum
+                    # Single host sync per macro-step instead of per micro-step.
+                    loss_val = float(accum_loss_arr.item()) / grad_accum
                     total_loss += loss_val
                     step += 1
                     micro_step = 0
-                    accum_loss = 0.0
+                    accum_loss_arr = mx.zeros((), dtype=mx.float32)
                     accumulated_grads = None
 
                     progress.update(1)
@@ -1783,10 +1805,16 @@ class VLMGRPOTrainer:
         import os
         import re
 
+        from mlx_tune._perf import configure_wired_limit, enable_grad_checkpoint
+        configure_wired_limit()
+
         print("\n[Using Native Vision GRPO Training with Policy Gradient]")
 
         wrapper = self.model if isinstance(self.model, VLMModelWrapper) else None
         actual_model = wrapper.model if wrapper else self.model
+        # Wire GC if the wrapper's lora_config requested it.
+        if wrapper is not None:
+            enable_grad_checkpoint(wrapper)
 
         # Ensure training mode
         if hasattr(actual_model, 'train'):
@@ -1841,6 +1869,10 @@ class VLMGRPOTrainer:
             return -advantage * comp_log_prob[0]
 
         loss_and_grad = nn.value_and_grad(actual_model, pg_loss_fn)
+
+        # Note: `@mx.compile` is intentionally NOT applied here. Same reason
+        # as VLMSFTTrainer: image-derived shapes vary per prompt, and the
+        # vision branch isn't shapeless-friendly.
 
         print(f"\nStarting training for {self.iters} iterations...")
         print(f"  Generating {self.num_generations} completions per prompt")

@@ -32,6 +32,7 @@
         <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="performance.html">Performance</a></li>
         <li><a href="examples.html">Examples</a></li>
         <li><a href="troubleshooting.html">Troubleshooting</a></li>
       </ul>
@@ -144,7 +145,7 @@ model.save_pretrained("lora_model")</code></pre>
 
           <h4>FastLanguageModel.from_pretrained()</h4>
           <div class="api-signature">
-            <span class="api-name">FastLanguageModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=2048</span>, <span class="api-param">load_in_4bit</span><span class="api-default">=False</span>, <span class="api-param">load_in_8bit</span><span class="api-default">=False</span>, <span class="api-param">use_gradient_checkpointing</span><span class="api-default">="unsloth"</span>, ...) &rarr; <span class="api-param">Tuple[MLXModelWrapper, Tokenizer]</span>
+            <span class="api-name">FastLanguageModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">max_seq_length</span><span class="api-default">=2048</span>, <span class="api-param">load_in_4bit</span><span class="api-default">=False</span>, <span class="api-param">load_in_8bit</span><span class="api-default">=False</span>, <span class="api-param">use_gradient_checkpointing</span><span class="api-default">=False</span>, ...) &rarr; <span class="api-param">Tuple[MLXModelWrapper, Tokenizer]</span>
           </div>
           <p>Load a pretrained language model from HuggingFace or a local path.</p>
           <table class="api-params">
@@ -154,7 +155,7 @@ model.save_pretrained("lora_model")</code></pre>
               <tr><td><code>max_seq_length</code></td><td>int</td><td>Maximum sequence length for training and inference</td></tr>
               <tr><td><code>load_in_4bit</code></td><td>bool</td><td>Load model with 4-bit quantization (QLoRA)</td></tr>
               <tr><td><code>load_in_8bit</code></td><td>bool</td><td>Load model with 8-bit quantization</td></tr>
-              <tr><td><code>use_gradient_checkpointing</code></td><td>str | bool</td><td>Gradient checkpointing mode (accepted for Unsloth compat)</td></tr>
+              <tr><td><code>use_gradient_checkpointing</code></td><td>str | bool</td><td>Gradient checkpointing &mdash; <code>False</code> (default), <code>True</code>, or <code>"unsloth"</code>. Off by default because it roughly doubles backward time; opt into <code>"unsloth"</code> for long-context training (ctx&ge;4096) or larger models where activation memory is the constraint.</td></tr>
             </tbody>
           </table>
 

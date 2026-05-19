@@ -54,7 +54,8 @@ def main():
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        # LFM2-350M is small enough to skip gradient checkpointing — default
+        # False keeps training ~2× faster. Set "unsloth" if you OOM.
         random_state=3407,
     )
     print("LoRA configured with LFM2-specific target modules")

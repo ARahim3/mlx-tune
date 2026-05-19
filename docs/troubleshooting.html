@@ -26,6 +26,7 @@
         <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
         <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="performance.html">Performance</a></li>
         <li><a href="examples.html">Examples</a></li>
         <li><a href="troubleshooting.html">Troubleshooting</a></li>
       </ul>
@@ -71,6 +72,7 @@
         <li><a href="#model-not-found">Model Not Found</a></li>
         <li><a href="#oom">Out of Memory</a></li>
         <li><a href="#slow">Slow Generation</a></li>
+        <li><a href="#perf-tuning">Performance &amp; Tuning</a></li>
         <li><a href="#gguf">GGUF Export</a></li>
         <li><a href="#vlm-issues">VLM Issues</a></li>
         <li><a href="#audio-issues">Audio Issues</a></li>
@@ -117,9 +119,18 @@ model_name = "mlx-community/Llama-3.2-8B-Instruct-4bit"</code></pre>
         <li>Use a smaller model</li>
         <li>Use 4-bit quantization (<code>load_in_4bit=True</code>)</li>
         <li>Reduce <code>max_seq_length</code></li>
+        <li><strong>Enable gradient checkpointing</strong> &mdash; pass <code>use_gradient_checkpointing="unsloth"</code> (or <code>True</code>) to <code>get_peft_model</code>. Trades roughly 2&times; backward time for about half the activation memory. The default is <code>False</code> because most short-context runs don&rsquo;t need it; opt in explicitly when you hit OOM at long context or with a large model.</li>
         <li>Close other applications (browsers, IDEs consume significant RAM)</li>
         <li>Ensure your macOS is up to date for the latest MLX improvements</li>
       </ul>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python"># Long-context fine-tuning: opt into gradient checkpointing
+model = FastLanguageModel.get_peft_model(
+    model, r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    use_gradient_checkpointing="unsloth",  # ON for ctx >= 4096 / 7B+ models
+)</code></pre>
+      </div>
 
       <!-- Slow Generation -->
       <h2 id="slow">Slow Generation</h2>
@@ -141,6 +152,27 @@ response = generate(model.model, tokenizer,
         <li>4. Keep macOS updated for the latest MLX optimizations</li>
         <li>5. Close memory-heavy applications to free unified memory bandwidth</li>
       </ul>
+
+      <!-- Performance & Tuning -->
+      <h2 id="perf-tuning">Performance &amp; Tuning</h2>
+      <p>For a reference table of training speeds and peak memory across SFT, DPO, ORPO, GRPO, and embedding workloads &mdash; plus the full list of tuning knobs &mdash; see the <a href="performance.html">Performance page</a>. The notes below cover the two things most likely to come up in a troubleshooting context.</p>
+
+      <h3>Environment variables</h3>
+      <p>Two escape hatches when something feels off:</p>
+      <table>
+        <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>MLX_TUNE_DISABLE_COMPILE=1</code></td><td>Disable <code>@mx.compile</code> globally and run trainers eagerly. Use this if you suspect a compile-related issue or want to compare eager vs. compiled wall time.</td></tr>
+          <tr><td><code>MLX_TUNE_BUCKET_SIZE=N</code></td><td>Override the default 64-token padding bucket used by collators. Set to <code>1</code> to effectively disable bucketing.</td></tr>
+        </tbody>
+      </table>
+      <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-bash"># Run a trainer with compile disabled
+MLX_TUNE_DISABLE_COMPILE=1 python examples/21_dpo_preference_tuning.py</code></pre>
+      </div>
+
+      <h3>Loss values shifted slightly after upgrading to 0.5.0?</h3>
+      <p>0.5.0 fixes a small bug in length masking: earlier versions accidentally included one pad token&rsquo;s log-probability in every sample. The fix doesn&rsquo;t change DPO loss in practice (the spurious term cancelled in the log-ratio), but ORPO, KTO, SimPO, and GRPO loss curves shift slightly downward versus 0.4.x. The optimum and gradient direction are unchanged. If you compare loss curves across versions, expect a small offset.</p>
 
       <!-- GGUF Export -->
       <h2 id="gguf">GGUF Export from Quantized Models</h2>

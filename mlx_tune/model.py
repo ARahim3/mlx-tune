@@ -258,7 +258,7 @@ class FastLanguageModel:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_rslora: bool = False,
         loftq_config: Optional[Any] = None,
@@ -279,7 +279,24 @@ class FastLanguageModel:
             lora_alpha: LoRA scaling parameter
             lora_dropout: Dropout probability for LoRA layers
             bias: Bias configuration ("none", "all", or "lora_only")
-            use_gradient_checkpointing: Enable gradient checkpointing
+            use_gradient_checkpointing: Gradient checkpointing mode. Defaults to
+                ``False`` (faster training, more memory). Pass ``True`` or
+                ``"unsloth"`` to wrap each transformer block's forward with
+                ``mx.checkpoint`` — roughly halves activation memory at the cost
+                of ~2× wall-time per step (recompute in backward).
+
+                When to opt in:
+
+                * Long context (ctx≥4096) on M-series Macs — without GC, ORPO/DPO
+                  with both chosen+rejected forwards held live in
+                  ``value_and_grad`` will exceed the Metal wired-memory limit
+                  (~75% of unified RAM) and OOM.
+                * Large models on tighter-RAM machines (e.g., 7B+ on a 24GB Mac).
+                * Otherwise leave at ``False`` for ~2× faster training.
+
+                ``True`` and ``"unsloth"`` behave identically — mlx-tune doesn't
+                ship Unsloth's custom GC kernel; both map to mlx-lm's
+                ``mx.checkpoint``-based path.
             random_state: Random seed for initialization
             use_rslora: Use Rank-Stabilized LoRA
             loftq_config: LoftQ configuration (for quantization-aware init)
@@ -473,7 +490,7 @@ class MLXModelWrapper:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         **kwargs
     ):
@@ -486,7 +503,12 @@ class MLXModelWrapper:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             bias: Bias configuration
-            use_gradient_checkpointing: Gradient checkpointing mode
+            use_gradient_checkpointing: Gradient checkpointing mode. Defaults to
+                ``False`` for fast training. Pass ``True`` or ``"unsloth"`` to
+                halve activation memory at ~2× step-time cost — needed for
+                long-context (ctx≥4096) preference/RL training and for large
+                models on tight-RAM Macs. ``True`` and ``"unsloth"`` behave
+                identically; mlx-tune doesn't ship Unsloth's custom GC kernel.
             random_state: Random seed
             **kwargs: Additional configuration
         """

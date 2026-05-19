@@ -405,6 +405,12 @@ class CPTTrainer:
                 "Native training required for CPT. Install with: uv pip install 'mlx-lm[train]'"
             )
 
+        from mlx_tune._perf import (
+            bucket_length, compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+        configure_wired_limit()
+
         print("=" * 70)
         print("Starting Continual Pretraining (CPT)")
         print("=" * 70)
@@ -420,6 +426,7 @@ class CPTTrainer:
             if hasattr(self.model, '_apply_lora') and not self.model._lora_applied:
                 print("\nApplying LoRA adapters...")
                 self.model._apply_lora(num_layers=self.num_layers)
+            enable_grad_checkpoint(self.model)
 
             # Step 2: Unfreeze embed_tokens + lm_head
             if self.include_embeddings:
@@ -546,10 +553,12 @@ class CPTTrainer:
         lr_schedule = self._get_lr_schedule()
         optimizer = optim.AdamW(learning_rate=lr_schedule, weight_decay=self.weight_decay)
 
-        # Define loss function (standard next-token prediction)
+        # Define loss function (standard next-token prediction).
+        # No fp32 upcast — nn.losses.cross_entropy is numerically stable on
+        # fp16/bf16 logits and the upcast roughly doubles activation memory
+        # for big-vocab models (mlx-lm's default_loss does not upcast either).
         def loss_fn(model, input_ids, lengths):
             logits = model(input_ids)
-            logits = logits.astype(mx.float32)
 
             # Shift for next-token prediction
             shift_logits = logits[:, :-1, :]
@@ -566,8 +575,22 @@ class CPTTrainer:
 
         loss_and_grad = nn.value_and_grad(actual_model, loss_fn)
 
+        # Compiled step. CPT pads to per-batch max length so seq length varies
+        # → `shapeless=True`. The embedding-grad scaling closes over a Python
+        # float (`self._embedding_grad_scale`) which is baked into the trace.
+        scale_grads = self._scale_embedding_gradients
+        state = make_step_state(actual_model, optimizer)
+
+        def step_fn(input_ids, length_arr):
+            loss, grads = loss_and_grad(actual_model, input_ids, length_arr)
+            grads = scale_grads(grads)
+            optimizer.update(actual_model, grads)
+            return loss
+
+        step_fn = compiled_step(step_fn, state)
+
         print(f"\nStarting training for {self.iters} iterations...")
-        total_loss = 0.0
+        total_loss_arr = mx.zeros((), dtype=mx.float32)  # on-device accumulator
 
         for step in range(self.iters):
             # Get batch
@@ -588,8 +611,9 @@ class CPTTrainer:
                 tokens_list.append(toks)
                 lengths.append(len(toks))
 
-            # Pad to max length in batch
-            max_len = min(max(lengths), self.max_seq_length)
+            # Pad to max length in batch, rounded up to the next bucket
+            # so `mx.compile`'s per-shape cache hits.
+            max_len = min(bucket_length(max(lengths)), self.max_seq_length)
             pad_id = self.tokenizer.pad_token_id or 0
             padded = []
             actual_lengths = []
@@ -604,23 +628,15 @@ class CPTTrainer:
             input_ids = mx.array(padded)
             length_arr = mx.array(actual_lengths)
 
-            # Forward + backward
-            loss, grads = loss_and_grad(actual_model, input_ids, length_arr)
+            loss = step_fn(input_ids, length_arr)
+            total_loss_arr = total_loss_arr + loss.astype(mx.float32)
+            mx.eval(state, total_loss_arr)
 
-            # Scale embedding gradients for decoupled LR
-            grads = self._scale_embedding_gradients(grads)
-
-            # Optimizer step
-            optimizer.update(actual_model, grads)
-            mx.eval(actual_model.parameters(), optimizer.state)
-
-            total_loss += loss.item()
-
-            # Logging
+            # Logging — single host sync per logging_steps interval.
             if (step + 1) % self.logging_steps == 0:
-                avg_loss = total_loss / self.logging_steps
+                avg_loss = float(total_loss_arr.item()) / self.logging_steps
                 print(f"  Step {step + 1}/{self.iters} | Loss: {avg_loss:.4f}")
-                total_loss = 0.0
+                total_loss_arr = mx.zeros((), dtype=mx.float32)
 
             # Save checkpoint
             if (step + 1) % self.save_steps == 0:

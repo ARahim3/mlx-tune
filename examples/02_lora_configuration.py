@@ -33,7 +33,8 @@ def main():
         lora_alpha=16,
         lora_dropout=0.05,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        # use_gradient_checkpointing defaults to False (fast).
+        # Pass "unsloth" or True if you OOM at long ctx or with a large model.
         random_state=3407,
     )
     print("✓ LoRA adapters configured!")

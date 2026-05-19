@@ -4,6 +4,7 @@
 PROJECT_PLAN.md
 PROGRESS.md
 PHASE*.md
+perf_improvements.md
 IMPLEMENTATION_SUMMARY.md
 NEXT_SESSION.md
 docs_progress.md
@@ -74,6 +75,7 @@ adapters/
 fused_model/
 qwen_lora/
 qwen35_text_lora/
+drafts/
 *_lora/
 *_output/
 *_outputs/

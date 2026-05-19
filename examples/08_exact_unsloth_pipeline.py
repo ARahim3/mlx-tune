@@ -64,6 +64,9 @@ def main():
         lora_alpha=16,
         lora_dropout=0,  # 0 is optimized in Unsloth
         bias="none",
+        # Mirrors Unsloth's tutorial syntax exactly. mlx-tune's default is
+        # False (faster); pass "unsloth" or True when you need to halve
+        # activation memory at the cost of ~2× step time.
         use_gradient_checkpointing="unsloth",
         random_state=3407,
     )

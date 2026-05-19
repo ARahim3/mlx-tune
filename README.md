@@ -78,7 +78,24 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🚀 **v0.4.25** — Arcee Trinity-Nano (AFMoE) fine-tuning: SFT, GRPO reasoning, and CPT recipes with per-expert LoRA over 128 experts + 1 shared expert. Also: CPT now correctly detects LoRA-wrapped quantized `lm_head` (benefits every 4-bit CPT, not just Trinity).
+> 🚀 **v0.5.0 — Faster, leaner training across every trainer.**
+>
+> Headline numbers on an M4 Pro 48 GB Mac, Qwen3-class models:
+> - **GRPO runs roughly 10× faster.** Generation reuses a KV cache instead of re-forwarding the prefix every step, and the prompt forward now runs once per prompt and is reused across the N rollouts in the group.
+> - **DPO and ORPO at batch size 1** share the prompt forward between the chosen and rejected branches. On long-prompt data that's ~1.5× faster DPO and ~1.9× faster ORPO, per sample.
+> - **ORPO at 4096 context fits on a 48 GB Mac.** It used to OOM. Gradient checkpointing is now wired into every preference and audio trainer, not just SFT.
+> - **Embedding fine-tuning** is ~1.8× faster from `@mx.compile` plus length-bucketed collators.
+> - **Parakeet TDT (RNN-T) loss** is ~1.5× faster on the backward pass, with bit-identical results.
+>
+> Everything above is under the hood — existing scripts get the speedups with no code changes. A few small things worth knowing:
+>
+> - `use_gradient_checkpointing` now defaults to `False`. Set it to `"unsloth"` for long context (≥4096) or larger models where activation memory is tight.
+> - DPO uses a frozen reference model by default (the standard formulation). Pass `DPOConfig(precompute_ref_logprobs=False)` to restore the previous behaviour.
+> - SFT validation is lighter — `val_batches` defaults to 5 (was 25). Set `val_batches=0` to skip evaluation entirely.
+> - Env-var escape hatches: `MLX_TUNE_DISABLE_COMPILE=1` (run trainers eagerly), `MLX_TUNE_BUCKET_SIZE=N` (override the 64-token padding bucket).
+> - A small off-by-one in length masking is fixed in this release. ORPO, KTO, SimPO, and GRPO loss curves shift slightly versus 0.4.x; the optimum and gradient direction are unchanged.
+>
+> See the [Performance page](https://arahim3.github.io/mlx-tune/performance.html) for the full reference table and tuning knobs.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

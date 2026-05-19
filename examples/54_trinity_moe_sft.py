@@ -80,7 +80,8 @@ def main():
         lora_alpha=16,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        # Trinity-Nano is 6B MoE / 1B active — fits without GC at ctx=2048.
+        # Set "unsloth" if you push to longer contexts.
         random_state=3407,
     )
 

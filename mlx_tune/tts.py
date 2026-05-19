@@ -270,7 +270,7 @@ class FastTTSModel:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_rslora: bool = False,
         use_dora: bool = False,
@@ -451,7 +451,7 @@ class TTSModelWrapper:
         lora_alpha: int = 16,
         lora_dropout: float = 0.0,
         bias: str = "none",
-        use_gradient_checkpointing: Union[bool, str] = "unsloth",
+        use_gradient_checkpointing: Union[bool, str] = False,
         random_state: int = 3407,
         use_dora: bool = False,
         **kwargs,
@@ -922,6 +922,8 @@ class TTSDataCollator:
         if profile.codec_type == "qwen3_speech":
             return self._collate_qwen3_tts(samples)
 
+        from mlx_tune._perf import bucket_length
+
         all_input_ids = []
         all_labels = []
 
@@ -930,9 +932,10 @@ class TTSDataCollator:
             all_input_ids.append(input_ids)
             all_labels.append(labels)
 
-        # Pad to same length within batch
+        # Pad to same length within batch, rounded up to the next bucket so
+        # `mx.compile`'s per-shape cache hits across batches.
         max_len = min(
-            max(len(ids) for ids in all_input_ids),
+            bucket_length(max(len(ids) for ids in all_input_ids)),
             self.max_seq_length,
         )
 
@@ -955,6 +958,8 @@ class TTSDataCollator:
 
     def _collate_qwen3_tts(self, samples: List[Dict]) -> Dict:
         """Collate Qwen3-TTS samples into inputs_embeds + labels."""
+        from mlx_tune._perf import bucket_length
+
         all_embeds = []
         all_labels = []
 
@@ -963,9 +968,9 @@ class TTSDataCollator:
             all_embeds.append(embeds)
             all_labels.append(labels)
 
-        # Pad to same length (batch_size is forced to 1 for audio, but handle >1)
+        # Pad to same length within batch, rounded up to the next bucket.
         max_len = min(
-            max(e.shape[0] for e in all_embeds),
+            bucket_length(max(e.shape[0] for e in all_embeds)),
             self.max_seq_length,
         )
         hidden_size = all_embeds[0].shape[-1]
@@ -1295,13 +1300,22 @@ class TTSSFTTrainer:
         from mlx.utils import tree_map
         from tqdm import tqdm
 
+        from mlx_tune._perf import (
+            compiled_step, configure_wired_limit,
+            enable_grad_checkpoint, make_step_state,
+        )
+
         print("=" * 70)
         print("Starting TTS Fine-Tuning")
         print("=" * 70)
 
+        configure_wired_limit()
+
         # Ensure LoRA is applied
         if self.wrapper and self.wrapper.lora_enabled and not self.wrapper._lora_applied:
             self.wrapper._apply_lora()
+        if self.wrapper:
+            enable_grad_checkpoint(self.wrapper)
 
         # Set training mode
         self.actual_model.train()
@@ -1365,19 +1379,37 @@ class TTSSFTTrainer:
 
         loss_and_grad_fn = nn.value_and_grad(self.actual_model, loss_fn)
 
+        # Compiled step (mlx-lm pattern). `shapeless=True` because TTS token
+        # sequences vary in length per batch.
         grad_accum = self.gradient_accumulation_steps
+        actual_model = self.actual_model
+        state = make_step_state(actual_model, optimizer)
+
+        def step_fn(batch, prev_grad, do_update):
+            loss, grad = loss_and_grad_fn(actual_model, batch)
+            if prev_grad is not None:
+                grad = tree_map(lambda a, g: a + g, prev_grad, grad)
+            if do_update:
+                if grad_accum > 1:
+                    grad = tree_map(lambda g: g / grad_accum, grad)
+                optimizer.update(actual_model, grad)
+                return loss, None
+            return loss, grad
+
+        step_fn = compiled_step(step_fn, state)
+
         progress = tqdm(range(total_steps), desc="Training")
         total_loss = 0.0
-        step = 0
+        step_counter = 0
         micro_step = 0
-        accum_loss = 0.0
+        accum_loss_arr = mx.zeros((), dtype=mx.float32)  # on-device accumulator
         accumulated_grads = None
         epoch = 0
 
-        while step < total_steps:
+        while step_counter < total_steps:
             epoch += 1
             for i in range(0, max(dataset_len, 1), self.batch_size):
-                if step >= total_steps:
+                if step_counter >= total_steps:
                     break
 
                 # Get batch
@@ -1398,37 +1430,24 @@ class TTSSFTTrainer:
                     if not isinstance(batch, dict):
                         batch = {"input_ids": batch}
 
-                loss, grads = loss_and_grad_fn(self.actual_model, batch)
-                mx.eval(loss)
+                do_update = (micro_step + 1) >= grad_accum
+                loss, accumulated_grads = step_fn(batch, accumulated_grads, do_update)
 
-                # Accumulate gradients
-                if accumulated_grads is None:
-                    accumulated_grads = grads
-                else:
-                    accumulated_grads = tree_map(
-                        lambda a, g: a + g, accumulated_grads, grads
-                    )
-                accum_loss += loss.item()
+                accum_loss_arr = accum_loss_arr + loss.astype(mx.float32)
+                mx.eval(state, accum_loss_arr, accumulated_grads)
                 micro_step += 1
 
-                # Update weights every grad_accum micro-steps
-                if micro_step >= grad_accum:
-                    averaged_grads = tree_map(
-                        lambda g: g / grad_accum, accumulated_grads
-                    )
-                    optimizer.update(self.actual_model, averaged_grads)
-                    mx.eval(self.actual_model, optimizer.state)
-
-                    loss_val = accum_loss / grad_accum
+                if do_update:
+                    loss_val = float(accum_loss_arr.item()) / grad_accum
                     total_loss += loss_val
-                    step += 1
+                    step_counter += 1
                     micro_step = 0
-                    accum_loss = 0.0
+                    accum_loss_arr = mx.zeros((), dtype=mx.float32)
                     accumulated_grads = None
 
                     progress.update(1)
-                    if step % self.logging_steps == 0:
-                        avg_loss = total_loss / step
+                    if step_counter % self.logging_steps == 0:
+                        avg_loss = total_loss / step_counter
                         progress.set_postfix(
                             {"loss": f"{loss_val:.4f}", "avg_loss": f"{avg_loss:.4f}"}
                         )
@@ -1441,7 +1460,7 @@ class TTSSFTTrainer:
             self.wrapper.save_pretrained(str(adapter_dir))
             self.wrapper._adapter_path = adapter_dir
 
-        avg_loss = total_loss / max(step, 1)
+        avg_loss = total_loss / max(step_counter, 1)
         print(f"\nTraining complete! Average loss: {avg_loss:.4f}")
 
         return _TrainerStats({"train_loss": avg_loss, "train_runtime": 0})
