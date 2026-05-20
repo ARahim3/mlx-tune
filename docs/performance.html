@@ -14,10 +14,10 @@
   <link rel="stylesheet" href="assets/css/prism-dark.css">
   <link rel="stylesheet" href="assets/css/style.css">
   <style>
-    /* Keep model identifiers on one line so the table stays readable. */
-    .perf-table td.model { white-space: nowrap; }
-    .perf-table th.num, .perf-table td.num { text-align: right; white-space: nowrap; }
-    .perf-table { width: 100%; }
+    /* Right-align numeric columns; let the table follow the standard content column width. */
+    .perf-table th.num, .perf-table td.num { text-align: right; }
+    .perf-table-wrap { overflow-x: auto; margin: 16px 0 24px; }
+    .perf-table-wrap > table { margin: 0; }
   </style>
 </head>
 <body>
@@ -72,14 +72,30 @@
   </button>
 
   <div class="page-wrapper">
-    <main class="content full-width">
+    <aside class="sidebar">
+      <div class="sidebar-title">On This Page</div>
+      <ul class="sidebar-nav">
+        <li><a href="#what-to-expect">What to Expect</a></li>
+        <li class="sub-item"><a href="#smaller-macs">Smaller Macs</a></li>
+        <li class="sub-item"><a href="#prompt-share-note">DPO/ORPO at bs=1</a></li>
+        <li><a href="#knobs">Performance Knobs</a></li>
+        <li class="sub-item"><a href="#grad-checkpoint">Gradient Checkpointing</a></li>
+        <li class="sub-item"><a href="#validation">SFT Validation</a></li>
+        <li class="sub-item"><a href="#dpo-reference">DPO Reference</a></li>
+        <li class="sub-item"><a href="#env-vars">Environment Variables</a></li>
+        <li><a href="#automatic">What&rsquo;s Automatic</a></li>
+      </ul>
+    </aside>
+
+    <main class="content">
 
       <h1>Performance</h1>
-      <p style="color:var(--text-secondary);font-size:1.05rem;">Training speed and memory you can expect, plus the knobs you can use when defaults don&rsquo;t fit your workload.</p>
+      <p>Training speed and memory you can expect, plus the knobs you can use when defaults don&rsquo;t fit your workload.</p>
 
       <h2 id="what-to-expect">What to expect on M4 Pro 48 GB</h2>
       <p>These numbers come from our own runs on an M4 Pro 48 GB Mac. They&rsquo;re rough indicators, not benchmarks &mdash; treat them as &ldquo;starting expectations.&rdquo; Your numbers will move with model size, quantization, context length, batch size, dataset shape, and macOS version. All rows below use LoRA rank 8&ndash;16.</p>
 
+      <div class="perf-table-wrap">
       <table class="perf-table">
         <thead>
           <tr>
@@ -165,6 +181,7 @@
           </tr>
         </tbody>
       </table>
+      </div>
 
       <div class="callout" style="margin-top:1.5rem;">
         <div class="callout-title">How to read this</div>
