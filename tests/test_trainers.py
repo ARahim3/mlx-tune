@@ -127,6 +127,43 @@ class TestTrainerInitialization:
         assert KTOTrainer is not None
         assert SimPOTrainer is not None
 
+    def test_sft_native_training_forwards_gradient_accumulation(self, monkeypatch, tmp_path):
+        """Test SFTTrainer forwards gradient accumulation to MLX-LM TrainingArgs."""
+        from mlx_tune import SFTConfig, SFTTrainer
+        import mlx_tune.sft_trainer as sft_trainer
+
+        if not sft_trainer.HAS_NATIVE_TRAINING:
+            pytest.skip("Native MLX-LM training components are not available")
+
+        captured = {}
+
+        def fake_train(**kwargs):
+            captured["args"] = kwargs["args"]
+
+        trainer = SFTTrainer(
+            model=object(),
+            train_dataset=[{"text": "hello"}],
+            args=SFTConfig(
+                output_dir=str(tmp_path / "output"),
+                max_steps=1,
+                per_device_train_batch_size=1,
+                gradient_accumulation_steps=7,
+            ),
+            adapter_path=str(tmp_path / "adapter"),
+        )
+
+        monkeypatch.setattr(trainer, "_prepare_training_data", lambda: str(tmp_path))
+        monkeypatch.setattr(trainer, "_get_lr_schedule", lambda: 1e-4)
+        monkeypatch.setattr(trainer, "_save_adapter_config", lambda: None)
+        monkeypatch.setattr(sft_trainer, "mlx_load_dataset", lambda **kwargs: ([1], [1], None))
+        monkeypatch.setattr(sft_trainer, "CacheDataset", lambda dataset: dataset)
+        monkeypatch.setattr(sft_trainer, "mlx_train", fake_train)
+
+        result = trainer._train_native()
+
+        assert result["status"] == "success"
+        assert captured["args"].grad_accumulation_steps == 7
+
 
 class TestLossFunctionImports:
     """Test loss function imports."""
