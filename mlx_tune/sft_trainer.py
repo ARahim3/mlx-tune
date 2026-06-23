@@ -613,6 +613,7 @@ class SFTTrainer:
             max_seq_length=self.max_seq_length,
             adapter_file=adapter_file,
             grad_checkpoint=self._should_use_grad_checkpoint(),
+            grad_accumulation_steps=self.gradient_accumulation_steps,
         )
 
         print(f"\nTraining configuration:")
@@ -621,6 +622,7 @@ class SFTTrainer:
         print(f"  Learning rate: {self.learning_rate}")
         print(f"  LR scheduler: {self.lr_scheduler_type}")
         print(f"  Grad checkpoint: {training_args.grad_checkpoint}")
+        print(f"  Gradient accumulation: {training_args.grad_accumulation_steps}")
         print(f"  Adapter file: {adapter_file}")
         print()
 
