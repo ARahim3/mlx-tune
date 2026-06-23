@@ -31,6 +31,7 @@
         <li><a href="vlm.html">VLM</a></li>
         <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
+        <li><a href="jepa.html">JEPA</a></li>
         <li><a href="workflow.html">Workflow</a></li>
         <li><a href="performance.html">Performance</a></li>
         <li><a href="examples.html">Examples</a></li>
@@ -92,6 +93,7 @@
         <li><a href="#embedding">Embedding Models</a></li>
         <li class="sub-item"><a href="#FastEmbeddingModel">FastEmbeddingModel</a></li>
         <li class="sub-item"><a href="#EmbeddingSFTTrainer">EmbeddingSFTTrainer</a></li>
+        <li><a href="#llm-jepa">LLM-JEPA</a></li>
         <li><a href="#chat-templates">Chat Templates</a></li>
         <li><a href="#post-training">Post-Training</a></li>
         <li><a href="#examples">Examples</a></li>
@@ -679,6 +681,32 @@ similarity = (embeddings[0] * embeddings[1]).sum().item()</code></pre>
           <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/31_harrier_0.6b_embedding_finetuning.py" target="_blank">Example 31</a> &mdash; Microsoft Harrier 0.6B (cross-lingual search)</li>
           <li><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/32_harrier_270m_embedding_finetuning.py" target="_blank">Example 32</a> &mdash; Microsoft Harrier 270M (code/doc search)</li>
         </ul>
+      </div>
+
+      <!-- ===== LLM-JEPA ===== -->
+      <div class="api-module" id="llm-jepa">
+        <div class="api-module-header">
+          <h2 style="margin:0;">LLM-JEPA</h2>
+          <span class="module-path">mlx_tune.llm_jepa</span>
+        </div>
+
+        <p><strong>LLM-JEPA</strong> (<a href="https://arxiv.org/abs/2509.14252" target="_blank">arXiv 2509.14252</a>, Huang, LeCun &amp; Balestriero) brings the Joint-Embedding Predictive objective to LLM fine-tuning: it augments next-token prediction with a JEPA term that aligns the embeddings of two &ldquo;views&rdquo; of the same item (e.g. a description and its regex/SQL/code). The fine-tuned artifact is a <strong>normal LoRA model</strong> &mdash; save / merge / generate as usual. <code>LLMJEPATrainer</code> + <code>LLMJEPAConfig</code>; first-on-MLX.</p>
+
+        <div class="callout">
+          <strong>Full documentation lives on the JEPA page</strong> (alongside the rest of the JEPA family): see <a href="jepa.html#llm-jepa">JEPA &rarr; LLM-JEPA</a> for the objective, config reference, and a runnable example.
+        </div>
+
+        <div class="code-block-wrapper" style="margin-top: 1rem;">
+          <button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, LLMJEPATrainer, LLMJEPAConfig
+
+model, tok = FastLanguageModel.from_pretrained("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+data = [{"text": "match one or more digits", "code": r"\d+"}, ...]  # two views
+LLMJEPATrainer(model, data, tokenizer=tok,
+               args=LLMJEPAConfig(jepa_lambda=0.1)).train()</code></pre>
+        </div>
       </div>
 
       <!-- ===== Chat Templates ===== -->

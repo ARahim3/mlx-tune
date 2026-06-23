@@ -8,6 +8,7 @@ perf_improvements.md
 IMPLEMENTATION_SUMMARY.md
 NEXT_SESSION.md
 docs_progress.md
+jepa.md
 .claude/
 
 # =============================================================================
@@ -21,6 +22,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+demos/
 downloads/
 eggs/
 .eggs/

@@ -25,6 +25,8 @@ window.MLX_SEARCH_INDEX = [
   { title: "CPTTrainer", section: "Continual Pretraining Trainer", url: "llm.html#CPTTrainer", tags: "cpttrainer cptconfig continual pretraining embed_tokens lm_head decoupled lr", page: "LLM" },
   { title: "LFM2 Models", section: "Liquid Foundation Models", url: "llm.html#cpt", tags: "lfm2 lfm2.5 liquid ai hybrid gated conv gqa attention in_proj out_proj w1 w2 w3", page: "LLM" },
   { title: "Embedding Models", section: "Contrastive Learning", url: "llm.html#embedding", tags: "embedding sentence transformer bert modernbert qwen3 harrier infonce contrastive", page: "LLM" },
+  { title: "LLM-JEPA", section: "JEPA objective for LLM fine-tuning", url: "jepa.html#llm-jepa", tags: "llm-jepa llmjepa joint embedding predictive objective huang lecun balestriero next token prediction view alignment cosine infonce pred tokens text code views first on mlx llm fine-tuning", page: "JEPA" },
+  { title: "LLMJEPATrainer", section: "LLM-JEPA training", url: "jepa.html#LLMJEPATrainer", tags: "llmjepatrainer llmjepaconfig jepa_lambda jepa_distance num_predictors jepa_ratio ntp view alignment lora llm", page: "JEPA" },
   { title: "Save & Export", section: "GGUF, LoRA, Merged", url: "llm.html#save", tags: "save export gguf lora merge push hub save_pretrained_merged convert", page: "LLM" },
 
   // --- VLM (Vision) ---
@@ -41,6 +43,27 @@ window.MLX_SEARCH_INDEX = [
   { title: "FastOCRModel", section: "Model Loading", url: "ocr.html#quick-start", tags: "fastocrmodel ocr model deepseek glm olmocr", page: "OCR" },
   { title: "OCR Metrics", section: "CER / WER / Exact Match", url: "ocr.html#metrics", tags: "cer wer exact match character error rate word error", page: "OCR" },
   { title: "OCR GRPO", section: "RL for OCR", url: "ocr.html#grpo", tags: "ocr grpo rl reward cer reward", page: "OCR" },
+
+  // --- JEPA ---
+  { title: "JEPA", section: "Overview", url: "jepa.html", tags: "jepa joint embedding predictive architecture yann lecun self-supervised ssl vision video lejepa i-jepa v-jepa world model", page: "JEPA" },
+  { title: "What is JEPA", section: "Concept", url: "jepa.html#what-is-jepa", tags: "jepa explained representation collapse latent prediction vit vision transformer not llm self-supervised", page: "JEPA" },
+  { title: "LeJEPA", section: "Self-supervised pretraining from scratch", url: "jepa.html#lejepa", tags: "lejepa balestriero lecun sigreg sketched isotropic gaussian regularization epps pulley multi-view from scratch no teacher no predictor no stop-gradient", page: "JEPA" },
+  { title: "FastJEPAModel", section: "Model loading", url: "jepa.html#FastJEPAModel", tags: "fastjepamodel from_pretrained vit-tiny vit-small vit-base preset encode features ijepa", page: "JEPA" },
+  { title: "JEPATrainer", section: "LeJEPA training", url: "jepa.html#JEPATrainer", tags: "jepatrainer jepaconfig lam sigreg num_slices n_global n_local multi-crop pretraining", page: "JEPA" },
+  { title: "I-JEPA", section: "Pretrained image encoder", url: "jepa.html#ijepa", tags: "i-jepa ijepa facebook vith14 image pretrained meta feature extraction linear probe 224 vit-huge", page: "JEPA" },
+  { title: "V-JEPA 2", section: "Pretrained video world model", url: "jepa.html#vjepa2", tags: "v-jepa vjepa2 video world model facebook vitl fpc64 tubelet conv3d 3d rope rotary clip frames meta", page: "JEPA" },
+  { title: "FastVideoJEPAModel", section: "V-JEPA 2 loading", url: "jepa.html#vjepa2", tags: "fastvideojepamodel vjepa2 video encode clip features from_pretrained", page: "JEPA" },
+  { title: "JEPA Downstream Fine-Tuning", section: "frozen / LoRA / full classification", url: "jepa.html#downstream", tags: "jepa classification finetune frozen lora full for_image_classification for_video_classification jepaclassifiertrainer videoclassifiertrainer head warmup", page: "JEPA" },
+  { title: "JEPA Inference", section: "Save, reload, predict", url: "jepa.html#inference", tags: "jepa predict save_pretrained load_classifier inference probabilities softmax lifecycle", page: "JEPA" },
+  { title: "JEPA Probes", section: "linear / kNN / attentive", url: "jepa.html#ijepa", tags: "jepa probe linear_probe knn_probe attentive_probe attentive pooling evaluation eval encode_tokens token features canonical i-jepa v-jepa readout video_linear_probe video_knn_probe video_attentive_probe", page: "JEPA" },
+  { title: "Warm-start / Domain Adaptation", section: "Continued SSL from pretrained", url: "jepa.html#ijepa", tags: "jepa warm start warm-start continued pretraining domain adaptation lejepa from i-jepa initialize finetune ssl in-domain", page: "JEPA" },
+  { title: "V-JEPA 2 Predictor", section: "Anticipation / surprise energy", url: "jepa.html#vjepa2", tags: "vjepa2 predictor masked latent prediction predict_latents latent_energy energy surprise anticipation world model rollout future context frames anomaly discontinuity", page: "JEPA" },
+  { title: "V-JEPA 2 Pretrained Classifiers", section: "SSv2 action recognition, zero training", url: "jepa.html#vjepa2", tags: "vjepa2 ssv2 something-something pretrained classifier attentive pooler VJEPA2PretrainedVideoClassifier action recognition 174 classes top_k predict label zero training meta fine-tuned", page: "JEPA" },
+  { title: "V-JEPA 2 Scope", section: "Action-conditioned planning out of scope", url: "jepa.html#vjepa2", tags: "vjepa2 scope action conditioning planning robotics cem mpc v-jepa 2-ac not supported", page: "JEPA" },
+  { title: "JEPA Dense & Regression", section: "Counting / depth / segmentation", url: "jepa.html#dense-regression", tags: "jepa regression dense counting depth segmentation for_image_regression for_dense_prediction JEPAForImageRegression JEPAForDensePrediction JEPARegressionTrainer JEPADenseTrainer mae rmse pixel accuracy per-pixel", page: "JEPA" },
+  { title: "JEPA Scale-up", section: "Non-224 inputs + streaming + resume", url: "jepa.html#scaleup", tags: "jepa pos-embed interpolation non-224 native resolution bicubic ImageFolderDataset streaming dataloader resumable checkpoint save_steps resume corpus on-device", page: "JEPA" },
+  { title: "LeWM (LeWorldModel)", section: "Trainable latent world model + planning", url: "jepa.html#lewm", tags: "lewm leworldmodel world model latent pixels sigreg next-embedding prediction no stop-gradient FastWorldModel LeWMTrainer plan_cem cem mpc planning PointMassEnv arxiv 2603.19312 maes lecun balestriero trainable on-device", page: "JEPA" },
+  { title: "JEPA Examples", section: "Runnable examples", url: "jepa.html#examples", tags: "jepa examples 58 59 60 61 62 63 64 lejepa ijepa vjepa2 pretraining feature extraction video predictor ssv2", page: "JEPA" },
 
   // --- Audio ---
   { title: "Audio Fine-Tuning", section: "TTS & STT Overview", url: "audio.html", tags: "audio tts stt text speech voice", page: "Audio" },

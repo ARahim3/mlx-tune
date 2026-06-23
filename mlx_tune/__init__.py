@@ -17,7 +17,7 @@ Supported Training Methods:
 - OCR (Optical Character Recognition) fine-tuning
 """
 
-__version__ = "0.5.1"  # GH #15: save_pretrained_merged on a quantized base now honors save_method — merged_16bit (default) dequantizes so the fine-tune isn't rounded away by re-quantization. (0.5.0: perf cycle — fused log-prob, KV-cached GRPO sampling, @mx.compile + collator bucketing, GC propagation, prompt-prefix KV-cache share, DPO fixed-reference logprobs, SFT val_batches knob, off-by-one length-mask fix)
+__version__ = "0.6.0"  # JEPA on MLX: LeJEPA from-scratch SSL + pretrained I-JEPA + V-JEPA 2 (encoder + predictor + SSv2 classifiers) + LLM-JEPA + LeWM; HF-parity cosine 1.0, frozen/LoRA/full downstream. Follows 0.5.1 (no 0.5.2 release). (0.5.1: GH #15 quantized-base merge fix.)
 
 from mlx_tune.model import FastLanguageModel
 from mlx_tune.trainer import (
@@ -181,6 +181,67 @@ from mlx_tune.chat_templates import (
     load_dataset_with_config,
 )
 
+# JEPA / LeJEPA (self-supervised vision) + I-JEPA (pretrained) downstream
+from mlx_tune.jepa import (
+    FastJEPAModel,
+    JEPAModelWrapper,
+    JEPAConfig,
+    JEPATrainer,
+    JEPAAugment,
+    JEPADataCollator,
+    ImageFolderDataset,
+    ViTEncoder,
+    sigreg_loss,
+    lejepa_loss,
+    lejepa_prediction_loss,
+    sample_directions,
+    linear_probe,
+    knn_probe,
+    attentive_probe,
+    JEPAForImageClassification,
+    JEPAClassifierTrainer,
+    JEPAClassifierConfig,
+    JEPAForImageRegression,
+    JEPARegressionTrainer,
+    JEPAForDensePrediction,
+    JEPADenseTrainer,
+    apply_lora_to_encoder,
+)
+
+# V-JEPA 2 (Meta) — pretrained video JEPA encoder + predictor + downstream
+from mlx_tune.vjepa2 import (
+    FastVideoJEPAModel,
+    VJEPA2ModelWrapper,
+    VideoViTEncoder,
+    VJEPA2ForVideoClassification,
+    VJEPA2PretrainedVideoClassifier,
+    VideoClassifierTrainer,
+    VideoClassifierConfig,
+    apply_lora_to_vjepa2_encoder,
+    latent_energy,
+    video_linear_probe,
+    video_knn_probe,
+    video_attentive_probe,
+)
+
+# LLM-JEPA — Joint-Embedding Predictive objective for LLM fine-tuning
+from mlx_tune.llm_jepa import (
+    LLMJEPATrainer,
+    LLMJEPAConfig,
+    llm_jepa_loss,
+)
+
+# LeWM — LeWorldModel: trainable latent world model (SIGReg, no stop-grad) + planning
+from mlx_tune.lewm import (
+    FastWorldModel,
+    WorldModel,
+    LeWMConfig,
+    LeWMTrainer,
+    lewm_loss,
+    plan_cem,
+    PointMassEnv,
+)
+
 __all__ = [
     # Core
     "FastLanguageModel",
@@ -313,4 +374,53 @@ __all__ = [
     # HF Dataset Config (Unsloth-compatible)
     "HFDatasetConfig",
     "load_dataset_with_config",
+    # JEPA / LeJEPA (self-supervised vision)
+    "FastJEPAModel",
+    "JEPAModelWrapper",
+    "JEPAConfig",
+    "JEPATrainer",
+    "JEPAAugment",
+    "JEPADataCollator",
+    "ImageFolderDataset",
+    "ViTEncoder",
+    "sigreg_loss",
+    "lejepa_loss",
+    "lejepa_prediction_loss",
+    "sample_directions",
+    "linear_probe",
+    "knn_probe",
+    "attentive_probe",
+    "JEPAForImageClassification",
+    "JEPAClassifierTrainer",
+    "JEPAClassifierConfig",
+    "JEPAForImageRegression",
+    "JEPARegressionTrainer",
+    "JEPAForDensePrediction",
+    "JEPADenseTrainer",
+    "apply_lora_to_encoder",
+    # V-JEPA 2 (video)
+    "FastVideoJEPAModel",
+    "VJEPA2ModelWrapper",
+    "VideoViTEncoder",
+    "VJEPA2ForVideoClassification",
+    "VJEPA2PretrainedVideoClassifier",
+    "latent_energy",
+    "VideoClassifierTrainer",
+    "VideoClassifierConfig",
+    "apply_lora_to_vjepa2_encoder",
+    "video_linear_probe",
+    "video_knn_probe",
+    "video_attentive_probe",
+    # LLM-JEPA (LLM fine-tuning objective)
+    "LLMJEPATrainer",
+    "LLMJEPAConfig",
+    "llm_jepa_loss",
+    # LeWM (LeWorldModel — trainable world model + planning)
+    "FastWorldModel",
+    "WorldModel",
+    "LeWMConfig",
+    "LeWMTrainer",
+    "lewm_loss",
+    "plan_cem",
+    "PointMassEnv",
 ]

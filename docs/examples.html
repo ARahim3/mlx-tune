@@ -25,6 +25,7 @@
         <li><a href="vlm.html">VLM</a></li>
         <li><a href="ocr.html">OCR</a></li>
         <li><a href="audio.html">Audio</a></li>
+        <li><a href="jepa.html">JEPA</a></li>
         <li><a href="workflow.html">Workflow</a></li>
         <li><a href="performance.html">Performance</a></li>
         <li><a href="examples.html" class="active">Examples</a></li>
@@ -77,6 +78,7 @@
         <li><a href="#embedding">Embedding Models</a></li>
         <li><a href="#ocr">OCR Models</a></li>
         <li><a href="#cpt">Continual Pretraining</a></li>
+        <li><a href="#jepa">JEPA</a></li>
       </ul>
     </aside>
 
@@ -1798,6 +1800,148 @@ trainer.train()</code></pre>
             <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/46_lfm2_cpt_domain.py" target="_blank">Full source &rarr;</a></p>
           </div>
         </div>
+      </div>
+
+      <!-- JEPA -->
+      <h2 id="jepa">JEPA</h2>
+      <div class="example-grid">
+
+        <div class="example-card">
+          <h4>58 &mdash; LeJEPA Pretraining (from scratch)</h4>
+          <p>Train a Vision Transformer from scratch with the LeJEPA objective (SIGReg + multi-view prediction, no EMA/predictor/stop-grad), then evaluate the learned features with a frozen linear probe. Uses a CIFAR-10 subset with a synthetic offline fallback.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">LeJEPA</span><span class="example-tag">Self-Supervised</span><span class="example-tag">From Scratch</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPATrainer, JEPAConfig, linear_probe
+
+model, _ = FastJEPAModel.from_pretrained("vit-tiny", img_size=96)
+JEPATrainer(model, args=JEPAConfig(num_epochs=3, lam=0.05),
+            train_dataset=train_images).train()
+
+acc = linear_probe(model, tr_x, tr_y, te_x, te_y)   # representation quality</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/58_lejepa_pretraining.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>59 &mdash; I-JEPA Feature Extraction + Fine-Tune</h4>
+          <p>Load Meta&rsquo;s pretrained I-JEPA (ViT-Huge), convert HF&rarr;MLX, then run a frozen-feature linear probe, a LoRA fine-tune, and a full save&rarr;load&rarr;predict inference cycle. Numerically identical to the HuggingFace model.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">I-JEPA</span><span class="example-tag">Pretrained</span><span class="example-tag">LoRA</span><span class="example-tag">Inference</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPAClassifierTrainer, JEPAClassifierConfig
+
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+clf = FastJEPAModel.for_image_classification(model, num_classes=10, finetune="lora", r=8)
+JEPAClassifierTrainer(clf, JEPAClassifierConfig(img_size=224),
+                      train_images, train_labels).train()
+
+clf.save_pretrained("ijepa_clf")
+preds = FastJEPAModel.load_classifier("ijepa_clf").predict(new_images)</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/59_ijepa_feature_extraction.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>60 &mdash; V-JEPA 2 Video</h4>
+          <p>Load Meta&rsquo;s V-JEPA 2 video world model (3D tubelet + 3D RoPE), extract clip features with a video linear probe, then LoRA fine-tune for video classification and save/load/predict. HuggingFace-parity verified.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">V-JEPA 2</span><span class="example-tag">Video</span><span class="example-tag">Pretrained</span><span class="example-tag">LoRA</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastVideoJEPAModel, VideoClassifierTrainer, VideoClassifierConfig
+
+model, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")
+clf = FastVideoJEPAModel.for_video_classification(model, num_classes=2, finetune="lora", r=8)
+VideoClassifierTrainer(clf, VideoClassifierConfig(),
+                       train_clips, train_labels).train()   # clips: (T, 256, 256, 3)</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/60_vjepa2_video.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>61 &mdash; LLM-JEPA Fine-Tuning</h4>
+          <p>Bring the JEPA objective to <em>LLM</em> fine-tuning: augment next-token prediction with a JEPA term that aligns two &ldquo;views&rdquo; of the same item (a description and its regex). The artifact is a normal LoRA model &mdash; generate / merge as usual. First-on-MLX.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">LLM-JEPA</span><span class="example-tag">LLM</span><span class="example-tag">Qwen3.5</span><span class="example-tag">LoRA</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastLanguageModel, LLMJEPATrainer, LLMJEPAConfig
+
+model, tok = FastLanguageModel.from_pretrained("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+data = [{"text": "match one or more digits", "code": r"\d+"}, ...]  # two views
+LLMJEPATrainer(model, data, tokenizer=tok,
+               args=LLMJEPAConfig(jepa_lambda=0.1)).train()</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/61_llm_jepa_finetuning.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>62 &mdash; LeWM World Model</h4>
+          <p>Train a latent world model from pixels (LeWorldModel): encoder + action-conditioned predictor, two losses (next-embedding prediction + SIGReg, no stop-grad), then plan with it via CEM / MPC over latent rollouts. The trainable, on-device world model.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">LeWM</span><span class="example-tag">World Model</span><span class="example-tag">Planning</span><span class="example-tag">SIGReg</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastWorldModel, LeWMConfig, LeWMTrainer, plan_cem, PointMassEnv
+
+env = PointMassEnv(size=48)
+data = env.collect(n_episodes=80, ep_len=10)
+model = FastWorldModel.from_pretrained("lewm-tiny", img_size=48, action_dim=2)
+LeWMTrainer(model, LeWMConfig(img_size=48, action_dim=2, max_steps=250), data).train()
+action = plan_cem(model, model.encode([env.render()])[0],
+                  model.encode([env.render([0.8, 0.2])])[0], horizon=3, action_dim=2)</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/62_lewm_world_model.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>63 &mdash; JEPA Dense &amp; Regression</h4>
+          <p>I-JEPA's own headline tasks beyond classification: object counting (regression), depth maps (dense regression) and segmentation (per-pixel) heads on a JEPA encoder, with frozen / LoRA / full fine-tuning.</p>
+          <div class="example-tags"><span class="example-tag">JEPA</span><span class="example-tag">Regression</span><span class="example-tag">Depth</span><span class="example-tag">Segmentation</span><span class="example-tag">Counting</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPAClassifierConfig, JEPARegressionTrainer
+
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+reg = FastJEPAModel.for_image_regression(model, out_dim=1, finetune="lora")  # counting
+JEPARegressionTrainer(reg, JEPAClassifierConfig(img_size=224), images, counts).train()
+dense = FastJEPAModel.for_dense_prediction(model, out_channels=1, task="regression")  # depth</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/63_jepa_dense_regression.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
+        <div class="example-card">
+          <h4>64 &mdash; V-JEPA 2 Predictor + Pretrained SSv2 Classifier</h4>
+          <p>The "world model" half of V-JEPA 2: predict the latents of a clip's future from its first frames and score how surprising the actual future was (<code>latent_energy</code>); plus Meta's fine-tuned Something-Something-v2 action classifier (174 classes) running natively on MLX with zero training. Both HF-parity verified (cosine 1.000000).</p>
+          <div class="example-tags"><span class="example-tag">V-JEPA 2</span><span class="example-tag">Predictor</span><span class="example-tag">World Model</span><span class="example-tag">SSv2</span><span class="example-tag">Zero-shot</span></div>
+          <button class="example-toggle">View Code</button>
+          <div class="example-code">
+            <div class="code-block-wrapper"><button class="copy-btn">Copy</button>
+<pre><code class="language-python">from mlx_tune import FastVideoJEPAModel, latent_energy
+
+model, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")
+pred, actual = model.predict_latents(clip, context_frames=4)   # anticipate the rest
+print(latent_energy(pred, actual))                             # surprise score
+
+clf, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc16-256-ssv2")
+print(clf.predict([clip], top_k=5))                            # 174 SSv2 actions</code></pre>
+            </div>
+            <p><a href="https://github.com/ARahim3/mlx-tune/blob/main/examples/64_vjepa2_predictor_classifier.py" target="_blank">Full source &rarr;</a></p>
+          </div>
+        </div>
+
       </div>
 
       <footer class="footer">

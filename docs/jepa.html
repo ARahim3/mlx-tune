@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JEPA &mdash; mlx-tune Docs</title>
+  <meta name="description" content="Train and fine-tune JEPA (Joint-Embedding Predictive Architecture) models on Apple Silicon with mlx-tune: LeJEPA from-scratch SSL, pretrained I-JEPA (images), and V-JEPA 2 (video) with LoRA fine-tuning.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='50%25' y='73%25' text-anchor='middle' font-family='system-ui,-apple-system,sans-serif' font-weight='900' font-size='22' fill='%23e6edf3'>m</text></svg>">
+  <meta property="og:title" content="JEPA - mlx-tune Docs">
+  <meta property="og:description" content="Yann LeCun's JEPA on Apple Silicon: LeJEPA from-scratch, pretrained I-JEPA (images) and V-JEPA 2 (video) with LoRA fine-tuning.">
+  <meta property="og:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png?v=2">
+  <meta property="og:url" content="https://arahim3.github.io/mlx-tune/jepa.html">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="JEPA - mlx-tune Docs">
+  <meta name="twitter:description" content="Train and fine-tune JEPA models on Apple Silicon: LeJEPA, I-JEPA, V-JEPA 2.">
+  <meta name="twitter:image" content="https://arahim3.github.io/mlx-tune/assets/img/og-image.png?v=2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/prism-dark.css">
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+
+  <nav class="top-nav">
+    <div class="nav-inner">
+      <a href="index.html" class="nav-logo"><img src="assets/img/logo.png" alt="mlx-tune"></a>
+      <ul class="nav-links">
+        <li><a href="index.html">Home</a></li>
+        <li><a href="llm.html">LLM</a></li>
+        <li><a href="vlm.html">VLM</a></li>
+        <li><a href="ocr.html">OCR</a></li>
+        <li><a href="audio.html">Audio</a></li>
+        <li><a href="jepa.html" class="active">JEPA</a></li>
+        <li><a href="workflow.html">Workflow</a></li>
+        <li><a href="performance.html">Performance</a></li>
+        <li><a href="examples.html">Examples</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      </ul>
+      <div class="nav-right">
+        <button class="search-trigger" aria-label="Search docs">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="5"/><path d="M10.5 10.5L15 15"/></svg>
+          Search
+          <kbd>⌘K</kbd>
+        </button>
+        <a href="https://github.com/ARahim3/mlx-tune" class="github-link" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" fill="currentColor"/></svg></a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+        <button class="mobile-toggle" aria-label="Menu">&#9776;</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Search Modal -->
+  <div class="search-overlay" role="dialog" aria-label="Search documentation">
+    <div class="search-modal">
+      <div class="search-input-wrap">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="5"/><path d="M10.5 10.5L15 15"/></svg>
+        <input type="text" class="search-input" placeholder="Search docs..." autocomplete="off" spellcheck="false">
+        <span class="search-esc">esc</span>
+      </div>
+      <div class="search-results"></div>
+      <div class="search-footer">
+        <span class="search-footer-item"><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span class="search-footer-item"><kbd>&crarr;</kbd> open</span>
+        <span class="search-footer-item"><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Back to Top -->
+  <button class="back-to-top" aria-label="Back to top">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 13V3M3 7l5-5 5 5"/></svg>
+  </button>
+
+  <div class="page-wrapper">
+    <aside class="sidebar">
+      <div class="sidebar-title">On This Page</div>
+      <ul class="sidebar-nav">
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#what-is-jepa">What is JEPA?</a></li>
+        <li><a href="#models">Models &amp; Tracks</a></li>
+        <li><a href="#lejepa">LeJEPA (from scratch)</a></li>
+        <li class="sub-item"><a href="#FastJEPAModel">FastJEPAModel</a></li>
+        <li class="sub-item"><a href="#JEPATrainer">JEPATrainer</a></li>
+        <li><a href="#ijepa">I-JEPA (pretrained)</a></li>
+        <li class="sub-item"><a href="#ijepa">Probes &amp; warm-start</a></li>
+        <li><a href="#vjepa2">V-JEPA 2 (video)</a></li>
+        <li><a href="#downstream">Downstream Fine-Tuning</a></li>
+        <li><a href="#inference">Inference &amp; Save/Load</a></li>
+        <li><a href="#llm-jepa">LLM-JEPA (LLM track)</a></li>
+        <li class="sub-item"><a href="#LLMJEPATrainer">LLMJEPATrainer</a></li>
+        <li><a href="#dense-regression">Dense &amp; Regression</a></li>
+        <li><a href="#scaleup">Scale-up (non-224, streaming)</a></li>
+        <li><a href="#lewm">LeWM (world model)</a></li>
+        <li><a href="#examples">Examples</a></li>
+        <li><a href="#tips">Tips</a></li>
+      </ul>
+    </aside>
+
+    <main class="content">
+      <h1>JEPA on Apple Silicon</h1>
+      <p><strong>JEPA</strong> (Joint-Embedding Predictive Architecture) is the self-supervised vision paradigm <a href="https://openreview.net/forum?id=BZ5a1r-kVsf" target="_blank" rel="noopener">Yann LeCun</a> has championed (in his <em>Path Towards Autonomous Machine Intelligence</em> position paper) as an alternative to generative and contrastive learning. <code>mlx-tune</code> brings the whole JEPA family to your Mac: train <strong>LeJEPA</strong> from scratch, or load pretrained <strong>I-JEPA</strong> (images) and <strong>V-JEPA 2</strong> (video) and fine-tune them with LoRA &mdash; all natively on MLX, no CUDA.</p>
+
+      <div class="callout">
+        <div class="callout-title">First trainable JEPA on MLX</div>
+        <p>To our knowledge this is the first solid, tested, train-and-fine-tune JEPA implementation on Apple Silicon. Both pretrained ports (I-JEPA, V-JEPA 2) are <strong>numerically identical to the official HuggingFace PyTorch models</strong> (cosine similarity 1.000000), verified in the test suite.</p>
+      </div>
+
+      <!-- ===== Overview ===== -->
+      <section class="section" id="overview">
+        <div class="section-label">Overview</div>
+        <h2 style="margin-top: 0;">Three ways to use JEPA</h2>
+        <p><code>mlx-tune</code> exposes JEPA through an Unsloth-flavoured API. Pick the track that matches your data and goal.</p>
+
+        <div class="callout">
+          <div class="callout-title">1. LeJEPA &mdash; pretrain from scratch (images)</div>
+          <p>The newest, leanest JEPA (Balestriero &amp; LeCun, 2025). A single Vision Transformer trained with a multi-view prediction loss plus <strong>SIGReg</strong> (a distribution regulariser). No EMA teacher, no predictor, no stop-gradient &mdash; which is exactly why it ports cleanly to MLX. Use it to learn representations on your own image set without labels.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">2. I-JEPA &mdash; pretrained image encoder (Meta)</div>
+          <p>Load Meta's pretrained I-JEPA (ViT-Huge, self-supervised on ImageNet) and use it for feature extraction, linear probing, or LoRA / full fine-tuning on your downstream classification task.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">3. V-JEPA 2 &mdash; pretrained video world model (Meta)</div>
+          <p>Load Meta's V-JEPA 2 (trained on &gt;1M hours of video): fine-tune for video classification, extract clip features, run the <strong>masked-latent predictor</strong> (anticipate a clip's future, score surprise), or use Meta's <strong>fine-tuned SSv2 action classifiers</strong> with zero training &mdash; all ported faithfully to MLX.</p>
+        </div>
+      </section>
+
+      <!-- ===== What is JEPA ===== -->
+      <section class="section" id="what-is-jepa">
+        <div class="section-label">Concept</div>
+        <h2 style="margin-top: 0;">What is JEPA (and is it an LLM)?</h2>
+        <p><strong>JEPA is a vision/video architecture, not a language model.</strong> Every JEPA here is a <strong>Vision Transformer</strong> that operates on image patches or video tubelets. The "JEPA" idea is <em>how it's trained</em>: take two views of an input, encode both, and train the model so one view's representation <strong>predicts</strong> the other's &mdash; <em>in latent space</em>, never reconstructing raw pixels. This captures predictable, abstract structure (semantics, dynamics) and discards unpredictable detail.</p>
+        <p>The enemy of every JEPA is <strong>representation collapse</strong> (the encoder outputs a constant). Different variants fight it differently:</p>
+        <table class="api-params">
+          <thead><tr><th>Variant</th><th>Domain</th><th>Anti-collapse mechanism</th></tr></thead>
+          <tbody>
+            <tr><td><strong>I-JEPA</strong> (2023)</td><td>Images</td><td>EMA target encoder (teacher) + predictor; masked target blocks</td></tr>
+            <tr><td><strong>V-JEPA 2</strong> (2025)</td><td>Video</td><td>Same recipe, spatiotemporal masks; world-model framing</td></tr>
+            <tr><td><strong>LeJEPA</strong> (2025)</td><td>Any</td><td><strong>SIGReg</strong> &mdash; provably regularise embeddings to an isotropic Gaussian. No teacher/predictor/stop-grad</td></tr>
+          </tbody>
+        </table>
+        <div class="callout" style="margin-top: 16px;">
+          <div class="callout-title">Why does LoRA apply here?</div>
+          <p>LoRA is not LLM-specific &mdash; it works on any model built from large linear layers, and a transformer is mostly linear layers (<code>q/k/v/out</code> projections + MLP), whether its inputs are words or image patches. So you can LoRA-fine-tune a 630M-parameter pretrained JEPA encoder on a Mac, training &lt;1% of the weights.</p>
+        </div>
+      </section>
+
+      <!-- ===== Models ===== -->
+      <section class="section" id="models">
+        <div class="section-label">Models</div>
+        <h2 style="margin-top: 0;">Supported models</h2>
+
+        <h3>LeJEPA presets (random init &mdash; train from scratch)</h3>
+        <table class="api-params">
+          <thead><tr><th>Preset</th><th>Dim</th><th>Depth</th><th>Heads</th><th>Use</th></tr></thead>
+          <tbody>
+            <tr><td><code>vit-debug</code></td><td>64</td><td>2</td><td>2</td><td>tests / quick checks</td></tr>
+            <tr><td><code>vit-tiny</code></td><td>192</td><td>12</td><td>3</td><td>small datasets, fast</td></tr>
+            <tr><td><code>vit-small</code></td><td>384</td><td>12</td><td>6</td><td>balanced</td></tr>
+            <tr><td><code>vit-base</code></td><td>768</td><td>12</td><td>12</td><td>larger datasets</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Pretrained checkpoints (downloaded &amp; converted on first use)</h3>
+        <table class="api-params">
+          <thead><tr><th>Model</th><th>HF repo</th><th>Params</th><th>Loader</th></tr></thead>
+          <tbody>
+            <tr><td>I-JEPA ViT-H/14</td><td><code>facebook/ijepa_vith14_1k</code></td><td>630M</td><td><code>FastJEPAModel</code></td></tr>
+            <tr><td>I-JEPA ViT-g/16</td><td><code>facebook/ijepa_vitg16_22k</code></td><td>1.0B</td><td><code>FastJEPAModel</code></td></tr>
+            <tr><td>V-JEPA 2 ViT-L</td><td><code>facebook/vjepa2-vitl-fpc64-256</code></td><td>326M</td><td><code>FastVideoJEPAModel</code></td></tr>
+            <tr><td>V-JEPA 2 ViT-H/g</td><td><code>facebook/vjepa2-vit{h,g}-fpc64-*</code></td><td>0.6&ndash;1B</td><td><code>FastVideoJEPAModel</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout" style="margin-top: 16px;">
+          <div class="callout-title">No PyTorch needed at load time</div>
+          <p>Weights are downloaded as safetensors and converted directly to MLX. <code>torch</code> is only needed if you want to run the HuggingFace parity tests.</p>
+        </div>
+      </section>
+
+      <!-- ===== LeJEPA ===== -->
+      <section class="section" id="lejepa">
+        <div class="section-label">From scratch</div>
+        <h2 style="margin-top: 0;">LeJEPA &mdash; self-supervised pretraining</h2>
+        <p>Train a ViT on your own images, no labels required. The loss has a single hyperparameter <code>lam</code> (the SIGReg weight, ~0.05).</p>
+        <pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPATrainer, JEPAConfig, linear_probe
+
+# 1. Build a randomly-initialised ViT (LeJEPA trains from scratch).
+model, _ = FastJEPAModel.from_pretrained("vit-tiny", img_size=128)
+
+# 2. Self-supervised pretraining — `images` is just a list of HWC arrays / PIL images.
+trainer = JEPATrainer(
+    model,
+    args=JEPAConfig(num_epochs=5, batch_size=64, lam=0.05),
+    train_dataset=images,
+)
+trainer.train()
+
+# 3. Use the learned encoder: extract features, or evaluate with a linear probe.
+feats = model.encode(images)                       # (N, dim) frozen features
+acc = linear_probe(model, tr_x, tr_y, te_x, te_y)  # quick representation-quality check
+
+# 4. Save / reload the encoder.
+model.save_pretrained("my_lejepa")
+model, _ = FastJEPAModel.from_pretrained("my_lejepa")</code></pre>
+
+        <div class="callout">
+          <div class="callout-title">How SIGReg prevents collapse</div>
+          <p>LeJEPA proves the ideal embedding distribution is an isotropic Gaussian. SIGReg projects embeddings onto many random 1-D directions and, on each, tests whether the projection looks like a standard normal (Epps&ndash;Pulley characteristic-function test). The total loss is <code>(1&minus;lam)&middot;prediction + lam&middot;SIGReg</code>. The training loss correlates with downstream accuracy &mdash; useful for model selection without labels.</p>
+        </div>
+      </section>
+
+      <!-- ===== FastJEPAModel ===== -->
+      <div class="api-module" id="FastJEPAModel">
+        <div class="api-module-header">
+          <h2 style="margin:0;">FastJEPAModel</h2>
+          <span class="module-path">mlx_tune.jepa</span>
+        </div>
+
+        <div class="api-entry">
+          <h3>FastJEPAModel.from_pretrained()</h3>
+          <div class="api-signature">
+            <span class="api-name">FastJEPAModel.from_pretrained</span>(<span class="api-param">model_name</span>, <span class="api-param">img_size</span><span class="api-default">=None</span>, <span class="api-param">patch_size</span><span class="api-default">=16</span>) &rarr; <span class="api-param">Tuple[JEPAModelWrapper, None]</span>
+          </div>
+          <p>One entry point, three behaviours, dispatched on <code>model_name</code>:</p>
+          <table class="api-params">
+            <thead><tr><th>If <code>model_name</code> is&hellip;</th><th>Then</th></tr></thead>
+            <tbody>
+              <tr><td>a preset (<code>"vit-tiny"</code>&hellip;)</td><td>random-init ViT for LeJEPA from-scratch training</td></tr>
+              <tr><td>a saved directory</td><td>reload a previously saved JEPA encoder</td></tr>
+              <tr><td>a HF repo (<code>"facebook/ijepa_*"</code>)</td><td>download + convert pretrained I-JEPA to MLX</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="api-entry">
+          <h3>model.encode()</h3>
+          <div class="api-signature">
+            <span class="api-name">model.encode</span>(<span class="api-param">images</span>, <span class="api-param">batch_size</span><span class="api-default">=64</span>) &rarr; <span class="api-param">mx.array</span>
+          </div>
+          <p>Run the frozen encoder over a list of images and return pooled features <code>(N, dim)</code> for downstream tasks (clustering, retrieval, probing).</p>
+        </div>
+      </div>
+
+      <!-- ===== JEPATrainer ===== -->
+      <div class="api-module" id="JEPATrainer">
+        <div class="api-module-header">
+          <h2 style="margin:0;">JEPATrainer &amp; JEPAConfig</h2>
+          <span class="module-path">mlx_tune.jepa</span>
+        </div>
+        <div class="api-entry">
+          <h3>Key JEPAConfig fields</h3>
+          <table class="api-params">
+            <thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>lam</code></td><td><code>0.05</code></td><td>SIGReg weight &mdash; the single LeJEPA hyperparameter</td></tr>
+              <tr><td><code>n_global</code> / <code>n_local</code></td><td><code>2</code> / <code>6</code></td><td>Number of global / local multi-crop views per image</td></tr>
+              <tr><td><code>num_slices</code></td><td><code>1024</code></td><td>Random projection directions for SIGReg</td></tr>
+              <tr><td><code>img_size</code></td><td><code>128</code></td><td>Pixel resolution all views are rendered at</td></tr>
+              <tr><td><code>learning_rate</code></td><td><code>5e-4</code></td><td>AdamW LR (linear warmup &rarr; cosine decay)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ===== I-JEPA ===== -->
+      <section class="section" id="ijepa">
+        <div class="section-label">Pretrained &middot; Images</div>
+        <h2 style="margin-top: 0;">I-JEPA &mdash; pretrained image encoder</h2>
+        <p>Load Meta's pretrained I-JEPA and put its features to work. Inputs default to 224&times;224 (the resolution it was trained at); other sizes work too via position-embedding interpolation &mdash; see <a href="#scaleup">Scale-up</a>.</p>
+        <pre><code class="language-python">from mlx_tune import FastJEPAModel, linear_probe, knn_probe, attentive_probe
+
+# Downloads ~2.5 GB on first run, then converts HF -> MLX (no torch needed).
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+
+# Three frozen-feature probes — none of them backprop through the 630M encoder:
+linear    = linear_probe(model, tr_x, tr_y, te_x, te_y)     # logistic regression on mean-pooled features
+knn       = knn_probe(model, tr_x, tr_y, te_x, te_y, k=20)  # label-light, no training
+attentive = attentive_probe(model, tr_x, tr_y, te_x, te_y)  # attention-pooling head — the paper's eval
+
+# Or just grab features for retrieval / clustering.
+feats   = model.encode(my_images)          # (N, 1280)  mean-pooled
+tokens  = model.encode_tokens(my_images)   # (N, T, 1280)  per-patch tokens</code></pre>
+
+        <div class="callout">
+          <div class="callout-title">Use the attentive probe for the real numbers</div>
+          <p>I-JEPA and V-JEPA 2 encoders don't mean-pool cleanly &mdash; a plain <code>linear_probe</code> on pooled features <em>under-reads</em> their quality. <code>attentive_probe</code> trains a small attention-pooling head over the token features (the canonical evaluation in both papers, and V-JEPA 2's own classification head). It's the most faithful measure of what these encoders know. <code>knn_probe</code> is a cheap, training-free, label-light sanity check. (Note: this is about <em>readout strength</em>; the encoder features themselves are bit-for-bit identical to the reference model regardless of probe.)</p>
+        </div>
+
+        <h3>Domain-adaptive continued pretraining (warm-start LeJEPA)</h3>
+        <p>Because LeJEPA and the pretrained encoders are all ViTs, you can <strong>continue self-supervised pretraining from a pretrained checkpoint</strong> &mdash; adapt Meta's ImageNet-trained I-JEPA to your own domain with the LeJEPA objective, no labels. Just pass the loaded model straight to <code>JEPATrainer</code>:</p>
+        <pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPATrainer, JEPAConfig
+
+# Start from pretrained I-JEPA instead of random init...
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+
+# ...and keep training it on your unlabeled domain images with LeJEPA / SIGReg.
+JEPATrainer(model, args=JEPAConfig(img_size=224, num_epochs=3, learning_rate=1e-4),
+            train_dataset=my_domain_images).train()
+
+model.save_pretrained("ijepa_my_domain")   # domain-adapted encoder</code></pre>
+        <div class="callout">
+          <div class="callout-title">Lower the LR when warm-starting</div>
+          <p>You're refining strong features, not learning from scratch &mdash; use a smaller learning rate (e.g. <code>1e-4</code>) than a from-scratch LeJEPA run so you don't wash out the pretrained representation.</p>
+        </div>
+      </section>
+
+      <!-- ===== V-JEPA 2 ===== -->
+      <section class="section" id="vjepa2">
+        <div class="section-label">Pretrained &middot; Video</div>
+        <h2 style="margin-top: 0;">V-JEPA 2 &mdash; pretrained video world model</h2>
+        <p>Load Meta's V-JEPA 2 video encoder. Clips are <code>(T, 256, 256, 3)</code> arrays; <code>T</code> must be a multiple of the tubelet size (2). Frames are resized to 256&times;256 automatically.</p>
+        <pre><code class="language-python">from mlx_tune import (
+    FastVideoJEPAModel, video_linear_probe, video_knn_probe, video_attentive_probe,
+)
+
+model, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")
+
+# Frozen clip features, or any of the three video probes.
+clip_feats = model.encode(my_clips)                            # (N, 1024)
+linear     = video_linear_probe(model, tr_x, tr_y, te_x, te_y)
+knn        = video_knn_probe(model, tr_x, tr_y, te_x, te_y, k=20)
+attentive  = video_attentive_probe(model, tr_x, tr_y, te_x, te_y)  # paper's eval</code></pre>
+        <div class="callout">
+          <div class="callout-title">Faithful 3D RoPE port</div>
+          <p>V-JEPA 2 uses a 3D tubelet <code>Conv3d</code> patch embed plus rotary position embeddings split across the frame / height / width axes. The MLX port replicates the reference rotation exactly, so encoder outputs match the HuggingFace model bit-for-bit.</p>
+        </div>
+
+        <h3>The predictor: anticipate the rest of a clip</h3>
+        <p>The <strong>masked-latent predictor</strong> &mdash; the "world model" half of V-JEPA 2 &mdash; is ported too (HF parity cosine 1.000000) and loads by default. Give it the latents of the first frames and it predicts the latents of the rest; <code>latent_energy</code> scores how surprising the <em>actual</em> future was (anomaly / discontinuity detection in representation space):</p>
+        <pre><code class="language-python">from mlx_tune import FastVideoJEPAModel, latent_energy
+
+model, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")
+
+# Context = first 4 frames; predict the latents of everything after.
+predicted, actual = model.predict_latents(clip, context_frames=4)
+
+energy = latent_energy(predicted, actual)                  # scalar surprise
+e_map  = latent_energy(predicted, actual, per_token=True)  # localise it
+# A clip with a hard cut scores higher energy than a coherent one.</code></pre>
+
+        <h3>Meta's fine-tuned action classifiers (zero training)</h3>
+        <p>Meta's <code>VJEPA2ForVideoClassification</code> checkpoints (attentive pooler + head, fine-tuned on Something-Something-v2) load straight into MLX &mdash; <code>from_pretrained</code> auto-detects them. Logits match HuggingFace (cosine 1.000000, same top-1):</p>
+        <pre><code class="language-python">clf, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc16-256-ssv2")
+
+results = clf.predict([clip], top_k=5)      # 174 SSv2 action classes
+for r in results[0]:
+    print(f"{r['prob']:.3f}  {r['label']}")
+
+clf.save_pretrained("ssv2_mlx")             # MLX-native save/reload</code></pre>
+
+        <div class="callout" style="border-left-color: var(--accent-warn, #d29922);">
+          <div class="callout-title">Scope: action-conditioned planning still out</div>
+          <p><code>mlx-tune</code> now ports the V-JEPA 2 <strong>encoder and predictor</strong> &mdash; features, fine-tuning, masked latent prediction, and anticipation/surprise scoring. What remains out of scope is <strong>V-JEPA 2-AC</strong>: the separately post-trained <em>action-conditioned</em> predictor and the robot <strong>planning</strong> loop (CEM / MPC over action sequences). If you want a trainable world model with planning on your Mac today, see <a href="#lewm">LeWM</a> below.</p>
+        </div>
+      </section>
+
+      <!-- ===== Downstream ===== -->
+      <section class="section" id="downstream">
+        <div class="section-label">Fine-Tuning</div>
+        <h2 style="margin-top: 0;">Downstream classification (frozen / LoRA / full)</h2>
+        <p>Both pretrained tracks share the same downstream API. Attach a classification head and pick how much of the encoder to train:</p>
+        <table class="api-params">
+          <thead><tr><th><code>finetune=</code></th><th>What trains</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><code>"frozen"</code></td><td>just the linear head</td><td>fast, tiny data, sanity check</td></tr>
+            <tr><td><code>"lora"</code> (default)</td><td>LoRA adapters in every block + head (&lt;1% of params)</td><td>adapt cheaply without overfitting</td></tr>
+            <tr><td><code>"full"</code></td><td>everything</td><td>lots of data, max accuracy</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Image classification (I-JEPA or LeJEPA encoder)</h3>
+        <pre><code class="language-python">from mlx_tune import (
+    FastJEPAModel, JEPAClassifierTrainer, JEPAClassifierConfig,
+)
+
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+
+# Attach a head; LoRA-adapt the encoder. (frozen base is frozen FIRST, then wrapped)
+clf = FastJEPAModel.for_image_classification(
+    model, num_classes=10, finetune="lora", r=8,
+)
+
+trainer = JEPAClassifierTrainer(
+    clf,
+    JEPAClassifierConfig(img_size=224, batch_size=6, num_epochs=5),
+    train_images, train_labels,
+    eval_images=val_images, eval_labels=val_labels,
+)
+trainer.train()
+print(f"accuracy: {trainer.evaluate():.3f}")</code></pre>
+
+        <h3>Video classification (V-JEPA 2 encoder)</h3>
+        <pre><code class="language-python">from mlx_tune import (
+    FastVideoJEPAModel, VideoClassifierTrainer, VideoClassifierConfig,
+)
+
+model, _ = FastVideoJEPAModel.from_pretrained("facebook/vjepa2-vitl-fpc64-256")
+clf = FastVideoJEPAModel.for_video_classification(model, num_classes=2, finetune="lora", r=8)
+
+trainer = VideoClassifierTrainer(
+    clf, VideoClassifierConfig(batch_size=2, num_epochs=5),
+    train_clips, train_labels, eval_videos=val_clips, eval_labels=val_labels,
+)
+trainer.train()</code></pre>
+
+        <div class="callout">
+          <div class="callout-title">LoRA on a deep ViT needs warmup</div>
+          <p>The classifier configs default to <code>learning_rate=3e-4</code> with <code>warmup_ratio=0.15</code>. Warmup matters: LoRA adapters perturbing all 24&ndash;32 transformer layers from step 0 can diverge without it. For <code>frozen</code> / <code>full</code> you can raise the LR.</p>
+        </div>
+      </section>
+
+      <!-- ===== Inference ===== -->
+      <section class="section" id="inference">
+        <div class="section-label">Inference</div>
+        <h2 style="margin-top: 0;">Save, reload, and predict</h2>
+        <p>Trained classifiers save the encoder, LoRA adapters, and head together. Reloading reconstructs the architecture (re-applying the LoRA structure) and produces <strong>identical predictions</strong>.</p>
+        <pre><code class="language-python"># after trainer.train() ...
+clf.save_pretrained("my_classifier")
+
+# Reload in a fresh process and run inference.
+clf = FastJEPAModel.load_classifier("my_classifier")        # video: FastVideoJEPAModel.load_classifier
+preds = clf.predict(new_images)                             # class ids   (N,)
+probs = clf.predict(new_images, return_probs=True)          # softmax probs (N, num_classes)</code></pre>
+        <div class="callout">
+          <div class="callout-title">Lifecycle verified</div>
+          <p>The full <code>train &rarr; save &rarr; load &rarr; predict</code> path is covered by the test suite for frozen, LoRA, and full modes &mdash; reloaded predictions match the trained model exactly.</p>
+        </div>
+      </section>
+
+      <!-- ===== LLM-JEPA ===== -->
+      <section class="section" id="llm-jepa">
+        <div class="section-label">LLM track</div>
+        <h2 style="margin-top: 0;">LLM-JEPA &mdash; the JEPA objective for LLM fine-tuning</h2>
+        <p>Every track above is <em>vision</em>. <strong>LLM-JEPA</strong> (<a href="https://arxiv.org/abs/2509.14252" target="_blank">arXiv 2509.14252</a>, Huang, LeCun &amp; Balestriero) brings the same Joint-Embedding Predictive idea to <strong>language-model</strong> fine-tuning. It is a <em>training objective</em>, not a model: it augments standard next-token prediction (NTP) with a JEPA term that aligns the embeddings of two &ldquo;views&rdquo; of the same item &mdash; e.g. a natural-language description (<code>text</code>) and its regex / SQL / code (<code>code</code>). It is implemented here for the first time on MLX.</p>
+
+        <div class="callout">
+          <div class="callout-title">Objective</div>
+          <p><code>L = L<sub>NTP</sub> + &lambda; &middot; d( Pred(Enc(text)), Enc(code) )</code></p>
+          <ul style="margin-top: 0.5rem; margin-bottom: 0;">
+            <li><strong>Enc(x)</strong> &mdash; the last non-pad token&rsquo;s final-layer hidden state for view <code>x</code>.</li>
+            <li><strong>Pred</strong> &mdash; an optional predictor formed by appending <code>num_predictors</code> learnable <code>[PRED]</code> slots (default <code>0</code> &rArr; identity).</li>
+            <li><strong>d</strong> &mdash; cosine dissimilarity (default), or <code>l2</code> / <code>mse</code> / <code>infonce</code>.</li>
+          </ul>
+        </div>
+
+        <p>The fine-tuned artifact is a <strong>normal LoRA-fine-tuned LLM</strong> &mdash; save / merge / generate work exactly as with SFT. The JEPA term only shapes the representation during training (the paper reports accuracy gains and resistance to overfitting). The dataset is a list of dicts with the two views under <code>text_field</code> / <code>code_field</code> (default <code>"text"</code> / <code>"code"</code>), falling back to <code>prompt</code> / <code>completion</code>.</p>
+
+        <div class="api-module" id="LLMJEPATrainer">
+          <h3>LLMJEPATrainer / LLMJEPAConfig</h3>
+          <table class="api-params">
+            <thead><tr><th>Config parameter</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>jepa_lambda</code></td><td>0.1</td><td>Weight on the JEPA term</td></tr>
+              <tr><td><code>jepa_distance</code></td><td>"cosine"</td><td><code>cosine</code> / <code>l2</code> / <code>mse</code> / <code>infonce</code></td></tr>
+              <tr><td><code>num_predictors</code></td><td>0</td><td><code>k</code> learnable <code>[PRED]</code> slots (0 &rArr; predictor is identity)</td></tr>
+              <tr><td><code>jepa_ratio</code></td><td>-1.0</td><td>JEPA-loss dropout: probability of keeping the term per step (-1 = always on)</td></tr>
+              <tr><td><code>ntp_on</code></td><td>"all"</td><td>NTP over the 3-way concat <code>[combined, text, code]</code>, or <code>"combined"</code> only</td></tr>
+              <tr><td><code>response_only</code></td><td>False</td><td>Mask the <code>text</code> prefix of the combined sequence during NTP</td></tr>
+            </tbody>
+          </table>
+          <pre><code class="language-python">from mlx_tune import FastLanguageModel, LLMJEPATrainer, LLMJEPAConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained("mlx-community/Qwen3.5-0.8B-MLX-4bit")
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16)
+
+# Two "views" of the same item: a description and its regex
+data = [
+    {"text": "match one or more digits", "code": r"\d+"},
+    {"text": "match a hex color code",   "code": r"#[0-9a-fA-F]{6}"},
+    # ...
+]
+
+trainer = LLMJEPATrainer(
+    model, data, tokenizer=tokenizer,
+    args=LLMJEPAConfig(jepa_lambda=0.1, jepa_distance="cosine", max_steps=40),
+)
+trainer.train()
+
+# The result is a normal LoRA model — generate / merge as usual:
+print(model.generate(prompt="match one or more digits", max_tokens=16))
+# model.save_pretrained_merged("./llm_jepa_merged")</code></pre>
+          <div class="callout">
+            <div class="callout-title">Tip</div>
+            <p>For real benchmarks use paired-view datasets like NL-RX (regex), Spider (SQL) or GSM8K (math) &mdash; the datasets the paper evaluates. Set <code>jepa_lambda=0</code> to train a pure-NTP baseline for an A/B comparison.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Dense & Regression heads ===== -->
+      <section class="section" id="dense-regression">
+        <div class="section-label">Downstream</div>
+        <h2 style="margin-top: 0;">Dense &amp; regression heads (counting, depth, segmentation)</h2>
+        <p>I-JEPA's <em>own</em> paper-headline tasks are depth prediction and object counting — i.e.
+        "more than classify". Three non-classification heads attach to any JEPA encoder and reuse the
+        same frozen / LoRA / full fine-tuning machinery:</p>
+        <table class="api-params">
+          <thead><tr><th>Builder</th><th>Head</th><th>Loss / metric</th></tr></thead>
+          <tbody>
+            <tr><td><code>for_image_regression(model, out_dim)</code></td><td><code>JEPAForImageRegression</code> &mdash; scalar/vector (counting)</td><td>MSE / MAE, RMSE</td></tr>
+            <tr><td><code>for_dense_prediction(model, C, task="regression")</code></td><td><code>JEPAForDensePrediction</code> &mdash; per-pixel value map (depth)</td><td>MSE / MAE</td></tr>
+            <tr><td><code>for_dense_prediction(model, C, task="segmentation")</code></td><td><code>JEPAForDensePrediction</code> &mdash; per-pixel class logits</td><td>per-pixel CE / pixel-acc</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-python">from mlx_tune import (FastJEPAModel, JEPAClassifierConfig,
+                      JEPARegressionTrainer, JEPADenseTrainer)
+
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k")
+
+# object counting (scalar regression)
+reg = FastJEPAModel.for_image_regression(model, out_dim=1, finetune="lora")
+JEPARegressionTrainer(reg, JEPAClassifierConfig(img_size=224),
+                      images, counts).train()
+print(reg.evaluate())                 # {"mae": ..., "rmse": ...}
+
+# depth map (dense regression) — targets are per-pixel maps at img_size
+dense = FastJEPAModel.for_dense_prediction(model, out_channels=1, task="regression")
+# segmentation — out_channels = num classes, integer mask targets
+seg = FastJEPAModel.for_dense_prediction(model, out_channels=21, task="segmentation")</code></pre>
+        <p>Dense heads predict at the patch grid and bilinearly upsample to <code>img_size</code>.
+        Reload with <code>FastJEPAModel.load_regressor(dir)</code> / <code>load_dense(dir)</code>.</p>
+      </section>
+
+      <!-- ===== Scale-up: non-224 inputs + streaming ===== -->
+      <section class="section" id="scaleup">
+        <div class="section-label">Scale-up</div>
+        <h2 style="margin-top: 0;">Native resolution &amp; training over a real corpus</h2>
+        <p><strong>Non-224 inputs.</strong> Pretrained I-JEPA position embeddings were tied to 224&sup2;;
+        now you can load at any (patch-divisible) size — the learned grid is bicubically interpolated
+        at load (and on-the-fly for off-grid inputs). The native-resolution path is bit-identical.</p>
+        <pre><code class="language-python"># run a pretrained encoder at 384x384
+model, _ = FastJEPAModel.from_pretrained("facebook/ijepa_vith14_1k", img_size=384)</code></pre>
+        <p><strong>Streaming + resumable checkpoints.</strong> <code>ImageFolderDataset</code> decodes
+        images lazily from a folder (recursively) on the prefetch thread, so the corpus never has to
+        fit in memory. Set <code>save_steps</code> + <code>resume</code> to checkpoint the encoder +
+        optimizer state and continue an interrupted run.</p>
+        <pre><code class="language-python">from mlx_tune import FastJEPAModel, JEPAConfig, JEPATrainer, ImageFolderDataset
+
+model, _ = FastJEPAModel.from_pretrained("vit-base", img_size=224)
+ds = ImageFolderDataset("/path/to/images")     # lazy, recursive
+cfg = JEPAConfig(img_size=224, batch_size=64, num_epochs=10,
+                 save_steps=500, resume=True)   # resumes from <output_dir>/checkpoint
+JEPATrainer(model, cfg, ds).train()</code></pre>
+      </section>
+
+      <!-- ===== LeWM (world model) ===== -->
+      <section class="section" id="lewm">
+        <div class="section-label">World model</div>
+        <h2 style="margin-top: 0;">LeWM — a latent world model you can train (and plan with)</h2>
+        <p><strong>LeWM (LeWorldModel</strong>, <a href="https://arxiv.org/abs/2603.19312" target="_blank">arXiv 2603.19312</a>,
+        Maes/Le&nbsp;Lidec/Scieur/LeCun/Balestriero) trains a latent world model end-to-end from
+        pixels with only <strong>two loss terms</strong> and one tunable hyperparameter:</p>
+        <div class="callout">
+          <code>L = next-embedding prediction  +  &lambda; &middot; SIGReg(embeddings)</code>
+          <p style="margin-top:0.5rem;margin-bottom:0;">No stop-gradient, no EMA target — SIGReg (the
+          same regularizer as LeJEPA) is what stops the encoder collapsing. The trained model is a
+          small latent world model you can plan with via CEM / MPC over latent rollouts.</p>
+        </div>
+        <p>This is the <em>trainable, on-device</em> world model — the counterpart to V-JEPA 2-AC's
+        load-and-plan (which is a <a href="#" onclick="return false;">design writeup</a> for a future
+        release, see <code>jepa.md</code> §9).</p>
+        <pre><code class="language-python">from mlx_tune import FastWorldModel, LeWMConfig, LeWMTrainer, plan_cem, PointMassEnv
+
+env = PointMassEnv(size=48)                       # toy 2-D control env
+data = env.collect(n_episodes=80, ep_len=10)      # {"frames", "actions"} trajectories
+
+model = FastWorldModel.from_pretrained("lewm-tiny", img_size=48, action_dim=2)
+LeWMTrainer(model, LeWMConfig(img_size=48, action_dim=2, sigreg_lambda=0.05,
+                              max_steps=250), data).train()
+
+# plan: pick actions whose predicted latent matches a goal image's latent (MPC)
+goal_z = model.encode([env.render([0.8, 0.2])])[0]
+z = model.encode([env.render()])[0]
+action = plan_cem(model, z, goal_z, horizon=3, action_dim=2)</code></pre>
+        <div class="callout">
+          <div class="callout-title">Honest scope</div>
+          <p>The planner is exact (cost&rarr;0 on known dynamics) and training reduces the prediction
+          loss; convincing closed-loop control needs the paper's training budget / real control
+          datasets (pass them in the <code>{"frames","actions"}</code> format). This is a demo of the
+          pipeline, not a SOTA-control claim.</p>
+        </div>
+      </section>
+
+      <!-- ===== Examples ===== -->
+      <section class="section" id="examples">
+        <div class="section-label">Examples</div>
+        <h2 style="margin-top: 0;">Runnable examples</h2>
+        <table class="api-params">
+          <thead><tr><th>File</th><th>What it shows</th></tr></thead>
+          <tbody>
+            <tr><td><code>examples/58_lejepa_pretraining.py</code></td><td>LeJEPA from-scratch pretraining on a CIFAR-10 subset (synthetic fallback) &rarr; linear probe</td></tr>
+            <tr><td><code>examples/59_ijepa_feature_extraction.py</code></td><td>Pretrained I-JEPA: linear probe + LoRA fine-tune + save/load/predict</td></tr>
+            <tr><td><code>examples/60_vjepa2_video.py</code></td><td>Pretrained V-JEPA 2: video linear probe + LoRA fine-tune + save/load/predict</td></tr>
+            <tr><td><code>examples/61_llm_jepa_finetuning.py</code></td><td>LLM-JEPA: fine-tune an LLM with the JEPA objective (NL&rarr;regex views, Qwen3.5-0.8B)</td></tr>
+            <tr><td><code>examples/62_lewm_world_model.py</code></td><td>LeWM: train a latent world model from pixels + CEM/MPC planning (toy point-mass)</td></tr>
+            <tr><td><code>examples/63_jepa_dense_regression.py</code></td><td>Dense &amp; regression heads: counting, depth maps, segmentation</td></tr>
+            <tr><td><code>examples/64_vjepa2_predictor_classifier.py</code></td><td>V-JEPA 2 predictor (anticipation + surprise energy) + Meta's pretrained SSv2 classifier</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-bash">python examples/58_lejepa_pretraining.py
+python examples/59_ijepa_feature_extraction.py
+python examples/60_vjepa2_video.py
+python examples/61_llm_jepa_finetuning.py
+python examples/62_lewm_world_model.py
+python examples/63_jepa_dense_regression.py
+python examples/64_vjepa2_predictor_classifier.py</code></pre>
+      </section>
+
+      <!-- ===== Tips ===== -->
+      <section class="section" id="tips">
+        <div class="section-label">Tips</div>
+        <h2 style="margin-top: 0;">Tips &amp; gotchas</h2>
+
+        <div class="callout">
+          <div class="callout-title">I-JEPA defaults to 224&times;224 (other sizes supported)</div>
+          <p>The pretrained position embeddings were trained on a 224&times;224 grid, so 224 is the default and the loader resizes to it for you. To run at another resolution, pass <code>img_size=</code> at load &mdash; the grid is bicubically interpolated and the native-224 path stays bit-identical. See <a href="#scaleup">Native resolution &amp; scale-up</a>.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">V-JEPA 2 clips: 256&times;256, frames multiple of 2</div>
+          <p>The 3D RoPE grid is tied to <code>crop_size=256</code>. Frames are resized to 256&times;256; the number of frames <code>T</code> must be a multiple of the tubelet size (2). The predictor is ported too (loads by default) &mdash; use <code>predict_latents</code> for masked latent prediction; only the action-conditioned V-JEPA 2-AC variant is out of scope.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Memory footprint (M4 Pro, 48 GB)</div>
+          <p>I-JEPA LoRA fine-tune (batch 6, 224&times;224) peaks ~13 GB; V-JEPA 2 LoRA (8-frame clip) peaks ~7.6 GB. Frozen-feature probing is far lighter since there's no backprop through the encoder.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Small-scale results are demos</div>
+          <p>Linear-probe / fine-tune accuracy on small datasets on a Mac is a capability demonstration, not a SOTA claim. For serious results, prototype here and scale the same code on a larger machine.</p>
+        </div>
+
+        <div class="callout">
+          <div class="callout-title">Performance</div>
+          <p>Attention uses MLX's fused <code>scaled_dot_product_attention</code>; trainers configure the wired-memory limit and overlap image/video preprocessing with GPU compute on a background thread &mdash; so the first trial is fast.</p>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p>Community project, not affiliated with Unsloth AI or Apple. JEPA, I-JEPA, and V-JEPA 2 are research from Meta / FAIR.</p>
+        <p><a href="https://github.com/ARahim3/mlx-tune">GitHub</a> &middot; <a href="https://pypi.org/project/mlx-tune/">PyPI</a> &middot; Apache 2.0 License</p>
+      </footer>
+    </main>
+  </div>
+
+  <script src="assets/js/prism.min.js"></script>
+  <script src="assets/js/prism-python.min.js"></script>
+  <script src="assets/js/prism-bash.min.js"></script>
+  <script src="assets/js/search-index.js"></script>
+  <script src="assets/js/main.js"></script>
+</body>
+</html>

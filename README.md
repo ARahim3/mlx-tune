@@ -78,18 +78,13 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 
 ## Project Status
 
-> 🩹 **v0.5.1 (patch)** — `save_pretrained_merged` on a 4-bit base now preserves the fine-tune ([#15](https://github.com/ARahim3/mlx-tune/issues/15)).
-
-> 🚀 **v0.5.0 — Faster, leaner training across every trainer.**
+> 🧠 **v0.6.0 — JEPA comes to Apple Silicon.** Yann LeCun's Joint-Embedding Predictive Architecture, the whole family:
+> - **LeJEPA** — pretrain a Vision Transformer from scratch with the heuristics-free SIGReg objective (no EMA teacher, no predictor, no stop-gradient).
+> - **I-JEPA** — load Meta's pretrained image encoder (`facebook/ijepa_*`) and fine-tune with frozen / LoRA / full classification.
+> - **V-JEPA 2** — load Meta's pretrained video world model (`facebook/vjepa2-*`): video classification, clip features, the **masked-latent predictor** (`predict_latents` + `latent_energy` — anticipate the rest of a clip, score how surprising the actual future was), and Meta's **fine-tuned SSv2 action classifiers** (174 classes, zero training).
+> - **LLM-JEPA** — bring the JEPA objective to *LLM* fine-tuning ([arXiv 2509.14252](https://arxiv.org/abs/2509.14252)): augment next-token prediction with a JEPA term that aligns two "views" of the same item (e.g. a description and its code). First-on-MLX; the artifact is a normal LoRA model.
 >
-> Headline numbers on an M4 Pro Mac, Qwen3-class models:
-> - **GRPO runs roughly 10× faster.** Generation reuses a KV cache instead of re-forwarding the prefix every step, and the prompt forward now runs once per prompt and is reused across the N rollouts in the group.
-> - **DPO and ORPO at batch size 1** share the prompt forward between the chosen and rejected branches. On long-prompt data that's ~1.5× faster DPO and ~1.9× faster ORPO, per sample.
-> - **ORPO at 4096 context fits on a 48 GB Mac.** It used to OOM. Gradient checkpointing is now wired into every preference and audio trainer, not just SFT.
-> - **Embedding fine-tuning** is ~1.8× faster from `@mx.compile` plus length-bucketed collators.
-> - **Parakeet TDT (RNN-T) loss** is ~1.5× faster on the backward pass, with bit-identical results.
->
-> See the [Performance page](https://arahim3.github.io/mlx-tune/performance.html) for the full reference table and tuning knobs.
+> New entry points: `FastJEPAModel`, `FastVideoJEPAModel`, `LLMJEPATrainer`. See the [JEPA docs](https://arahim3.github.io/mlx-tune/jepa.html).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -114,6 +109,13 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 | **`convert()`** | ✅ Stable | **HF → MLX conversion (LLM, TTS, STT)** |
 | **Embedding Fine-Tuning** | ✅ Stable | **BERT, ModernBERT, Qwen3-Embedding, Harrier (InfoNCE/contrastive)** |
 | **OCR Fine-Tuning** | ✅ Stable | **DeepSeek-OCR, GLM-OCR, olmOCR, Qwen-VL, Pixtral + CER/WER metrics** |
+| **JEPA / LeJEPA** | ✅ Stable | **From-scratch ViT SSL ([LeJEPA](https://arxiv.org/abs/2511.08544): SIGReg, no EMA/predictor/stop-grad)** |
+| **I-JEPA (pretrained)** | ✅ Stable | **Meta `facebook/ijepa_*` → MLX (HF-parity verified); frozen / LoRA / full classification; linear / kNN / attentive probes; warm-start SSL** |
+| **V-JEPA 2 (video)** | ✅ Stable | **Meta `facebook/vjepa2-*` video world model → MLX (Conv3d + 3D RoPE, HF-parity verified); video classification + probes; predictor ported (`predict_latents`/`latent_energy` anticipation); pretrained SSv2 classifiers load directly** |
+| **LLM-JEPA** | ✅ Stable | **JEPA objective for LLM fine-tuning ([arXiv 2509.14252](https://arxiv.org/abs/2509.14252)): NTP + view-alignment (cosine/l2/mse/infonce), `[PRED]` slots; `LLMJEPATrainer`, artifact is a normal LoRA model** |
+| **JEPA dense / regression** | ✅ Stable | **`for_image_regression` (object counting) + `for_dense_prediction` (depth maps, segmentation) — I-JEPA's own headline tasks; frozen / LoRA / full** |
+| **JEPA scale-up** | ✅ Stable | **Non-224 pretrained I-JEPA (bicubic pos-embed interpolation) + `ImageFolderDataset` streaming + resumable checkpoints** |
+| **LeWM (world model)** | ✅ Stable | **LeWorldModel ([arXiv 2603.19312](https://arxiv.org/abs/2603.19312)): trainable latent world model from pixels (SIGReg, no stop-grad) + CEM/MPC planning; `FastWorldModel`, `plan_cem`** |
 | **LFM2 Support** | ✅ Stable | **Liquid AI LFM2/LFM2.5 (350M-24B, hybrid conv+GQA, Thinking)** |
 | **Continual Pretraining** | ✅ Stable | **CPTTrainer with decoupled LR, embed_tokens/lm_head, full-weight mode** |
 | **`push_to_hub()`** | ✅ Stable | **Upload to HuggingFace Hub** |
