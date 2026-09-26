@@ -525,6 +525,8 @@ class CPTTrainer:
         Embedding/lm_head gradients are scaled by (embedding_lr / main_lr)
         before the optimizer step, achieving separate effective learning rates.
         """
+        from mlx_tune._perf import bucket_length, compiled_step, make_step_state
+
         print(f"\n[Using Decoupled LR Training]")
         print(f"  Main LR: {self.learning_rate}")
         print(f"  Embedding LR: {self.embedding_learning_rate}")
