@@ -90,7 +90,7 @@ Local Mac (MLX-Tune)       →     Cloud GPU (Unsloth)
 |---------|--------|-------|
 | SFT Training | ✅ Stable | Native MLX training |
 | Model Loading | ✅ Stable | Any HuggingFace model (quantized & non-quantized) |
-| Save/Export | ✅ Stable | HF format, GGUF ([see limitations](#known-limitations)) |
+| Save/Export | ✅ Stable | HF format, GGUF via llama.cpp ([setup](#gguf-export-llamacpp)) |
 | DPO Training | ✅ Stable | **Full DPO loss** |
 | ORPO Training | ✅ Stable | **Full ORPO loss** |
 | GRPO Training | ✅ Stable | **Multi-generation + reward** |
@@ -181,7 +181,7 @@ trainer.train()
 # Save (same API as Unsloth!)
 model.save_pretrained("lora_model")  # Adapters only
 model.save_pretrained_merged("merged", tokenizer)  # Full model (16-bit)
-model.save_pretrained_gguf("model", tokenizer)  # GGUF (see note below)
+model.save_pretrained_gguf("model", tokenizer, quantization_method="q4_k_m")  # GGUF (see note below)
 ```
 
 > [!NOTE]
@@ -192,8 +192,10 @@ model.save_pretrained_gguf("model", tokenizer)  # GGUF (see note below)
 > adapter and use `model.load_adapter(...)` at inference time.
 
 > [!NOTE]
-> **GGUF Export**: Works with non-quantized base models. If using a 4-bit model (like above),
-> see [Known Limitations](#known-limitations) for workarounds.
+> **GGUF Export** uses [llama.cpp](https://github.com/ggml-org/llama.cpp) (same approach as Unsloth):
+> adapters are fused, the base is dequantized, then converted and quantized to `quantization_method`.
+> Works with 4-bit bases and any architecture llama.cpp supports. Requires a llama.cpp checkout —
+> see [GGUF Export](#gguf-export-llamacpp).
 
 ### Chat Templates & Response-Only Training
 
@@ -549,43 +551,31 @@ Check [`examples/`](examples/) for working code:
 
 ## Known Limitations
 
-### GGUF Export from Quantized Models
+### GGUF Export (llama.cpp)
 
-**The Issue**: GGUF export (`save_pretrained_gguf`) doesn't work directly with quantized (4-bit) base models. This is a [known limitation in mlx-lm](https://github.com/ml-explore/mlx-lm/issues/353), not an mlx-tune bug.
+`save_pretrained_gguf` / `export_to_gguf` fuse your LoRA adapters, dequantize the base
+(so 4-bit/8-bit bases work), convert with llama.cpp's `convert_hf_to_gguf.py`, and quantize
+with `llama-quantize`. Any architecture llama.cpp supports works (Llama, Gemma, Qwen, Phi,
+Mistral, ...).
 
-**What Works**:
-- ✅ Training with quantized models (QLoRA) - works perfectly
-- ✅ Saving adapters (`save_pretrained`) - works
-- ✅ Saving merged model (`save_pretrained_merged`) - works
-- ✅ Inference with trained model - works
-- ❌ GGUF export from quantized base model - mlx-lm limitation
+**One-time setup**:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+pip install -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+brew install llama.cpp        # provides llama-quantize (or build it from the checkout)
+export LLAMA_CPP_PATH=$PWD/llama.cpp
+# optional, if the converter deps live in another environment:
+# export LLAMA_CPP_PYTHON=/path/to/python
+```
 
-**Workarounds**:
+**Usage**:
+```python
+model.save_pretrained_gguf("model", tokenizer, quantization_method="q4_k_m")  # q4_0, q5_k_m, q8_0, f16, ...
+model.save_pretrained_gguf("model", tokenizer, qat=True)  # QAT checkpoints (e.g. Gemma QAT): strict Q4_0
+```
 
-1. **Use a non-quantized base model** (recommended for GGUF export):
-   ```python
-   # Use fp16 model instead of 4-bit
-   model, tokenizer = FastLanguageModel.from_pretrained(
-       model_name="mlx-community/Llama-3.2-1B-Instruct",  # NOT -4bit
-       max_seq_length=2048,
-       load_in_4bit=False,  # Train in fp16
-   )
-   # Train normally, then export
-   model.save_pretrained_gguf("model", tokenizer)  # Works!
-   ```
-
-2. **Dequantize during export** (results in large fp16 file):
-   ```python
-   model.save_pretrained_gguf("model", tokenizer, dequantize=True)
-   # Then re-quantize with llama.cpp:
-   # ./llama-quantize model.gguf model-q4_k_m.gguf Q4_K_M
-   ```
-
-3. **Skip GGUF, use MLX format**: If you only need the model for MLX/Python inference, just use `save_pretrained_merged()` - no GGUF needed.
-
-**Related Issues**:
-- [mlx-lm #353](https://github.com/ml-explore/mlx-lm/issues/353) - MLX to GGUF conversion
-- [mlx-examples #1382](https://github.com/ml-explore/mlx-examples/issues/1382) - Quantized to GGUF
+If llama.cpp can't be found, a `LlamaCppNotFoundError` with these setup steps is raised.
+If you only need the model for MLX/Python inference, `save_pretrained_merged()` needs no llama.cpp.
 
 ### DeepSeek-OCR requires transformers<5.0
 

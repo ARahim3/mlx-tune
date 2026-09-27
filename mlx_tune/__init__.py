@@ -26,6 +26,7 @@ from mlx_tune.trainer import (
     create_training_data,
     save_model_hf_format,
     export_to_gguf,
+    LlamaCppNotFoundError,
     get_training_config,
 )
 from mlx_tune.sft_trainer import SFTTrainer, SFTConfig, TrainingArguments
@@ -343,6 +344,7 @@ __all__ = [
     "create_training_data",
     "save_model_hf_format",
     "export_to_gguf",
+    "LlamaCppNotFoundError",
     "get_training_config",
     "create_reward_function",
     "load_vlm_dataset",

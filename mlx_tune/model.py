@@ -862,37 +862,29 @@ class MLXModelWrapper:
         """
         Save model in GGUF format for llama.cpp, Ollama, LM Studio, etc.
 
-        This method exports the model (optionally with fused LoRA adapters) to GGUF format
-        for use with llama.cpp, Ollama, LM Studio, and other GGUF-compatible tools.
+        Fuses the in-memory LoRA layers (if any), dequantizes, converts with llama.cpp's
+        ``convert_hf_to_gguf.py`` and quantizes with ``llama-quantize``. Works with
+        quantized (4-bit/8-bit) bases and any architecture llama.cpp supports.
+        Requires llama.cpp; see :func:`mlx_tune.trainer.export_to_gguf`.
+
+        Like ``save_pretrained_merged``, this fuses the LoRA layers into the
+        in-memory model; save adapters first (``save_pretrained``) if you want to
+        keep training afterwards.
 
         Args:
-            output_dir: Directory/filename for GGUF file
-            tokenizer: Tokenizer
-            quantization_method: GGUF quantization type (for documentation only,
-                               mlx_lm exports in fp16)
-            **kwargs: Additional options including:
-                - dequantize: Whether to dequantize the model before export
+            output_dir: Directory (``model.gguf`` is written inside) or ``.gguf`` path
+            tokenizer: Tokenizer (unused; kept for Unsloth API compatibility)
+            quantization_method: llama.cpp type, e.g. ``q4_k_m`` (default), ``q4_0``,
+                ``q5_k_m``, ``q8_0``, ``f16``. Unsloth aliases are accepted.
+            **kwargs:
+                - qat: force strict ``q4_0`` for Quantization-Aware-Training checkpoints
+                - llama_cpp_path: llama.cpp checkout (else ``$LLAMA_CPP_PATH``)
+                - llama_cpp_python: Python for the converter (else ``$LLAMA_CPP_PYTHON``)
+                - keep_intermediates: keep merged weights / f16 GGUF
 
         Example:
-            >>> # With non-quantized model (recommended)
-            >>> model.save_pretrained_gguf("model", tokenizer)
-
-            >>> # With quantized model (requires dequantize)
-            >>> model.save_pretrained_gguf("model", tokenizer, dequantize=True)
-
-        Important - Quantized Model Limitation:
-            GGUF export from quantized (4-bit) base models is NOT supported by mlx_lm.
-            This is an upstream limitation, not an mlx-tune bug.
-            See: https://github.com/ml-explore/mlx-lm/issues/353
-
-            Workarounds:
-            1. Use a non-quantized base model (e.g., "Llama-3.2-1B-Instruct" not "-4bit")
-            2. Use dequantize=True (creates large fp16 file, re-quantize with llama.cpp)
-            3. Skip GGUF and use save_pretrained_merged() for MLX-only inference
-
-        Note:
-            - Supported architectures: Llama, Mistral, Mixtral
-            - Output is fp16 precision (use llama.cpp to quantize further)
+            >>> model.save_pretrained_gguf("model", tokenizer, quantization_method="q4_k_m")
+            >>> model.save_pretrained_gguf("model", tokenizer, qat=True)  # Gemma QAT etc.
         """
         from mlx_tune.trainer import export_to_gguf
         from pathlib import Path
@@ -904,7 +896,7 @@ class MLXModelWrapper:
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Get the original model path/name - this is what mlx_lm.fuse needs
+        # Get the original model path/name - the base weights are reloaded from here
         model_path = self.model_name
         if model_path is None:
             raise ValueError(
@@ -913,35 +905,24 @@ class MLXModelWrapper:
                 "to track the original model path."
             )
 
-        # Check for adapter path if LoRA was applied
-        adapter_path = None
         if self._lora_applied:
-            if self._adapter_path:
-                adapter_path = str(self._adapter_path)
-            else:
-                # Check common adapter locations
-                common_paths = [
-                    Path("./adapters"),
-                    Path("./lora_finetuned/adapters"),
-                    Path("./outputs/adapters"),
-                ]
-                for path in common_paths:
-                    if (path / "adapters.safetensors").exists():
-                        adapter_path = str(path)
-                        break
+            print("  LoRA layers will be fused from the in-memory model")
 
-            if adapter_path:
-                print(f"  LoRA adapters will be fused from: {adapter_path}")
-            else:
-                print("  Warning: LoRA was applied but no adapter path found.")
-                print("  Export will use base model only. Train and save adapters first.")
+        if isinstance(self.config, dict) and self.config.get("quantization"):
+            bits = self.config["quantization"].get("bits", "?")
+            print(f"  Quantized base detected ({bits}-bit): weights will be "
+                  "dequantized to full precision before GGUF conversion.")
 
+        # Merge the model that is already in memory (with its trained LoRA)
+        # rather than reloading the base from disk: avoids holding two copies
+        # of the weights, and exports exactly what was trained.
         print(f"Exporting to GGUF format...")
-        export_to_gguf(
-            model_path,  # Use original model path, not output directory
+        return export_to_gguf(
+            model_path,  # original model path (tokenizer assets are read from here)
             output_path=str(output_path),
             quantization=quantization_method,
-            adapter_path=adapter_path,
+            model=self,
+            tokenizer=tokenizer if tokenizer is not None else self.tokenizer,
             **kwargs
         )
 

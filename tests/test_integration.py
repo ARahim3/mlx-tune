@@ -142,43 +142,20 @@ class TestSaveWorkflows:
         assert "mlx-community" in model.model_name or "Llama" in model.model_name, \
             f"model_name should contain the original model path, got: {model.model_name}"
 
+        from mlx_tune.trainer import _find_llama_cpp
+        tools = _find_llama_cpp()
+        if not (tools["convert_script"] and tools["quantize_bin"]):
+            pytest.skip("llama.cpp not available (set LLAMA_CPP_PATH to run GGUF export)")
+
         with tempfile.TemporaryDirectory() as tmpdir:
             save_path = os.path.join(tmpdir, "model")
+            # 4-bit base + LoRA must export (issue #3): no architecture or
+            # quantized-base limitation any more once llama.cpp is present.
+            model.save_pretrained_gguf(save_path, tokenizer, quantization_method="q4_k_m")
 
-            try:
-                model.save_pretrained_gguf(save_path, tokenizer)
-
-                # If it succeeds, verify GGUF file exists
-                files = list(Path(tmpdir).rglob("*.gguf"))
-                assert len(files) > 0, "No GGUF file created"
-
-            except Exception as e:
-                import subprocess
-                error_msg = str(e)
-
-                # Check that the error is NOT about missing config.json in the output dir
-                # (which was the old bug - GitHub issue #3)
-                if "model/config.json" in error_msg:
-                    pytest.fail(
-                        "GGUF export looked for config.json in output dir instead of model path. "
-                        "This is the bug from GitHub issue #3. "
-                        f"Error: {error_msg}"
-                    )
-
-                # GGUF export depends on external tools and model architectures
-                # Skip for expected failures (unsupported architecture, tools not available)
-                is_expected_failure = (
-                    isinstance(e, subprocess.CalledProcessError) or
-                    any(x in error_msg.lower() for x in [
-                        "gguf", "quantized", "unsupported", "not supported",
-                        "model_type", "llama", "mistral"
-                    ])
-                )
-                if is_expected_failure:
-                    pytest.skip(
-                        f"GGUF export skipped (architecture or tool limitation): {type(e).__name__}"
-                    )
-                raise
+            files = list(Path(tmpdir).rglob("*.gguf"))
+            assert len(files) == 1, f"Expected one GGUF file, got {files}"
+            assert files[0].stat().st_size > 0, "GGUF file is empty"
 
     def test_save_pretrained_gguf_model_name_preserved(self, model_with_lora):
         """Test that model_name is preserved correctly for GGUF export.

@@ -254,8 +254,8 @@ model.save_pretrained("lora_model")</code></pre>
           </div>
           <p>Export to GGUF format for use with Ollama, llama.cpp, and other inference engines.</p>
           <div class="callout">
-            <div class="callout-title">GGUF Limitation</div>
-            <p>GGUF export works with <strong>non-quantized models only</strong>. Quantized (4-bit) model export is an <a href="https://github.com/ml-explore/mlx-lm/issues/353" target="_blank" rel="noopener">mlx-lm limitation</a>, not an <code>mlx-tune</code> bug. Load the model with <code>load_in_4bit=False</code> before exporting.</p>
+            <div class="callout-title">Requires llama.cpp</div>
+            <p>Adapters are fused, the base is dequantized (4-bit bases work), then converted and quantized with <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">llama.cpp</a>. Any architecture llama.cpp supports works. Pass <code>qat=True</code> for QAT checkpoints (strict Q4_0). See <a href="troubleshooting.html#gguf">GGUF setup</a>.</p>
           </div>
 
           <h4>model.push_to_hub()</h4>
@@ -810,8 +810,8 @@ trainer = train_on_responses_only(
         </div>
 
         <div class="callout">
-          <div class="callout-title">GGUF Limitation</div>
-          <p>GGUF export works with <strong>non-quantized models only</strong>. If you loaded with <code>load_in_4bit=True</code>, you must reload the base model without quantization before exporting to GGUF. This is an <a href="https://github.com/ml-explore/mlx-lm/issues/353" target="_blank" rel="noopener">mlx-lm limitation</a>.</p>
+          <div class="callout-title">GGUF export requires llama.cpp</div>
+          <p>Works with 4-bit bases and any architecture llama.cpp supports. One-time setup: <a href="troubleshooting.html#gguf">GGUF setup</a>.</p>
         </div>
       </section>
 

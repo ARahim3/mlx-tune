@@ -350,157 +350,274 @@ def save_model_hf_format(
         print(f"✓ Tokenizer saved to {output_dir}")
 
 
+# ---------------------------------------------------------------------------
+# GGUF export via llama.cpp
+# ---------------------------------------------------------------------------
+
+# Quantization types accepted by ``llama-quantize`` that we expose. "f16",
+# "bf16" and "f32" are produced directly by the converter (no quantize step).
+_GGUF_UNQUANTIZED_TYPES = {"f16", "bf16", "f32"}
+_GGUF_QUANT_TYPES = {
+    "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s", "q4_k_m",
+    "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m", "iq3_xxs", "iq3_xs", "iq3_s",
+    "iq3_m", "iq4_nl", "iq4_xs", "tq1_0", "tq2_0",
+}
+# Unsloth-compatible aliases
+_GGUF_ALIASES = {"not_quantized": "f16", "fast_quantized": "q8_0", "quantized": "q4_k_m"}
+
+_LLAMA_CPP_SETUP_HELP = """\
+GGUF export requires llama.cpp (the converter script plus the llama-quantize binary).
+
+  1. Get llama.cpp:
+       git clone https://github.com/ggml-org/llama.cpp
+       brew install llama.cpp          # provides llama-quantize
+     (or build llama-quantize yourself: cmake -B build && cmake --build build --target llama-quantize)
+
+  2. Give the converter a Python with its dependencies:
+       pip install -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+
+  3. Point mlx-tune at it (any of):
+       export LLAMA_CPP_PATH=/path/to/llama.cpp
+       model.save_pretrained_gguf(..., llama_cpp_path="/path/to/llama.cpp")
+     Optionally, if the converter's deps live in a different environment:
+       export LLAMA_CPP_PYTHON=/path/to/python
+"""
+
+
+class LlamaCppNotFoundError(RuntimeError):
+    """Raised when the llama.cpp toolchain needed for GGUF export is missing."""
+
+
+def _normalize_gguf_quantization(quantization: Optional[str], qat: bool = False) -> str:
+    """Resolve a user-supplied GGUF quantization name to a llama.cpp type."""
+    if qat:
+        # QAT checkpoints (e.g. Gemma QAT) are trained against Q4_0's scale
+        # grid; any other scheme re-rounds the weights and discards that.
+        if quantization and str(quantization).lower() not in ("q4_0", "quantized", "q4_k_m"):
+            print(f"  Note: qat=True overrides quantization='{quantization}' -> 'q4_0'")
+        return "q4_0"
+    q = (quantization or "q4_k_m").lower()
+    q = _GGUF_ALIASES.get(q, q)
+    if q not in _GGUF_QUANT_TYPES and q not in _GGUF_UNQUANTIZED_TYPES:
+        supported = ", ".join(sorted(_GGUF_QUANT_TYPES | _GGUF_UNQUANTIZED_TYPES))
+        raise ValueError(f"Unsupported GGUF quantization '{quantization}'. Supported: {supported}")
+    return q
+
+
+def _find_llama_cpp(llama_cpp_path: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Locate ``convert_hf_to_gguf.py`` and ``llama-quantize``.
+
+    Search order: explicit ``llama_cpp_path`` arg, ``$LLAMA_CPP_PATH``,
+    ``./llama.cpp``, ``~/llama.cpp``. ``llama-quantize`` is additionally
+    looked up on ``$PATH`` (e.g. Homebrew's llama.cpp).
+    """
+    import os
+    import shutil
+
+    candidates = []
+    for p in (llama_cpp_path, os.environ.get("LLAMA_CPP_PATH")):
+        if p:
+            candidates.append(Path(p).expanduser())
+    candidates += [Path.cwd() / "llama.cpp", Path.home() / "llama.cpp"]
+
+    convert_script = None
+    quantize_bin = None
+    for root in candidates:
+        if convert_script is None and (root / "convert_hf_to_gguf.py").is_file():
+            convert_script = str(root / "convert_hf_to_gguf.py")
+        if quantize_bin is None:
+            for rel in ("build/bin/llama-quantize", "llama-quantize", "bin/llama-quantize"):
+                if (root / rel).is_file() and os.access(root / rel, os.X_OK):
+                    quantize_bin = str(root / rel)
+                    break
+    if quantize_bin is None:
+        quantize_bin = shutil.which("llama-quantize")
+
+    return {"convert_script": convert_script, "quantize_bin": quantize_bin}
+
+
+def _copy_tokenizer_assets(model_path: Union[str, Path], out_dir: Path) -> None:
+    """Copy tokenizer files HF tokenizers don't re-emit but llama.cpp may need.
+
+    Only files that exist in the *source* checkpoint are copied, so a model that
+    ships just ``tokenizer.json`` (e.g. Gemma 4) is converted from that.
+    """
+    import shutil
+    from mlx_lm.utils import _download
+
+    src = Path(model_path) if Path(model_path).exists() else _download(str(model_path))
+    for name in ("tokenizer.model", "tokenizer.model.v3", "tekken.json"):
+        if (src / name).is_file() and not (out_dir / name).exists():
+            shutil.copy2(src / name, out_dir / name)
+
+
+def _release_mlx_memory() -> None:
+    import gc
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def _merge_for_gguf(model_path: Union[str, Path], adapter_path: Optional[str], out_dir: Path) -> Path:
+    """Load base (+ adapters) from disk, fuse, dequantize, save full-precision HF weights.
+
+    Used by the standalone ``export_to_gguf(model_path, adapter_path=...)``. When a
+    model is already in memory, ``save_model_hf_format`` is used instead so the
+    weights are not loaded twice.
+    """
+    from mlx_lm import load as mlx_load
+    from mlx_lm.utils import save_model, save_config, dequantize_model
+    from mlx.utils import tree_unflatten
+
+    print(f"  Loading {model_path}" + (f" with adapters from {adapter_path}" if adapter_path else ""))
+    model, tokenizer, config = mlx_load(str(model_path), adapter_path=adapter_path, return_config=True)
+
+    fused = [(n, m.fuse(dequantize=True)) for n, m in model.named_modules() if hasattr(m, "fuse")]
+    if fused:
+        print(f"  Fusing {len(fused)} LoRA layers (dequantized)")
+        model.update_modules(tree_unflatten(fused))
+    model = dequantize_model(model)
+    config = dict(config)
+    config.pop("quantization", None)
+    config.pop("quantization_config", None)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_model(str(out_dir), model, donate_model=True)
+    save_config(config, config_path=out_dir / "config.json")
+    tokenizer.save_pretrained(str(out_dir))
+    del model
+    _copy_tokenizer_assets(model_path, out_dir)
+    return out_dir
+
+
 def export_to_gguf(
     model_path: str,
     output_path: Optional[str] = None,
     quantization: str = "q4_k_m",
     adapter_path: Optional[str] = None,
+    qat: bool = False,
+    llama_cpp_path: Optional[str] = None,
     **kwargs
 ):
     """
-    Export model to GGUF format for use with llama.cpp, Ollama, etc.
+    Export a model (optionally with LoRA adapters) to GGUF for llama.cpp, Ollama, LM Studio.
 
-    This function uses mlx_lm.fuse to merge adapters (if any) and export to GGUF.
+    Pipeline (same approach as Unsloth):
+      1. Load the base model with mlx-lm, fuse adapters, and dequantize to full
+         precision (works for 4-bit/8-bit bases).
+      2. Convert to GGUF with llama.cpp's ``convert_hf_to_gguf.py`` (supports every
+         architecture llama.cpp supports: Llama, Gemma, Qwen, Phi, Mistral, ...).
+      3. Quantize with ``llama-quantize`` to the requested type.
 
     Args:
-        model_path: Path to the base model or HuggingFace model ID
-            (e.g., "mlx-community/Llama-3.2-1B-Instruct-4bit" or "./my_model")
-        output_path: Path for output GGUF file (defaults to ./model.gguf)
-        quantization: Quantization type (q4_k_m, q5_k_m, q8_0, f16, etc.)
-            Note: mlx_lm exports in fp16 precision
-        adapter_path: Path to LoRA adapters to fuse before export
-        **kwargs: Additional export options:
-            - dequantize: bool - Dequantize model before export (required for quantized models)
+        model_path: Base model path or HuggingFace ID (quantized or not).
+        output_path: Output ``.gguf`` path (defaults to ./model.gguf).
+        quantization: llama.cpp type: q4_k_m (default), q4_0, q5_k_m, q6_k, q8_0,
+            f16, bf16, ... Unsloth aliases (``quantized``, ``fast_quantized``,
+            ``not_quantized``) are accepted.
+        adapter_path: LoRA adapter directory to fuse before export.
+        qat: Force strict ``q4_0``, matching the scale grid of Quantization-Aware
+            Training checkpoints (e.g. Gemma QAT). Token embeddings keep
+            llama.cpp's default higher-precision type, as in Google's own QAT GGUFs.
+        llama_cpp_path: Path to a llama.cpp checkout (else ``$LLAMA_CPP_PATH``,
+            ``./llama.cpp``, ``~/llama.cpp``).
+        **kwargs:
+            - llama_cpp_python: Python used to run the converter (else
+              ``$LLAMA_CPP_PYTHON``, else the current interpreter).
+            - keep_intermediates: keep merged weights / f16 GGUF (default False).
+            - model / tokenizer: an in-memory (LoRA-applied) model to merge instead
+              of reloading ``model_path`` from disk; used by ``save_pretrained_gguf``
+              so the weights are only held once. The LoRA layers are fused into this
+              model in place (same as ``save_pretrained_merged``).
+            - dequantize: accepted for backward compatibility (always dequantizes).
+
+    Raises:
+        LlamaCppNotFoundError: llama.cpp tools are not installed/located.
 
     Examples:
-        >>> # Export base model to GGUF
-        >>> export_to_gguf("mlx-community/Llama-3.2-1B-Instruct-4bit")
-        >>>
-        >>> # Export fine-tuned model with adapters
-        >>> export_to_gguf(
-        ...     "mlx-community/Llama-3.2-1B-Instruct-4bit",
-        ...     adapter_path="./adapters",
-        ...     output_path="my-model.gguf",
-        ... )
-
-    Note:
-        GGUF export is only supported for Llama, Mistral, and Mixtral architectures.
-        Quantized models need dequantize=True to export properly.
+        >>> export_to_gguf("mlx-community/gemma-2-2b-it-4bit", adapter_path="./adapters",
+        ...                output_path="model-q4_k_m.gguf")
+        >>> export_to_gguf("./gemma-qat-unquantized", adapter_path="./adapters", qat=True)
     """
+    import os
+    import shutil
     import subprocess
+    import sys
+    import tempfile
 
-    # Determine if model_path is a HuggingFace model ID or local path
-    # HF model IDs typically contain "/" but don't exist as local paths
-    model_path_str = str(model_path)
-    is_hf_model = (
-        "/" in model_path_str and
-        not Path(model_path_str).exists()
-    )
-
-    # Keep as string for HF models, convert to Path for local paths
-    if not is_hf_model:
-        model_path = Path(model_path_str)
-
-    # Handle output path
-    if output_path is None:
-        output_path = Path("./model.gguf")
-    else:
-        output_path = Path(output_path)
-
-    # Ensure output directory exists
+    quant = _normalize_gguf_quantization(quantization, qat=qat)
+    output_path = Path(output_path) if output_path else Path("./model.gguf")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check if model appears to be quantized (warn user about mlx_lm limitation)
-    quantized_indicators = ['4bit', '8bit', '3bit', '2bit', '-q4', '-q8', 'int4', 'int8', 'bnb']
-    model_name_lower = model_path_str.lower()
-    is_likely_quantized = any(ind in model_name_lower for ind in quantized_indicators)
+    tools = _find_llama_cpp(llama_cpp_path)
+    missing = []
+    if tools["convert_script"] is None:
+        missing.append("convert_hf_to_gguf.py (llama.cpp checkout)")
+    if quant not in _GGUF_UNQUANTIZED_TYPES and tools["quantize_bin"] is None:
+        missing.append("llama-quantize binary")
+    if missing:
+        raise LlamaCppNotFoundError(
+            "Could not find: " + ", ".join(missing) + "\n\n" + _LLAMA_CPP_SETUP_HELP
+        )
 
-    if is_likely_quantized and not kwargs.get('dequantize', False):
-        print("\n" + "=" * 70)
-        print("⚠️  WARNING: Quantized model detected!")
-        print("=" * 70)
-        print(f"Model '{model_path}' appears to be quantized.")
-        print("GGUF export from quantized models is NOT supported by mlx_lm.")
-        print("This is an upstream limitation: https://github.com/ml-explore/mlx-lm/issues/353")
-        print("\nOptions:")
-        print("  1. Use dequantize=True (creates large fp16, re-quantize with llama.cpp)")
-        print("  2. Use a non-quantized base model for training")
-        print("  3. Use save_pretrained_merged() for MLX-only inference")
-        print("=" * 70 + "\n")
+    converter_python = kwargs.get("llama_cpp_python") or os.environ.get("LLAMA_CPP_PYTHON") or sys.executable
+    keep = bool(kwargs.get("keep_intermediates", False))
 
-    print(f"Exporting model to GGUF format...")
+    print("Exporting model to GGUF (llama.cpp)...")
     print(f"  Model: {model_path}")
-    print(f"  Output: {output_path}")
     if adapter_path:
         print(f"  Adapters: {adapter_path}")
+    print(f"  Quantization: {quant}" + (" (QAT)" if qat else ""))
+    print(f"  Output: {output_path}")
 
-    # Build mlx_lm.fuse command
-    cmd = [
-        "mlx_lm.fuse",
-        "--model", str(model_path),
-        "--export-gguf",
-        "--gguf-path", str(output_path),
-    ]
-
-    # Add adapter path if provided
-    if adapter_path:
-        cmd.extend(["--adapter-path", str(adapter_path)])
-
-    # Add dequantize flag for quantized models (required for proper GGUF export)
-    if kwargs.get('dequantize', False) or kwargs.get('de_quantize', False):
-        cmd.append("--dequantize")
-
-    print(f"\nRunning: {' '.join(cmd)}")
-
+    in_memory_model = kwargs.get("model")
+    work = Path(tempfile.mkdtemp(prefix="mlx_tune_gguf_", dir=str(output_path.parent)))
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        if result.stdout:
-            print(result.stdout)
-        print(f"✓ Model exported to {output_path}")
+        print("[1/3] Fusing adapters and dequantizing to full precision...")
+        if in_memory_model is not None:
+            merged_dir = work / "merged"
+            save_model_hf_format(in_memory_model, kwargs.get("tokenizer"), str(merged_dir),
+                                 save_method="merged_16bit")
+            _copy_tokenizer_assets(model_path, merged_dir)
+        else:
+            merged_dir = _merge_for_gguf(model_path, adapter_path, work / "merged")
+        _release_mlx_memory()
+
+        converted = output_path if quant in _GGUF_UNQUANTIZED_TYPES else work / "model-f16.gguf"
+        print(f"[2/3] Converting to GGUF ({'final ' + quant if converted == output_path else 'f16 intermediate'})...")
+        conv_cmd = [converter_python, tools["convert_script"], str(merged_dir),
+                    "--outfile", str(converted),
+                    "--outtype", quant if converted == output_path else "f16"]
+        result = subprocess.run(conv_cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            tail = "\n".join((result.stderr or result.stdout).strip().splitlines()[-15:])
+            hint = ""
+            if "No module named" in tail:
+                hint = ("\nThe converter's Python is missing dependencies. Install them with\n"
+                        "  pip install -r <llama.cpp>/requirements/requirements-convert_hf_to_gguf.txt\n"
+                        "or set LLAMA_CPP_PYTHON to an interpreter that has them.")
+            raise RuntimeError(f"convert_hf_to_gguf.py failed (exit {result.returncode}):\n{tail}{hint}")
+
+        if converted != output_path:
+            print(f"[3/3] Quantizing to {quant.upper()} with llama-quantize...")
+            q_cmd = [tools["quantize_bin"], str(converted), str(output_path), quant.upper()]
+            result = subprocess.run(q_cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                tail = "\n".join((result.stderr or result.stdout).strip().splitlines()[-15:])
+                raise RuntimeError(f"llama-quantize failed (exit {result.returncode}):\n{tail}")
+
+        size_mb = output_path.stat().st_size / 1e6
+        print(f"✓ Model exported to {output_path} ({size_mb:.0f} MB, {quant})")
         return str(output_path)
-
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr if e.stderr else str(e)
-        print(f"Error during GGUF export: {error_msg}")
-
-        # Provide helpful error messages
-        if "adapter_config.json" in error_msg.lower():
-            print("\n⚠️  Adapter config not found. This usually means:")
-            print("   1. The adapter path is missing adapter_config.json")
-            print("   2. Training was done with an older version of mlx-tune")
-            print(f"\n   To fix, either:")
-            print(f"   a) Re-train with mlx-tune >= 0.3.4 (saves adapter_config.json)")
-            print(f"   b) Export without adapters (base model only):")
-            print(f"      model.save_pretrained_gguf('model', tokenizer)")
-            if adapter_path:
-                print(f"\n   Adapter path checked: {adapter_path}")
-        elif "config.json" in error_msg.lower() or "FileNotFoundError" in str(e):
-            print("\n⚠️  Config file not found. This usually means:")
-            print("   1. The model path is incorrect")
-            print("   2. The model hasn't been downloaded yet")
-            print(f"\n   Try loading the model first with mlx_lm:")
-            print(f"   python -c \"from mlx_lm import load; load('{model_path}')\"")
-        elif "quantized" in error_msg.lower():
-            print("\n⚠️  Quantized model detected. Try with dequantize=True:")
-            print(f"   export_to_gguf('{model_path}', dequantize=True)")
-
-        # Try alternative method using convert
-        print("\nTrying alternative export method...")
-        try:
-            alt_cmd = [
-                "mlx_lm.convert",
-                "--hf-path", str(model_path),
-                "-q",  # Quantize
-                "--export-gguf",
-            ]
-            subprocess.run(alt_cmd, check=True)
-            print(f"✓ Model exported using alternative method")
-            return str(output_path)
-        except Exception as alt_e:
-            print(f"Alternative method also failed: {alt_e}")
-            print("\nManual export command:")
-            print(f"  mlx_lm.fuse --model {model_path} --export-gguf --gguf-path {output_path}")
-            raise
+    finally:
+        if keep:
+            print(f"  Intermediates kept in {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def get_training_config(

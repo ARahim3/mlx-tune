@@ -277,18 +277,17 @@ class TestAllSaveFormats:
 
     @pytest.mark.slow
     def test_gguf_save_format_non_quantized(self):
-        """GGUF export with a non-quantized model.
+        """GGUF export with a non-quantized (bf16) base + trained LoRA.
 
-        This test uses a non-quantized (bf16) model because quantized GGUF
-        export is an mlx-lm upstream limitation.
-
-        Note: mlx_lm.fuse may fail with "can only serialize row-major arrays"
-        on some MLX versions. When that happens we verify the adapters and
-        fuse-path are correct (our code) and skip the GGUF file assertion.
+        Requires llama.cpp (see LLAMA_CPP_PATH); skipped otherwise.
         """
         from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
+        from mlx_tune.trainer import _find_llama_cpp
         from datasets import Dataset
-        import subprocess
+
+        tools = _find_llama_cpp()
+        if not (tools["convert_script"] and tools["quantize_bin"]):
+            pytest.skip("llama.cpp not available (set LLAMA_CPP_PATH to run GGUF export)")
 
         model, tokenizer = _load_bf16_model()
         model = FastLanguageModel.get_peft_model(
@@ -317,15 +316,7 @@ class TestAllSaveFormats:
             assert (adapter_path / "adapter_config.json").exists()
 
             gguf_dir = os.path.join(tmpdir, "gguf_out")
-            try:
-                model.save_pretrained_gguf(gguf_dir, tokenizer)
-            except subprocess.CalledProcessError:
-                # mlx_lm.fuse may fail with row-major array error
-                # on certain MLX versions — that's an upstream issue
-                pytest.skip(
-                    "GGUF export failed due to upstream mlx_lm issue "
-                    "(row-major array serialization). Adapters verified OK."
-                )
+            model.save_pretrained_gguf(gguf_dir, tokenizer)
 
             gguf_files = list(Path(gguf_dir).glob("*.gguf"))
             assert len(gguf_files) > 0, "No .gguf file created"
